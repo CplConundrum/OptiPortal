@@ -1,0 +1,19 @@
+{
+  "Group": "Cpl",
+  "Name": "OptiPortal",
+  "Version": "1.0.0",
+  "Main": "com.optiportal.OptiPortal",
+  "Description": "Optimizes server performance via intelligent warp zone pre-loading, chunk caching, and deduplication.",
+  "Authors": [
+    {
+      "Name": "Cpl"
+    }
+  ],
+  "ServerVersion": "2026.02.19-1a311a592",
+  "IncludesAssetPack": true,
+  "Dependencies": {},
+  "OptionalDependencies": {
+    "Hytaled:Optimizer": "*",
+    "Zurku:Gravestones": "*"
+  }
+}
