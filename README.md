@@ -60,7 +60,6 @@ Edit `config.json` while the server is running, then run `/preload reload` to ap
 | `defaults.*` (strategy, radius, buffers, timeout) | Applied to new zone evaluations |
 | `warps.sourcePath` / `warps.watchIntervalSeconds` | Watcher is fully restarted |
 | `gravestones.watchIntervalSeconds` | Picked up on next watcher cycle |
-| `ui.*` (showBedSpawns, showDeathLocations, etc.) | Applied on next UI open |
 | `metrics.bstatsEnabled` | Takes effect on next reporting interval |
 
 ### ❌ Requires a full server restart
