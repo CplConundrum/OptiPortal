@@ -1,0 +1,23 @@
+Group #PreloadRoot {
+  Anchor: (Width: 900, Height: 620);
+  LayoutMode: Top;
+
+  Group #PanelWarps {
+    LayoutMode: Top;
+    FlexWeight: 1;
+
+    Label #WarpTableContent {
+      Style: (FontSize: 13);
+      Anchor: (Horizontal: 8, Top: 8);
+    }
+    Label #WarpStats {
+      Style: (FontSize: 12);
+      Anchor: (Horizontal: 8, Top: 6, Bottom: 6);
+    }
+  }
+
+  Label #StorageBackend {
+    Style: (FontSize: 12);
+    Anchor: (Horizontal: 8, Top: 4, Bottom: 8);
+  }
+}

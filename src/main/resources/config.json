@@ -1,0 +1,224 @@
+{
+  "_readme": "PreloadPlugin config. Restart the server after making changes.",
+
+  "_section_storage": "=== STORAGE BACKEND ===",
+  "_backend_info": "Where zone/cache data is saved. Options: JSON (flat files, easiest setup), SQLITE (single file DB, faster), MYSQL (requires separate DB server)",
+  "backend": "JSON",
+
+  "_section_startup": "=== STARTUP BEHAVIOUR ===",
+  "_startupLoadStrategy_info": "How zones are loaded when the server boots. STAGED = load gradually to reduce lag spike. IMMEDIATE = load everything at once.",
+  "startupLoadStrategy": "STAGED",
+
+  "_suppressRamWarnings_info": "Set true to silence warnings if PreloadPlugin's RAM usage looks high. Leave false unless the warnings are false positives.",
+  "suppressRamWarnings": false,
+
+  "_section_snapshots": "=== SNAPSHOTS & CRASH RECOVERY ===",
+  "_snapshotIntervalMinutes_info": "How often (in minutes) a full cache snapshot is written to disk. Lower = less data lost on crash, higher = less disk I/O.",
+  "snapshotIntervalMinutes": 10,
+
+  "_rebuildFromChunksOnCorruption_info": "If the cache file is corrupted on startup, automatically rebuild it from Hytale's raw chunk files instead of starting empty.",
+  "rebuildFromChunksOnCorruption": true,
+
+  "_scheduledRebuildIntervalHours_info": "How often (in hours) to do a full cache rebuild from chunk files as a health-check. Set to 0 to disable. Default: every 24h.",
+  "scheduledRebuildIntervalHours": 24,
+
+  "_section_defaults": "=== ZONE DEFAULTS ===",
+  "_defaults_info": "Default settings applied to all zones unless overridden per-zone.",
+  "defaults": {
+    "_strategy_info": "WARM = chunks held in memory permanently (fast, uses more RAM). PREDICTIVE = chunks loaded on player approach and cached (balanced).",
+    "strategy": "PREDICTIVE",
+
+    "_warmRadius_info": "How many chunks out from the zone centre to keep loaded (radius, not diameter). E.g. 4 = 9x9 chunk area.",
+    "warmRadius": 4,
+
+    "_warmRadiusX_info": "Override warmRadius for the X axis only. Set to null to use warmRadius for both axes.",
+    "warmRadiusX": null,
+    "_warmRadiusZ_info": "Override warmRadius for the Z axis only. Set to null to use warmRadius for both axes.",
+    "warmRadiusZ": null,
+
+    "_timeoutSeconds_info": "How long (seconds) to wait for a zone to finish loading before giving up and letting the player through anyway.",
+    "timeoutSeconds": 5,
+
+    "_bufferSeconds_info": "How long a zone stays in each tier before being allowed to drop down to COLD. Prevents thrashing on a busy server.",
+    "bufferSeconds": {
+      "WARM": 60,
+      "PREDICTIVE": 20
+    }
+  },
+
+  "_section_activation": "=== PORTAL / ZONE ACTIVATION ===",
+  "_activation_info": "Controls when PreloadPlugin decides a player is 'approaching' a zone and should trigger a pre-load.",
+  "activation": {
+    "_distance_info": "Horizontal distance (in blocks/units) at which a nearby zone is considered 'approached' and pre-loading begins.",
+    "distance": 16,
+
+    "_distanceVertical_info": "Vertical distance for the same check. Smaller than horizontal because players usually approach portals head-on.",
+    "distanceVertical": 8,
+
+    "_shape_info": "Shape of the detection volume around the zone. ELLIPSOID = oval (smoother), CYLINDER = flat circle, BOX = rectangular.",
+    "shape": "ELLIPSOID",
+
+    "_floorCeilingCheck_info": "If true, players standing directly above or below a zone won't trigger it — only players at roughly the same Y level.",
+    "floorCeilingCheck": true,
+
+    "_facingCheck_info": "If true, only trigger pre-loading if the player is actually facing toward the zone (reduces false triggers).",
+    "facingCheck": true,
+
+    "_cooldownSeconds_info": "After triggering a zone pre-load, wait this many seconds before the same zone can be triggered again. Prevents spam.",
+    "cooldownSeconds": 30,
+
+    "_commitWindowSeconds_info": "A player must be within range for this many seconds continuously before the pre-load actually starts. Filters brief walk-bys.",
+    "commitWindowSeconds": 3
+  },
+
+  "_section_ttl": "=== CACHE EXPIRY (TTL) ===",
+  "_ttl_info": "How long (in days) each cache tier is kept before being discarded. -1 means keep forever.",
+  "ttl": {
+    "_warm_info": "WARM zones (permanently held in RAM). -1 = never expire.",
+    "warm": -1,
+
+    "_recentHot_info": "Zones that were recently HOT (a player was just there). Kept for 7 days by default.",
+    "recentHot": 7,
+
+    "_predictive_info": "Zones pre-loaded by prediction. Shorter TTL since they may never be visited.",
+    "predictive": 2,
+
+    "_lowTraffic_info": "Zones flagged as low-traffic (below lowTrafficThreshold). Expire quickly to free RAM.",
+    "lowTraffic": 1,
+
+    "_bed_info": "Cached bed/spawn locations. Kept for 3 days.",
+    "bed": 3,
+
+    "_deathLocation_info": "Cached player death locations. Only need to persist for one session.",
+    "deathLocation": 1
+  },
+
+  "_section_cache": "=== DISK CACHE ===",
+  "cache": {
+    "_persistColdCache_info": "Save COLD-tier chunk geometry to disk so it survives server restarts. Strongly recommended.",
+    "persistColdCache": true,
+
+    "_cacheDirectory_info": "Folder (relative to the plugin directory) where cache files are stored.",
+    "cacheDirectory": "preload-cache/",
+
+    "_maxCacheAgeDays_info": "Delete cache files older than this many days on startup to prevent unbounded disk growth.",
+    "maxCacheAgeDays": 7,
+
+    "_predictiveCacheTTLDays_info": "How long predictive-cache files are kept on disk (should match ttl.predictive above).",
+    "predictiveCacheTTLDays": 2,
+
+    "_startupLoadStrategy_info": "Overrides the top-level startupLoadStrategy for the disk cache specifically. Usually keep these in sync.",
+    "startupLoadStrategy": "STAGED"
+  },
+
+  "_section_low_traffic": "=== LOW TRAFFIC ===",
+  "_lowTrafficThreshold_info": "If a zone has fewer than this many active players, it's considered 'low traffic' and uses a shorter TTL (see ttl.lowTraffic).",
+  "lowTrafficThreshold": 5,
+
+  "_immuneToSimulationReduction_info": "If true, PreloadPlugin-managed zones are never unloaded by Hytale's own simulation distance reduction. Keeps them stable.",
+  "immuneToSimulationReduction": true,
+
+  "_section_keepalive": "=== KEEPALIVE (PREVENT ZONES FROM GOING COLD) ===",
+  "_keepalive_info": "Periodically 'pings' zones to prevent them dropping to a lower tier. Useful for warps or hubs you want always-ready.",
+  "keepalive": {
+    "_hot_info": "Keep HOT zones hot (re-ping before they cool down).",
+    "hot": true,
+    "_warm_info": "Keep WARM zones warm.",
+    "warm": true,
+    "_cold_info": "Bring COLD zones back to WARM proactively. Disabled by default — enable for critical always-on zones.",
+    "cold": false,
+
+    "hotIntervalMinutes": 5,
+    "warmIntervalMinutes": 15,
+    "coldIntervalMinutes": 60
+  },
+
+  "_section_decay": "=== DECAY (HOW FAST ZONES COOL DOWN) ===",
+  "_decay_info": "Controls how quickly zones drop from HOT → WARM → COLD when no players are present.",
+  "decay": {
+    "_hotDecaySeconds_info": "Seconds after a player leaves before a HOT zone starts cooling toward WARM.",
+    "hotDecaySeconds": 30,
+
+    "_warmDecayMinutes_info": "Minutes a zone spends in WARM before dropping to COLD.",
+    "warmDecayMinutes": 60,
+
+    "_pollIntervalSeconds_info": "How often (seconds) the decay system checks all zones. Lower = more responsive, slightly more CPU.",
+    "pollIntervalSeconds": 1
+  },
+
+  "_section_warps": "=== WARP FILE INTEGRATION ===",
+  "_warps_info": "Point this at your server's warps.json so PreloadPlugin can pre-load warp destinations automatically.",
+  "warps": {
+    "sourcePath": "/home/sambashare/universe/warps.json",
+
+    "_watchForChanges_info": "Automatically reload the warp list when the file changes (e.g. a new warp is added) without restarting.",
+    "watchForChanges": true,
+    "watchIntervalSeconds": 30,
+
+    "_fields_info": "The field names in your warps.json. Adjust if your warp plugin uses different keys.",
+    "worldField": "World",
+    "idField": "Id",
+    "xField": "X",
+    "yField": "Y",
+    "zField": "Z",
+    "yawField": "Yaw"
+  },
+
+  "_section_gravestones": "=== GRAVESTONE FILE INTEGRATION ===",
+  "_gravestones_info": "Reads the Gravestones mod's data file so PreloadPlugin can pre-load the area around each gravestone.",
+  "gravestones": {
+    "sourcePath": "/home/sambashare/mods/Gravestones/gravestones.json",
+    "watchForChanges": true,
+    "watchIntervalSeconds": 5
+  },
+
+  "_section_integrations": "=== PLUGIN INTEGRATIONS ===",
+  "integrations": {
+    "gravestone": {
+      "_enabled_info": "Enable the Gravestones plugin integration. Requires the Gravestones plugin to be installed.",
+      "enabled": false,
+      "pluginId": "gravestones",
+
+      "_releaseOnBreak_info": "Stop keeping the gravestone's chunk loaded once the gravestone block is broken.",
+      "releaseOnBreak": true,
+
+      "_releaseOnEmpty_info": "Stop keeping the gravestone's chunk loaded once the gravestone is emptied (all items collected).",
+      "releaseOnEmpty": true
+    }
+  },
+
+  "_section_mysql": "=== MYSQL (only used if backend is set to MYSQL above) ===",
+  "mysql": {
+    "host": "localhost",
+    "port": 3306,
+    "database": "preload",
+    "username": "",
+    "password": "",
+    "tablePrefix": "pre_"
+  },
+
+  "_section_ui": "=== IN-GAME UI ===",
+  "_ui_info": "Controls what's shown in the PreloadPlugin admin UI panel.",
+  "ui": {
+    "_showInstancedPortals_info": "Show instanced (per-player) portals in the zone table.",
+    "showInstancedPortals": false,
+    "_showBedSpawns_info": "Show player bed/spawn cache entries in the UI.",
+    "showBedSpawns": true,
+    "_showDeathLocations_info": "Show cached death locations in the UI.",
+    "showDeathLocations": true
+  },
+
+  "_section_metrics": "=== BSTATS METRICS ===",
+  "_metrics_info": "Anonymous usage stats sent to bStats (bstats.org). Helps the developer see how the plugin is used.",
+  "metrics": {
+    "bstatsEnabled": true,
+    "_bstatsPluginId_info": "Your plugin's bStats ID. Leave 0 if you haven't registered it yet.",
+    "bstatsPluginId": 0
+  },
+
+  "_section_updates": "=== UPDATE CHECKER ===",
+  "updateChecker": {
+    "_enabled_info": "Check for new PreloadPlugin versions on startup and notify in the console.",
+    "enabled": true
+  }
+}
