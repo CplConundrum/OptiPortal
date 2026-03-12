@@ -1,0 +1,90 @@
+$C = "Common.ui";
+
+$C.@Container {
+  Anchor: (Width: 920, Height: 660);
+
+  #Title {
+    Group {
+      $C.@Title {
+        @Text = "OptiPortal — Zone Cache Status";
+      }
+    }
+  }
+
+  #Content {
+    LayoutMode: Top;
+
+    Group #TableHeader {
+      LayoutMode: Left;
+      Anchor: (Horizontal: 8, Top: 8, Bottom: 4);
+
+      Label #HdrTier {
+        Style: (FontSize: 14, RenderBold: true);
+        Anchor: (Width: 90);
+      }
+      Label #HdrName {
+        Style: (FontSize: 14, RenderBold: true);
+        Anchor: (Width: 180);
+      }
+      Label #HdrStrat {
+        Style: (FontSize: 14, RenderBold: true);
+        Anchor: (Width: 90);
+      }
+      Label #HdrRadius {
+        Style: (FontSize: 14, RenderBold: true);
+        Anchor: (Width: 90);
+      }
+      Label #HdrRam {
+        Style: (FontSize: 14, RenderBold: true);
+        Anchor: (Width: 90);
+      }
+    }
+
+    Group #TableBody {
+      LayoutMode: Left;
+      Anchor: (Horizontal: 8, Top: 4, Bottom: 8);
+      FlexWeight: 1;
+
+      Label #ColTier {
+        Style: (FontSize: 12);
+        Anchor: (Width: 90);
+      }
+      Label #ColName {
+        Style: (FontSize: 12);
+        Anchor: (Width: 180);
+      }
+      Label #ColStrat {
+        Style: (FontSize: 12);
+        Anchor: (Width: 90);
+      }
+      Label #ColRadius {
+        Style: (FontSize: 12);
+        Anchor: (Width: 90);
+      }
+      Label #ColRam {
+        Style: (FontSize: 12);
+        Anchor: (Width: 90);
+      }
+    }
+
+    Label #CommandRef1 {
+      Style: (FontSize: 10);
+      Anchor: (Horizontal: 8, Top: 8, Bottom: 2);
+    }
+
+    Label #CommandRef2 {
+      Style: (FontSize: 10);
+      Anchor: (Horizontal: 8, Top: 2, Bottom: 4);
+    }
+
+    Label #WarpStats {
+      Style: (FontSize: 11);
+      Anchor: (Horizontal: 8, Top: 4, Bottom: 4);
+    }
+
+    Label #StorageBackend {
+      Style: (FontSize: 10);
+      Anchor: (Horizontal: 8, Top: 2, Bottom: 14);
+    }
+  }
+}

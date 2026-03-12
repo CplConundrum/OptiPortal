@@ -83,7 +83,7 @@ public class ChunkPreloader {
             }
         }
         int skipped = allChunks.size() - toLoad.size();
-        if (skipped > 0) LOG.info("[OptiPortal] predictiveLoad " + zoneId + ": skipped " + skipped + " already-owned chunks");
+        if (skipped > 0 && toLoad.size() > 0) LOG.info("[OptiPortal] predictiveLoad " + zoneId + ": skipped " + skipped + " already-owned chunks");
 
         CompletableFuture<Void> future = toLoad.isEmpty()
                 ? CompletableFuture.completedFuture(null)
@@ -97,7 +97,9 @@ public class ChunkPreloader {
                     cacheManager.registerOwnership(zid, worldName, coord[0], coord[1]);
                 }
                 cacheManager.setZoneTier(zid, com.optiportal.model.CacheTier.HOT);
-                LOG.info("[OptiPortal] predictiveLoad complete: " + zid + " → HOT (loaded=" + toLoad.size() + " shared=" + skipped + ")");
+                if (toLoad.size() > 0) {
+                    LOG.info("[OptiPortal] predictiveLoad complete: " + zid + " → HOT (loaded=" + toLoad.size() + " shared=" + skipped + ")");
+                }
             });
         }
         return future;

@@ -13,7 +13,7 @@ import com.optiportal.integrations.WarpFileWatcher;
 import com.optiportal.metrics.MetricsCollector;
 import com.optiportal.metrics.bStatsIntegration;
 import com.optiportal.model.WarmStrategy;
-import com.optiportal.player.BedTracker;
+import com.optiportal.player.RespawnTracker;
 import com.optiportal.player.DeathLocationTracker;
 import com.optiportal.preload.ChunkPreloader;
 import com.optiportal.preload.WarmZoneManager;
@@ -67,7 +67,7 @@ public class OptiPortal extends JavaPlugin {
     private com.optiportal.preload.PortalLinkRegistry portalLinkRegistry;
 
     // Player tracking
-    private BedTracker bedTracker;
+    private RespawnTracker respawnTracker;
     private DeathLocationTracker deathLocationTracker;
 
     // Integrations
@@ -119,14 +119,14 @@ public class OptiPortal extends JavaPlugin {
             warmZoneManager.registerWorldsLoadedListener(getEventRegistry());
 
             // Player trackers
-            bedTracker = new BedTracker(config, storage, cacheManager, chunkPreloader);
+            respawnTracker = new RespawnTracker(config, storage, cacheManager, chunkPreloader);
             deathLocationTracker = new DeathLocationTracker(config, storage, cacheManager, chunkPreloader);
 
             // Portal link registry — learns links from observed teleports
             portalLinkRegistry = new com.optiportal.preload.PortalLinkRegistry(getDataDirectory().toFile());
 
             // Teleport interceptor
-            teleportInterceptor = new TeleportInterceptor(this, config, warmZoneManager, chunkPreloader, storage, portalLinkRegistry, executor);
+            teleportInterceptor = new TeleportInterceptor(this, config, warmZoneManager, chunkPreloader, storage, portalLinkRegistry, respawnTracker, deathLocationTracker, gravestoneIntegration, executor);
 
             // File watchers
             warpFileWatcher = new WarpFileWatcher(config, storage, warmZoneManager, executor);
@@ -279,7 +279,7 @@ public class OptiPortal extends JavaPlugin {
     public ChunkPreloader getChunkPreloader() { return chunkPreloader; }
     public WalManager getWalManager() { return walManager; }
     public WarpFileWatcher getWarpFileWatcher() { return warpFileWatcher; }
-    public BedTracker getBedTracker() { return bedTracker; }
+    public RespawnTracker getRespawnTracker() { return respawnTracker; }
     public DeathLocationTracker getDeathLocationTracker() { return deathLocationTracker; }
     public MetricsCollector getMetricsCollector() { return metricsCollector; }
     public ScheduledExecutorService getExecutor() { return executor; }

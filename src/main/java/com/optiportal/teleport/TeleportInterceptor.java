@@ -14,6 +14,9 @@ import com.hypixel.hytale.server.core.modules.entity.teleport.TeleportRecord;
 import com.hypixel.hytale.server.core.universe.world.WorldMapTracker;
 import com.optiportal.OptiPortal;
 import com.optiportal.config.PluginConfig;
+import com.optiportal.player.DeathLocationTracker;
+import com.optiportal.player.RespawnTracker;
+import com.optiportal.integrations.GravestoneIntegration;
 import com.optiportal.model.PortalEntry;
 import com.optiportal.model.WarmStrategy;
 import com.optiportal.preload.ChunkPreloader;
@@ -52,6 +55,16 @@ public class TeleportInterceptor {
     private final ChunkPreloader chunkPreloader;
     private final StorageBackend storage;
     private final com.optiportal.preload.PortalLinkRegistry portalLinkRegistry;
+    private final RespawnTracker respawnTracker;
+    private final DeathLocationTracker deathLocationTracker;
+    private final GravestoneIntegration gravestoneIntegration;
+
+    /**
+     * Fallback pending respawn set used when GravestoneIntegration is null
+     * (gravestones plugin not installed). Populated by the re-login detection
+     * in onPlayerReady.
+     */
+    private final Set<UUID> pendingRespawnCapture = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
     /** Separate cooldown for reverse preloads — independent of proximity cooldown. */
     private final ConcurrentHashMap<String, Long> reversePreloadCooldowns = new ConcurrentHashMap<>();
@@ -66,13 +79,15 @@ public class TeleportInterceptor {
     private final ScheduledExecutorService executor;
     // Track last-seen TeleportRecord timestamp per player to avoid re-triggering
     private final ConcurrentHashMap<UUID, Long> lastSeenTeleportNanos = new ConcurrentHashMap<>();
-    /** Tracks origin zone per player for 30s linger HOT on teleport */
-    private final ConcurrentHashMap<UUID, String> lastOriginZone = new ConcurrentHashMap<>();
+    /** Tracks player's last known position before teleport for origin portal detection */
+    private final ConcurrentHashMap<UUID, double[]> lastKnownPosition = new ConcurrentHashMap<>();
 
     public TeleportInterceptor(OptiPortal plugin, PluginConfig config,
                                WarmZoneManager warmZoneManager,
                                ChunkPreloader chunkPreloader, StorageBackend storage,
                                com.optiportal.preload.PortalLinkRegistry portalLinkRegistry,
+                               RespawnTracker respawnTracker, DeathLocationTracker deathLocationTracker,
+                               GravestoneIntegration gravestoneIntegration,
                                ScheduledExecutorService executor) {
         this.plugin = plugin;
         this.config = config;
@@ -80,6 +95,9 @@ public class TeleportInterceptor {
         this.chunkPreloader = chunkPreloader;
         this.storage = storage;
         this.portalLinkRegistry = portalLinkRegistry;
+        this.respawnTracker = respawnTracker;
+        this.deathLocationTracker = deathLocationTracker;
+        this.gravestoneIntegration = gravestoneIntegration;
         this.executor = executor;
         // Poll TeleportRecord every second to detect walk-through portal teleports.
         // No portal-use event exists in Hytale for zone-trigger portals.
@@ -186,7 +204,7 @@ public class TeleportInterceptor {
             UUID uuid = entry.getKey();
             PlayerRef pRef = entry.getValue();
             try {
-                World world = chunkPreloader.getWorldRegistry().getAnyWorld();
+                World world = chunkPreloader.getWorldRegistry().getWorldForPlayer(pRef);
                 if (world == null) continue;
                 final World w = world;
                 w.execute(() -> {
@@ -210,14 +228,18 @@ public class TeleportInterceptor {
                                                 final String dw = destWorld;
                                                 final double dx = pos.x, dy = pos.y, dz = pos.z;
                                                 final UUID fUuid = uuid;
+                                                // Snapshot pre-teleport position for origin portal lookup
+                                                final double[] prePos = lastKnownPosition.get(fUuid);
                                                 executor.execute(() -> {
                                                     System.out.println("[OptiPortal] Poll teleport → "
                                                         + dx + "," + dy + "," + dz + " world=" + dw);
-                                                    // Snapshot origin BEFORE proximity check overwrites lastOriginZone
-                                                    String snapshotOrigin = lastOriginZone.get(fUuid);
                                                     lingerOriginZone(fUuid);
-                                                    checkProximityAndPreload(fUuid, dw, dx, dy, dz, null);
-                                                    reversePreloadOrigin(fUuid, snapshotOrigin, dw, dx, dy, dz);
+                                                    checkProximityAndPreload(fUuid, dw, dx, dy, dz);
+                                                    // Derive origin portal from pre-teleport position
+                                                    String originId = prePos != null
+                                                        ? findNearestPortal(dw.equals(w.getName()) ? dw : w.getName(), prePos[0], prePos[1], prePos[2])
+                                                        : null;
+                                                    reversePreloadOrigin(fUuid, originId, dw, dx, dy, dz);
                                                 });
                                             }
                                         }
@@ -235,9 +257,10 @@ public class TeleportInterceptor {
                             final double cx = transform.getPosition().x;
                             final double cy = transform.getPosition().y;
                             final double cz = transform.getPosition().z;
+                            // Save position for origin detection on next teleport
+                            lastKnownPosition.put(uuid, new double[]{cx, cy, cz});
                             final UUID fUuid2 = uuid;
-                            final com.hypixel.hytale.math.vector.Transform tr = transform;
-                            executor.execute(() -> checkProximityAndPreload(fUuid2, curWorld, cx, cy, cz, tr));
+                            executor.execute(() -> checkProximityAndPreload(fUuid2, curWorld, cx, cy, cz));
                         }
                     } catch (Exception e) {
                         System.out.println("[OptiPortal] poll error: " + e);
@@ -275,7 +298,7 @@ public class TeleportInterceptor {
                 com.hypixel.hytale.math.vector.Vector3d dest = usedTeleporter.getDestinationPosition();
                 System.out.println("[OptiPortal] UsedTeleporter detected: dest="
                     + dest.x + "," + dest.y + "," + dest.z + " world=" + worldName);
-                checkProximityAndPreload(null, worldName, dest.x, dest.y, dest.z, null);
+                checkProximityAndPreload(null, worldName, dest.x, dest.y, dest.z);
             } else {
                 System.out.println("[OptiPortal] AddPlayerToWorld: no UsedTeleporter (login or non-teleporter move)");
             }
@@ -283,27 +306,16 @@ public class TeleportInterceptor {
     }
 
     /**
-     * Overload for teleport-destination checks (no rotation available).
+     * Check proximity to all portals and trigger preload if within activation distance.
      */
-    private void checkProximityAndPreload(UUID playerUuid, String worldName, double px, double py, double pz,
-                                          com.hypixel.hytale.math.vector.Transform transform) {
+    private void checkProximityAndPreload(UUID playerUuid, String worldName, double px, double py, double pz) {
         double maxDist = config.getActivationDistance();
         final double VERTICAL_BOUND = 4.0;
-
-        // Forward vector from yaw (if rotation available)
-        double fwdX = 0, fwdZ = 0;
-        boolean hasRotation = false;
-        if (transform != null && transform.getRotation() != null) {
-            // Hytale yaw: negated to match actual facing direction
-            double yawRad = Math.toRadians(transform.getRotation().x);
-            fwdX = Math.sin(yawRad);
-            fwdZ = -Math.cos(yawRad);
-            hasRotation = true;
-        }
 
         for (com.optiportal.model.PortalEntry entry : storage.loadAll()) {
             if (entry.isInstanced()) continue;
             if (!entry.getWorld().equals(worldName)) continue;
+            if (entry.getId().contains(":")) continue; // skip death:, respawn:, etc.
 
             // Vertical hard bound
             double dy = Math.abs(py - entry.getY());
@@ -311,18 +323,7 @@ public class TeleportInterceptor {
             double toZ = entry.getZ() - pz;
             double horizDist = Math.sqrt(toX * toX + toZ * toZ);
             if (dy > VERTICAL_BOUND) continue;
-            if (horizDist > maxDist) continue; // quick reject
-
-            if (hasRotation) {
-                // Dot product: cos(angle) between forward vector and portal direction
-                double dot = (horizDist > 0)
-                    ? (fwdX * toX + fwdZ * toZ) / horizDist
-                    : 1.0;
-                if (dot <= 0) continue; // behind player — never activate
-                // Effective radius = maxDist * dot (gentle cosine falloff)
-                double effectiveDist = maxDist * dot;
-                if (horizDist > effectiveDist) continue;
-            }
+            if (horizDist > maxDist) continue;
 
             String id = entry.getId();
             int cx = ChunkPreloader.toChunkCoord(entry.getX());
@@ -335,8 +336,6 @@ public class TeleportInterceptor {
                 com.optiportal.model.CacheTier current = cm.getZoneTier(id);
                 if (current != com.optiportal.model.CacheTier.HOT) {
                     cm.setZoneTier(id, com.optiportal.model.CacheTier.HOT);
-                    // Track as potential origin for next teleport linger
-                    if (playerUuid != null) lastOriginZone.put(playerUuid, id);
                     System.out.println("[OptiPortal] Proximity HOT: " + id
                         + " dist=" + String.format("%.1f", horizDist)
                         + " (was " + current + ")");
@@ -345,7 +344,6 @@ public class TeleportInterceptor {
                 // PREDICTIVE: cooldown guards chunk load
                 if (isOnCooldown(null, id)) continue;
                 recordCooldown(null, id);
-                if (playerUuid != null) lastOriginZone.put(playerUuid, id);
                 System.out.println("[OptiPortal] Proximity PREDICTIVE: " + id
                     + " dist=" + String.format("%.1f", horizDist) + " → load cx=" + cx + " cz=" + cz);
                 predictiveLoadWithRam(id, worldName, cx, cz, radius);
@@ -354,9 +352,10 @@ public class TeleportInterceptor {
             // If we know the linked portal for this one, preload it too
             String linkedId = portalLinkRegistry.getLinkedPortal(id);
             if (linkedId != null) {
-                long lastReverseLoad = reversePreloadCooldowns.getOrDefault(linkedId, 0L);
-                if (System.currentTimeMillis() - lastReverseLoad >= 5_000L) {
-                    reversePreloadCooldowns.put(linkedId, System.currentTimeMillis());
+                long now = System.currentTimeMillis();
+                boolean shouldFire = reversePreloadCooldowns.compute(linkedId, (k, last) ->
+                        (last == null || now - last >= 30_000L) ? now : last) == now;
+                if (shouldFire) {
                     storage.loadById(linkedId).ifPresent(linked -> {
                         int lcx = ChunkPreloader.toChunkCoord(linked.getX());
                         int lcz = ChunkPreloader.toChunkCoord(linked.getZ());
@@ -384,6 +383,7 @@ public class TeleportInterceptor {
         for (PortalEntry entry : storage.loadAll()) {
             if (entry.isInstanced()) continue;
             if (!entry.getWorld().equals(destWorld)) continue;
+            if (entry.getId().contains(":")) continue;
             double dist = Math.sqrt(Math.pow(entry.getX() - dx, 2) + Math.pow(entry.getZ() - dz, 2));
 
             // Exact match (within 1 block) — teleporter lands the player precisely on the warp coords
@@ -401,14 +401,15 @@ public class TeleportInterceptor {
         if (destEntry == null) return;
         if (bestDist > config.getActivationDistance() * 2) return; // sanity bound
 
-        // Record the learned link if origin is known
-        if (originId != null && !originId.equals(destEntry.getId())) {
+        // Record the learned link if origin is known and both IDs are plain portal names
+        if (originId != null && !originId.equals(destEntry.getId())
+                && !originId.contains(":") && !destEntry.getId().contains(":")) {
             portalLinkRegistry.recordLink(originId, destEntry.getId());
         }
 
         // Preload the destination portal
         long lastReverseLoad = reversePreloadCooldowns.getOrDefault(destEntry.getId(), 0L);
-        if (System.currentTimeMillis() - lastReverseLoad < 5_000L) return;
+        if (System.currentTimeMillis() - lastReverseLoad < 30_000L) return;
         reversePreloadCooldowns.put(destEntry.getId(), System.currentTimeMillis());
         int cx = ChunkPreloader.toChunkCoord(destEntry.getX());
         int cz = ChunkPreloader.toChunkCoord(destEntry.getZ());
@@ -422,12 +423,40 @@ public class TeleportInterceptor {
      * Linger: keeps the player's last active zone HOT for 30s after teleport.
      * The existing HOT→WARM decay timer handles cleanup — no extra scheduling needed.
      */
+    private String findNearestPortal(String worldName, double px, double py, double pz) {
+        String best = null;
+        double bestDist = config.getActivationDistance();
+        for (PortalEntry entry : storage.loadAll()) {
+            if (entry.isInstanced()) continue;
+            if (!entry.getWorld().equals(worldName)) continue;
+            if (entry.getId().contains(":")) continue;
+            double dist = Math.sqrt(Math.pow(entry.getX() - px, 2) + Math.pow(entry.getZ() - pz, 2));
+            if (dist <= bestDist) {
+                bestDist = dist;
+                best = entry.getId();
+            }
+        }
+        return best;
+    }
+
     private void lingerOriginZone(UUID playerUuid) {
-        String prevZoneId = lastOriginZone.get(playerUuid);
-        if (prevZoneId == null) return;
+        double[] prePos = lastKnownPosition.get(playerUuid);
+        if (prePos == null) return;
+        // Find nearest portal to pre-teleport position across all worlds
+        String prevZoneId = null;
+        double bestDist = Double.MAX_VALUE;
+        for (PortalEntry entry : storage.loadAll()) {
+            if (entry.isInstanced()) continue;
+            if (entry.getId().contains(":")) continue;
+            double dist = Math.sqrt(Math.pow(entry.getX() - prePos[0], 2) + Math.pow(entry.getZ() - prePos[2], 2));
+            if (dist < bestDist) {
+                bestDist = dist;
+                prevZoneId = entry.getId();
+            }
+        }
+        if (prevZoneId == null || bestDist > config.getActivationDistance()) return;
         plugin.getCacheManager().setZoneTier(prevZoneId, com.optiportal.model.CacheTier.HOT);
         System.out.println("[OptiPortal] Linger HOT: " + prevZoneId + " (30s decay will clean up)");
-        lastOriginZone.remove(playerUuid);
     }
 
     /**
@@ -445,17 +474,60 @@ public class TeleportInterceptor {
         plugin.getLogger().at(java.util.logging.Level.INFO).log(
                 "[OptiPortal] PlayerReady in world: " + worldName);
 
-        // Seed WorldRegistry and cache PlayerRef
+        // Seed WorldRegistry and cache PlayerRef.
+        // If the UUID is already in playerRefs, this is a respawn or return from instance
+        // rather than a fresh login — mark as pending respawn capture.
         chunkPreloader.getWorldRegistry().addWorld(world);
         @SuppressWarnings("deprecation")
         PlayerRef ref = player.getPlayerRef();
         if (ref != null) {
             UUID uuid = ref.getUuid();
-            if (uuid != null) playerRefs.put(uuid, ref);
+            if (uuid != null) {
+                boolean alreadyOnline = playerRefs.containsKey(uuid);
+                playerRefs.put(uuid, ref);
+                if (alreadyOnline && (gravestoneIntegration == null || !gravestoneIntegration.hasPendingRespawn(uuid))) {
+                    // No gravestone event fired (gravestones disabled or not installed),
+                    // but player re-entered the ready state while already online —
+                    // treat as death/instance return and capture their spawn position.
+                    if (gravestoneIntegration != null) {
+                        gravestoneIntegration.markPendingRespawn(uuid);
+                    } else {
+                        pendingRespawnCapture.add(uuid);
+                    }
+                    System.out.println("[OptiPortal] Respawn detected (no gravestones) for " + uuid);
+                }
+            }
         }
 
         // Trigger staged warm load on first player join.
         warmZoneManager.triggerStagedLoadOnce();
+
+        // Pre-load death location and handle respawn position tracking.
+        if (ref != null && ref.getUuid() != null) {
+            UUID preloadUuid = ref.getUuid();
+
+            // Always preload the death location if one exists.
+            deathLocationTracker.preloadDeathLocation(preloadUuid);
+
+            // If the player died/returned from instance, capture their spawn position
+            // as the new respawn location. Otherwise preload their known respawn point.
+            boolean pendingCapture = (gravestoneIntegration != null && gravestoneIntegration.consumePendingRespawn(preloadUuid))
+                    || pendingRespawnCapture.remove(preloadUuid);
+            if (pendingCapture) {
+                com.hypixel.hytale.server.core.universe.PlayerRef captureRef = playerRefs.get(preloadUuid);
+                if (captureRef != null) {
+                    com.hypixel.hytale.math.vector.Transform transform = captureRef.getTransform();
+                    if (transform != null && transform.getPosition() != null) {
+                        double rx = transform.getPosition().x;
+                        double ry = transform.getPosition().y;
+                        double rz = transform.getPosition().z;
+                        respawnTracker.onRespawn(preloadUuid, rx, ry, rz, worldName);
+                    }
+                }
+            } else {
+                respawnTracker.preloadRespawn(preloadUuid);
+            }
+        }
 
         // Read TeleportRecord from the cached PlayerRef to detect same-world portal teleports.
         // PlayerRef.getComponent() is a direct convenience method — no Holder traversal needed.
@@ -476,7 +548,7 @@ public class TeleportInterceptor {
                             if (pos != null) {
                                 System.out.println("[OptiPortal] TeleportRecord dest: "
                                     + pos.x + "," + pos.y + "," + pos.z + " world=" + destWorld);
-                                checkProximityAndPreload(null, destWorld, pos.x, pos.y, pos.z, null);
+                                checkProximityAndPreload(null, destWorld, pos.x, pos.y, pos.z);
                             }
                         }
                     }

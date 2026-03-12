@@ -57,7 +57,7 @@ public class PreloadCommand extends AbstractCommand {
                                     playerRef.getComponent(
                                             com.hypixel.hytale.server.core.entity.entities.Player.getComponentType());
                             if (player != null) {
-                                com.optiportal.ui.PreloadUIPage.openFor(player, playerRef, plugin);
+                                com.optiportal.ui.OptiPortalUIPage.openFor(player, playerRef, plugin);
                             }
                         });
                         return done();

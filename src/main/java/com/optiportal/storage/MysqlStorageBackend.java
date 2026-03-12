@@ -47,15 +47,14 @@ public class MysqlStorageBackend extends AbstractSqlStorageBackend {
                 ram_estimated, ram_marginal,
                 preload_count, last_cache_tier, last_active, last_status,
                 entry_type, updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?,?,?)
             ON DUPLICATE KEY UPDATE
                 world=VALUES(world), x=VALUES(x), y=VALUES(y), z=VALUES(z),
                 yaw=VALUES(yaw), strategy=VALUES(strategy),
                 warm_radius=VALUES(warm_radius), warm_radius_x=VALUES(warm_radius_x),
                 warm_radius_z=VALUES(warm_radius_z), instanced=VALUES(instanced),
                 notes=VALUES(notes), cache_ttl_days=VALUES(cache_ttl_days),
-                ram_estimated=VALUES(ram_estimated), ram_measured=VALUES(ram_measured),
-                ram_measured_at=VALUES(ram_measured_at), ram_marginal=VALUES(ram_marginal),
+                ram_estimated=VALUES(ram_estimated), ram_marginal=VALUES(ram_marginal),
                 preload_count=VALUES(preload_count), last_cache_tier=VALUES(last_cache_tier),
                 last_active=VALUES(last_active), last_status=VALUES(last_status),
                 entry_type=VALUES(entry_type), updated_at=VALUES(updated_at)

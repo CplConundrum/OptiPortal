@@ -53,6 +53,7 @@ public class PortalLinkRegistry {
     public void recordLink(String originId, String destinationId) {
         if (originId == null || destinationId == null) return;
         if (originId.equals(destinationId)) return;
+        if (isPlayerDataId(originId) || isPlayerDataId(destinationId)) return;
 
         // Skip if link is already correct — avoids unnecessary map writes and disk I/O
         if (destinationId.equals(links.get(originId)) && originId.equals(links.get(destinationId))) return;
@@ -118,6 +119,11 @@ public class PortalLinkRegistry {
         } catch (Exception e) {
             LOG.warning("[OptiPortal] PortalLinks: failed to load portal-links.json: " + e.getMessage());
         }
+    }
+
+    /** Returns true for player-data entry IDs that should never participate in link learning. */
+    private static boolean isPlayerDataId(String id) {
+        return id.startsWith("death:") || id.startsWith("respawn:");
     }
 
     private void save() {
