@@ -1,16 +1,16 @@
 package com.optiportal.commands;
 
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+
+import com.hypixel.hytale.server.core.Message;
 import com.hypixel.hytale.server.core.command.system.AbstractCommand;
 import com.hypixel.hytale.server.core.command.system.CommandContext;
-import com.hypixel.hytale.server.core.Message;
 import com.optiportal.OptiPortal;
 import com.optiportal.model.PortalEntry;
 import com.optiportal.model.WarmStrategy;
 import com.optiportal.preload.ChunkPreloader;
-
-import java.util.List;
-import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
 
 /**
  * /preload command — uses withDefaultArg so the framework accepts zero tokens.
@@ -78,7 +78,6 @@ public class PreloadCommand extends AbstractCommand {
             case "reload"    -> handleReload(context);
             case "setwarm"   -> handleSetWarm(context, args);
             case "unsetwarm" -> handleUnsetWarm(context, args);
-            case "stats"     -> handleStats(context);
             case "refresh"   -> handleRefresh(context, args);
             case "backup"    -> handleBackup(context, args);
             case "preload"   -> handleForcePreload(context, args);
@@ -104,7 +103,6 @@ public class PreloadCommand extends AbstractCommand {
         reply(ctx, "  /preload unsetwarm <id> — revert to PREDICTIVE");
         reply(ctx, "  /preload preload <id> — force predictive preload");
         reply(ctx, "  /preload ram — RAM usage summary");
-        reply(ctx, "  /preload stats — metrics summary");
         reply(ctx, "  /preload refresh warps — re-read warps.json");
         reply(ctx, "  /preload reload — hot-reload config.json (see output for what takes effect immediately)");
         reply(ctx, "  /preload migrate <JSON|SQLITE|H2|MYSQL> — migration instructions");
@@ -231,11 +229,6 @@ public class PreloadCommand extends AbstractCommand {
             reply(ctx, "[OptiPortal] " + id + " → PREDICTIVE. Warm chunks released.");
             return CompletableFuture.<Void>completedFuture(null);
         }).orElseGet(() -> { reply(ctx, "[OptiPortal] Portal '" + id + "' not found."); return done(); });
-    }
-
-    private CompletableFuture<Void> handleStats(CommandContext ctx) {
-        reply(ctx, plugin.getMetricsCollector().getSummary());
-        return done();
     }
 
     private CompletableFuture<Void> handleRefresh(CommandContext ctx, String[] args) {

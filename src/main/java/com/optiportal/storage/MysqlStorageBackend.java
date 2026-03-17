@@ -1,5 +1,9 @@
 package com.optiportal.storage;
 
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+
 import com.optiportal.config.PluginConfig;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
@@ -32,9 +36,16 @@ public class MysqlStorageBackend extends AbstractSqlStorageBackend {
     // Note: MySQL does not use ON CONFLICT syntax - override save() to use INSERT ... ON DUPLICATE KEY UPDATE
     @Override
     public void save(com.optiportal.model.PortalEntry entry) {
-        // TODO: Override with MySQL-specific UPSERT syntax when implementing
-        // INSERT INTO portal_entries (...) VALUES (...) ON DUPLICATE KEY UPDATE ...
-        super.save(entry);
+        // Use the MySQL-specific UPSERT syntax for better performance
+        String sql = upsertSql();
+        
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            bindEntry(ps, entry);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            System.err.println("[OptiPortal] SQL save error: " + e.getMessage());
+        }
     }
 
     @Override
@@ -47,7 +58,7 @@ public class MysqlStorageBackend extends AbstractSqlStorageBackend {
                 ram_estimated, ram_marginal,
                 preload_count, last_cache_tier, last_active, last_status,
                 entry_type, updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON DUPLICATE KEY UPDATE
                 world=VALUES(world), x=VALUES(x), y=VALUES(y), z=VALUES(z),
                 yaw=VALUES(yaw), strategy=VALUES(strategy),

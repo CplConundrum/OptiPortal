@@ -1,5 +1,7 @@
 package com.optiportal.ui;
 
+import java.util.List;
+
 import com.hypixel.hytale.codec.builder.BuilderCodec;
 import com.hypixel.hytale.component.Ref;
 import com.hypixel.hytale.component.Store;
@@ -17,8 +19,6 @@ import com.optiportal.config.PluginConfig;
 import com.optiportal.model.CacheTier;
 import com.optiportal.model.PortalEntry;
 import com.optiportal.model.WarmStrategy;
-
-import java.util.List;
 
 public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.Data> {
 
@@ -60,16 +60,26 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.D
         // Set column headers
         cmd.set("#HdrTier.Text",   "TIER");
         cmd.set("#HdrName.Text",   "NAME");
+        cmd.set("#HdrType.Text",   "TYPE");
         cmd.set("#HdrStrat.Text",  "STRAT");
         cmd.set("#HdrRadius.Text", "RADIUS");
         cmd.set("#HdrRam.Text",    "RAM");
+        cmd.set("#HdrRamMarginal.Text", "RAM+");
+        cmd.set("#HdrPreload.Text", "PRELOAD");
+        cmd.set("#HdrTTL.Text",    "TTL");
+        cmd.set("#HdrStatus.Text", "STATUS");
 
         // Build each column as a separate multi-line string
         StringBuilder colTier   = new StringBuilder();
         StringBuilder colName   = new StringBuilder();
+        StringBuilder colType   = new StringBuilder();
         StringBuilder colStrat  = new StringBuilder();
         StringBuilder colRadius = new StringBuilder();
         StringBuilder colRam    = new StringBuilder();
+        StringBuilder colRamMarginal = new StringBuilder();
+        StringBuilder colPreload = new StringBuilder();
+        StringBuilder colTTL    = new StringBuilder();
+        StringBuilder colStatus = new StringBuilder();
 
         for (PortalEntry z : zones) {
             CacheTier tier   = cache.getZoneTier(z.getId());
@@ -95,12 +105,48 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.D
                 default         -> "[-]";
             };
 
+            String statusLabel = switch (tier) {
+                case HOT        -> "Active";
+                case WARM       -> "Warm";
+                case COLD       -> "Cold";
+                case REBUILDING -> "Rebuilding";
+                case UNVISITED  -> "Unvisited";
+                default         -> "Unknown";
+            };
+
+            // Entry type label
+            String typeLabel = switch (z.getType()) {
+                case PORTAL -> "PORTAL";
+                case BED    -> "BED";
+                case DEATH  -> "DEATH";
+                case MANUAL -> "MANUAL";
+            };
+
+            // Strategy label
+            String stratLabel = z.getStrategy() == WarmStrategy.WARM ? "WARM" : "PRED";
+
+            // RAM marginal info
+            String ramMarginal = z.getRamMarginalMB() > 0
+                    ? String.format("+%.2f MB", z.getRamMarginalMB()) : "--";
+
+            // Preload count
+            String preload = z.getPreloadCount() > 0 ? String.valueOf(z.getPreloadCount()) : "--";
+
+            // Cache TTL info
+            String ttl = z.getCacheTTLDays() != null && z.getCacheTTLDays() > 0
+                    ? z.getCacheTTLDays() + "d" : "--";
+
             colTier.append(tierLabel).append("\n");
             colName.append(z.getId()).append("\n");
-            colStrat.append(z.getStrategy() == WarmStrategy.WARM ? "WARM" : "PRED").append("\n");
+            colType.append(typeLabel).append("\n");
+            colStrat.append(stratLabel).append("\n");
             colRadius.append("r=").append(radius).append("\n");
             colRam.append(z.getRamEstimatedMB() > 0
-                    ? String.format("%.0f MB", z.getRamEstimatedMB()) : "--").append("\n");
+                    ? String.format("%.2f MB", z.getRamEstimatedMB()) : "--").append("\n");
+            colRamMarginal.append(ramMarginal).append("\n");
+            colPreload.append(preload).append("\n");
+            colTTL.append(ttl).append("\n");
+            colStatus.append(statusLabel).append("\n");
         }
 
         if (zones.isEmpty()) {
@@ -109,15 +155,20 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.D
 
         cmd.set("#ColTier.Text",   colTier.toString().trim());
         cmd.set("#ColName.Text",   colName.toString().trim());
+        cmd.set("#ColType.Text",   colType.toString().trim());
         cmd.set("#ColStrat.Text",  colStrat.toString().trim());
         cmd.set("#ColRadius.Text", colRadius.toString().trim());
         cmd.set("#ColRam.Text",    colRam.toString().trim());
+        cmd.set("#ColRamMarginal.Text", colRamMarginal.toString().trim());
+        cmd.set("#ColPreload.Text", colPreload.toString().trim());
+        cmd.set("#ColTTL.Text",    colTTL.toString().trim());
+        cmd.set("#ColStatus.Text", colStatus.toString().trim());
 
         cmd.set("#CommandRef1.Text",
                 "/preload list   /preload strategy <id> <WARM|PRED>   /preload radius <id> <n>   " +
                 "/preload radiusxz <id> <rx> <rz>   /preload setwarm <id> [r]   /preload unsetwarm <id>");
         cmd.set("#CommandRef2.Text",
-                "/preload ram   /preload stats   /preload refresh warps   /preload reload   " +
+                "/preload ram   /preload refresh warps   /preload reload   " +
                 "/preload migrate <backend>   /preload backup <list|restore <date>>   /preload help");
 
         cmd.set("#WarpStats.Text", String.format(

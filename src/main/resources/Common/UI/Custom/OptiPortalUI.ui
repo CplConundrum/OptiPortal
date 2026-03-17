@@ -1,7 +1,7 @@
 $C = "Common.ui";
 
 $C.@Container {
-  Anchor: (Width: 920, Height: 660);
+  Anchor: (Width: 960, Height: 720);
 
   #Title {
     Group {
@@ -16,75 +16,115 @@ $C.@Container {
 
     Group #TableHeader {
       LayoutMode: Left;
-      Anchor: (Horizontal: 8, Top: 8, Bottom: 4);
+      Anchor: (Horizontal: 12, Top: 12, Bottom: 8);
 
       Label #HdrTier {
-        Style: (FontSize: 14, RenderBold: true);
-        Anchor: (Width: 90);
+        Style: (FontSize: 16, RenderBold: true);
+        Anchor: (Width: 80);
       }
       Label #HdrName {
-        Style: (FontSize: 14, RenderBold: true);
+        Style: (FontSize: 16, RenderBold: true);
         Anchor: (Width: 180);
       }
+      Label #HdrType {
+        Style: (FontSize: 16, RenderBold: true);
+        Anchor: (Width: 70);
+      }
       Label #HdrStrat {
-        Style: (FontSize: 14, RenderBold: true);
-        Anchor: (Width: 90);
+        Style: (FontSize: 16, RenderBold: true);
+        Anchor: (Width: 70);
       }
       Label #HdrRadius {
-        Style: (FontSize: 14, RenderBold: true);
-        Anchor: (Width: 90);
+        Style: (FontSize: 16, RenderBold: true);
+        Anchor: (Width: 80);
       }
       Label #HdrRam {
-        Style: (FontSize: 14, RenderBold: true);
+        Style: (FontSize: 16, RenderBold: true);
+        Anchor: (Width: 100);
+      }
+      Label #HdrRamMarginal {
+        Style: (FontSize: 16, RenderBold: true);
+        Anchor: (Width: 90);
+      }
+      Label #HdrPreload {
+        Style: (FontSize: 16, RenderBold: true);
+        Anchor: (Width: 70);
+      }
+      Label #HdrTTL {
+        Style: (FontSize: 16, RenderBold: true);
+        Anchor: (Width: 70);
+      }
+      Label #HdrStatus {
+        Style: (FontSize: 16, RenderBold: true);
         Anchor: (Width: 90);
       }
     }
 
     Group #TableBody {
       LayoutMode: Left;
-      Anchor: (Horizontal: 8, Top: 4, Bottom: 8);
+      Anchor: (Horizontal: 12, Top: 8, Bottom: 12);
       FlexWeight: 1;
 
       Label #ColTier {
-        Style: (FontSize: 12);
-        Anchor: (Width: 90);
+        Style: (FontSize: 14);
+        Anchor: (Width: 80);
       }
       Label #ColName {
-        Style: (FontSize: 12);
+        Style: (FontSize: 14);
         Anchor: (Width: 180);
       }
+      Label #ColType {
+        Style: (FontSize: 14);
+        Anchor: (Width: 70);
+      }
       Label #ColStrat {
-        Style: (FontSize: 12);
-        Anchor: (Width: 90);
+        Style: (FontSize: 14);
+        Anchor: (Width: 70);
       }
       Label #ColRadius {
-        Style: (FontSize: 12);
-        Anchor: (Width: 90);
+        Style: (FontSize: 14);
+        Anchor: (Width: 80);
       }
       Label #ColRam {
-        Style: (FontSize: 12);
+        Style: (FontSize: 14);
+        Anchor: (Width: 100);
+      }
+      Label #ColRamMarginal {
+        Style: (FontSize: 14);
+        Anchor: (Width: 90);
+      }
+      Label #ColPreload {
+        Style: (FontSize: 14);
+        Anchor: (Width: 70);
+      }
+      Label #ColTTL {
+        Style: (FontSize: 14);
+        Anchor: (Width: 70);
+      }
+      Label #ColStatus {
+        Style: (FontSize: 14);
         Anchor: (Width: 90);
       }
     }
 
     Label #CommandRef1 {
-      Style: (FontSize: 10);
-      Anchor: (Horizontal: 8, Top: 8, Bottom: 2);
+      Style: (FontSize: 11);
+      Anchor: (Horizontal: 12, Top: 12, Bottom: 4);
     }
 
     Label #CommandRef2 {
-      Style: (FontSize: 10);
-      Anchor: (Horizontal: 8, Top: 2, Bottom: 4);
+      Style: (FontSize: 11);
+      Anchor: (Horizontal: 12, Top: 4, Bottom: 8);
     }
 
     Label #WarpStats {
-      Style: (FontSize: 11);
-      Anchor: (Horizontal: 8, Top: 4, Bottom: 4);
+      Style: (FontSize: 12);
+      Anchor: (Horizontal: 12, Top: 8, Bottom: 8);
     }
 
     Label #StorageBackend {
-      Style: (FontSize: 10);
-      Anchor: (Horizontal: 8, Top: 2, Bottom: 14);
+      Style: (FontSize: 11);
+      Anchor: (Horizontal: 12, Top: 4, Bottom: 16);
     }
   }
 }

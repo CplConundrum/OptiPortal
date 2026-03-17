@@ -140,7 +140,7 @@
     "hotDecaySeconds": 30,
 
     "_warmDecayMinutes_info": "Minutes a zone spends in WARM before dropping to COLD.",
-    "warmDecayMinutes": 60,
+    "warmDecayMinutes": 45,
 
     "_pollIntervalSeconds_info": "How often (seconds) the decay system checks all zones. Lower = more responsive, slightly more CPU.",
     "pollIntervalSeconds": 1
@@ -149,7 +149,7 @@
   "_section_warps": "=== WARP FILE INTEGRATION ===",
   "_warps_info": "Point this at your server's warps.json so PreloadPlugin can pre-load warp destinations automatically.",
   "warps": {
-    "sourcePath": "/home/sambashare/universe/warps.json",
+    "sourcePath": "universe/warps.json",
 
     "_watchForChanges_info": "Automatically reload the warp list when the file changes (e.g. a new warp is added) without restarting.",
     "watchForChanges": true,
@@ -167,7 +167,7 @@
   "_section_gravestones": "=== GRAVESTONE FILE INTEGRATION ===",
   "_gravestones_info": "Reads the Gravestones mod's data file so PreloadPlugin can pre-load the area around each gravestone.",
   "gravestones": {
-    "sourcePath": "/home/sambashare/mods/Gravestones/gravestones.json",
+    "sourcePath": "plugins/Gravestones/gravestones.json",
     "watchForChanges": true,
     "watchIntervalSeconds": 5
   },
@@ -218,7 +218,7 @@
 
   "_section_updates": "=== UPDATE CHECKER ===",
   "updateChecker": {
-    "_enabled_info": "Check for new PreloadPlugin versions on startup and notify in the console.",
+    "_enabled_info": "Check for new OptiPortal versions on startup and notify in the console.",
     "enabled": true
   }
 }

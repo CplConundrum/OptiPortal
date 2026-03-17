@@ -1,5 +1,17 @@
 package com.optiportal.preload;
 
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+
 import com.hypixel.hytale.event.EventRegistry;
 import com.hypixel.hytale.server.core.universe.Universe;
 import com.hypixel.hytale.server.core.universe.world.events.AllWorldsLoadedEvent;
@@ -9,11 +21,6 @@ import com.optiportal.model.CacheTier;
 import com.optiportal.model.PortalEntry;
 import com.optiportal.model.WarmStrategy;
 import com.optiportal.storage.StorageBackend;
-import java.time.Instant;
-
-import java.util.*;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Manages all WARM zone lifecycle.
@@ -186,9 +193,9 @@ public class WarmZoneManager {
                 + " world=" + entry.getWorld()
                 + " cx=" + cx + " cz=" + cz + " r=" + radius);
 
-        // Estimated RAM: (2R+1)^2 chunks × bytesPerChunk
+        // Estimated RAM: (2R+1)^2 chunks × 64KB × 1.5x overhead for entities/metadata
         int chunkCount = (2 * radius + 1) * (2 * radius + 1);
-        double estimatedMB = (chunkCount * config.getBytesPerChunk()) / (1024.0 * 1024.0);
+        double estimatedMB = (chunkCount * 65536.0 * 1.5) / (1024.0 * 1024.0);
 
         return chunkPreloader.warmLoad(entry.getId(), entry.getWorld(), cx, cz, radius)
                 .thenRun(() -> {
@@ -197,6 +204,8 @@ public class WarmZoneManager {
                     // Use estimate for both fields; TODO: instrument via chunk object sizing.
                     storage.loadById(entry.getId()).ifPresent(loaded -> {
                         loaded.setRamEstimatedMB(estimatedMB);
+                        loaded.setRamMarginalMB(estimatedMB); // Also update marginal RAM
+                        chunkPreloader.updateEntryStats(loaded, chunkCount);
                         storage.save(loaded);
                     });
                     System.out.println("[OptiPortal] WARM zone loaded: " + entry.getId()

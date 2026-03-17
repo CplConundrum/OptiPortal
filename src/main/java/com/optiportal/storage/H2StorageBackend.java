@@ -1,10 +1,10 @@
 package com.optiportal.storage;
 
+import java.io.File;
+
 import com.optiportal.config.PluginConfig;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
-
-import java.io.File;
 
 public class H2StorageBackend extends AbstractSqlStorageBackend {
 

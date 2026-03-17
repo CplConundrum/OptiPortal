@@ -1,16 +1,16 @@
 package com.optiportal.preload;
 
-import com.optiportal.cache.CacheManager;
-import com.optiportal.config.PluginConfig;
-import com.optiportal.model.CacheTier;
-import com.optiportal.model.PortalEntry;
-import com.optiportal.storage.StorageBackend;
-
 import java.util.List;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
+
+import com.optiportal.cache.CacheManager;
+import com.optiportal.config.PluginConfig;
+import com.optiportal.model.CacheTier;
+import com.optiportal.model.PortalEntry;
+import com.optiportal.storage.StorageBackend;
 
 /**
  * Periodically re-pings chunks for HOT/WARM/COLD zones to prevent
@@ -44,6 +44,27 @@ public class KeepaliveManager {
         this.chunkPreloader = chunkPreloader;
         this.storage       = storage;
         this.executor      = executor;
+    }
+
+    // Protected getters for subclass access
+    protected PluginConfig getConfig() {
+        return config;
+    }
+
+    protected CacheManager getCacheManager() {
+        return cacheManager;
+    }
+
+    protected ChunkPreloader getChunkPreloader() {
+        return chunkPreloader;
+    }
+
+    protected StorageBackend getStorage() {
+        return storage;
+    }
+
+    protected ScheduledExecutorService getExecutor() {
+        return executor;
     }
 
     /**

@@ -7,7 +7,7 @@
 
     <groupId>com.optiportal</groupId>
     <artifactId>OptiPortal</artifactId>
-    <version>1.0.21</version>
+    <version>1.0.31</version>
     <packaging>jar</packaging>
 
     <properties>
@@ -26,6 +26,13 @@
             <artifactId>hytale-server</artifactId>
             <version>local</version>
             <scope>provided</scope>
+            <exclusions>
+                <!-- Exclude all transitive dependencies since they're resolved by Hytale build system -->
+                <exclusion>
+                    <groupId>*</groupId>
+                    <artifactId>*</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
 
         <!-- slf4j - provided by the server/other plugins at runtime; do NOT shade -->

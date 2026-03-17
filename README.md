@@ -84,6 +84,18 @@ Edit `config.json` while the server is running, then run `/preload reload` to ap
 
 ---
 
+## Enhanced Predictive Loading
+
+OptiPortal now supports enhanced predictive loading that leverages HytaleServer's field functions for more intelligent chunk prioritization based on terrain density. This enhancement provides better performance by pre-loading chunks in a more strategic order.
+
+### New API Methods
+
+The plugin exposes new async methods for enhanced predictive loading:
+
+- `asyncEnhancedPredictiveLoad(String worldName, double x, double z, int radius)` - Asynchronously triggers predictive loading with enhanced prioritization based on terrain density.
+
+---
+
 ## Portal Link Registry
 
 OptiPortal automatically learns bidirectional portal pairs at runtime. When a player teleports through a portal, the origin and destination are recorded and saved to `portal-links.json`. From that point on, approaching either end of the pair will trigger a preload of the other end.
@@ -102,3 +114,29 @@ Links are self-correcting — if a portal destination is changed in-game, the ne
 | MySQL | `MYSQL` | For shared/remote database setups |
 
 To switch backends, update `backend` in `config.json` and restart. Use `/preload migrate <backend>` for instructions.
+
+### Backend Details
+
+**JSON Backend**
+- Stores data in a single `portal-data.json` file
+- Human-readable format that can be edited manually
+- Uses WAL-safe write pattern with atomic renames to prevent corruption
+- Includes automatic backup recovery on load failure
+
+**SQLite Backend**
+- Uses SQLite database file (`portal-data.db`)
+- Built-in WAL (Write-Ahead Logging) mode for improved concurrency
+- Synchronous setting set to "NORMAL" for good balance of performance and durability
+- Supports large datasets efficiently
+
+**H2 Backend**
+- Embedded H2 database with full SQL support
+- No external dependencies beyond the JDBC driver
+- Provides stronger consistency guarantees than SQLite
+- Uses file-based storage without requiring a separate server process
+
+**MySQL Backend**
+- Requires a separate MySQL/MariaDB server
+- Supports shared database setups for multi-server environments
+- Uses connection pooling via HikariCP for efficient resource management
+- Allows for advanced database features and monitoring

@@ -120,7 +120,22 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
 
     @Override
     public void saveAll(List<PortalEntry> entries) {
-        for (PortalEntry entry : entries) save(entry);
+        if (entries == null || entries.isEmpty()) return;
+        
+        String sql = upsertSql();
+        
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            
+            for (PortalEntry entry : entries) {
+                bindEntry(ps, entry);
+                ps.addBatch();
+            }
+            
+            ps.executeBatch();
+        } catch (SQLException e) {
+            System.err.println("[OptiPortal] SQL saveAll error: " + e.getMessage());
+        }
     }
 
     @Override
@@ -142,7 +157,7 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
         }
     }
 
-    private void bindEntry(PreparedStatement ps, PortalEntry e) throws SQLException {
+    protected void bindEntry(PreparedStatement ps, PortalEntry e) throws SQLException {
         ps.setString(1, e.getId());
         ps.setString(2, e.getWorld());
         ps.setDouble(3, e.getX());

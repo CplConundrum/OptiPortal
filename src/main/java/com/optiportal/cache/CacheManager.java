@@ -1,12 +1,16 @@
 package com.optiportal.cache;
 
-import com.optiportal.config.PluginConfig;
+import java.util.Collections;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
-import com.optiportal.model.CacheTier;
-import com.optiportal.model.PortalEntry;
 
-import java.util.*;
-import java.util.concurrent.*;
+import com.optiportal.config.PluginConfig;
+import com.optiportal.metrics.MetricsCollector;
+import com.optiportal.model.CacheTier;
 
 /**
  * Central chunk registry and cache tier manager.
@@ -22,6 +26,7 @@ public class CacheManager {
     private final PluginConfig config;
     private final WalManager walManager;
     private final ScheduledExecutorService executor;
+    private final MetricsCollector metricsCollector;
 
     // chunkKey (world:cx:cz) → set of zone IDs that own it
     private final Map<String, Set<String>> chunkOwnership = new ConcurrentHashMap<>();
@@ -36,6 +41,7 @@ public class CacheManager {
         this.config = config;
         this.walManager = walManager;
         this.executor = executor;
+        this.metricsCollector = new MetricsCollector();
         // Run tier decay check every 10 seconds
         executor.scheduleAtFixedRate(this::decayTiers, 10, 10, TimeUnit.SECONDS);
     }
@@ -61,6 +67,8 @@ public class CacheManager {
             if (owners.isEmpty()) newChunks++;
             owners.add(zoneId);
         }
+        // Record metrics
+        metricsCollector.recordChunksDeduped(newChunks);
         return newChunks;
     }
 
@@ -109,18 +117,22 @@ public class CacheManager {
             if (tier == CacheTier.HOT && age >= hotMs) {
                 zoneTiers.put(zoneId, CacheTier.WARM);
                 tierTimestamps.put(zoneId, now); // reset clock for WARM→COLD
-                System.out.println("[OptiPortal] Tier decay: " + zoneId + " HOT → WARM");
+                LOG.fine("[OptiPortal] Tier decay: " + zoneId + " HOT → WARM");
             } else if (tier == CacheTier.WARM && age >= warmMs) {
                 zoneTiers.put(zoneId, CacheTier.COLD);
                 tierTimestamps.remove(zoneId);
                 deregisterAllChunks(zoneId);
-                System.out.println("[OptiPortal] Tier decay: " + zoneId + " WARM → COLD");
+                LOG.fine("[OptiPortal] Tier decay: " + zoneId + " WARM → COLD");
             }
         }
     }
 
     public Map<String, Set<String>> getChunkOwnership() {
         return Collections.unmodifiableMap(chunkOwnership);
+    }
+    
+    public MetricsCollector getMetricsCollector() {
+        return metricsCollector;
     }
 
     public int getTotalSharedChunks() {
@@ -133,7 +145,13 @@ public class CacheManager {
      */
     public boolean isChunkOwned(String world, int cx, int cz) {
         Set<String> owners = chunkOwnership.get(chunkKey(world, cx, cz));
-        return owners != null && !owners.isEmpty();
+        boolean owned = owners != null && !owners.isEmpty();
+        if (owned) {
+            metricsCollector.recordCacheHit();
+        } else {
+            metricsCollector.recordCacheMiss();
+        }
+        return owned;
     }
 
     /**

@@ -1,5 +1,7 @@
 package com.optiportal.teleport;
 
+import java.util.logging.Logger;
+
 import com.hypixel.hytale.event.EventRegistry;
 import com.hypixel.hytale.server.core.entity.entities.Player;
 import com.hypixel.hytale.server.core.event.events.ecs.DiscoverZoneEvent;
@@ -49,6 +51,8 @@ import java.util.concurrent.TimeUnit;
  */
 public class TeleportInterceptor {
 
+    private static final Logger LOG = Logger.getLogger("OptiPortal");
+    
     private final OptiPortal plugin;
     private final PluginConfig config;
     private final WarmZoneManager warmZoneManager;
@@ -103,6 +107,35 @@ public class TeleportInterceptor {
         // No portal-use event exists in Hytale for zone-trigger portals.
         int pollInterval = config.getPollIntervalSeconds();
         executor.scheduleAtFixedRate(this::pollTeleportRecords, pollInterval, pollInterval, TimeUnit.SECONDS);
+    }
+
+    // Protected getters for subclass access
+    protected PluginConfig getConfig() {
+        return config;
+    }
+
+    protected ConcurrentHashMap<UUID, PlayerRef> getPlayerRefs() {
+        return playerRefs;
+    }
+
+    protected StorageBackend getStorage() {
+        return storage;
+    }
+
+    protected ChunkPreloader getChunkPreloader() {
+        return chunkPreloader;
+    }
+
+    protected ConcurrentHashMap<UUID, Long> getLastSeenTeleportNanos() {
+        return lastSeenTeleportNanos;
+    }
+
+    protected ScheduledExecutorService getExecutor() {
+        return executor;
+    }
+
+    protected ConcurrentHashMap<UUID, ConcurrentHashMap<String, Long>> getCooldowns() {
+        return cooldowns;
     }
 
     /**
@@ -296,9 +329,14 @@ public class TeleportInterceptor {
             UsedTeleporter usedTeleporter = holder.getComponent(UsedTeleporter.getComponentType());
             if (usedTeleporter != null) {
                 com.hypixel.hytale.math.vector.Vector3d dest = usedTeleporter.getDestinationPosition();
-                System.out.println("[OptiPortal] UsedTeleporter detected: dest="
-                    + dest.x + "," + dest.y + "," + dest.z + " world=" + worldName);
-                checkProximityAndPreload(null, worldName, dest.x, dest.y, dest.z);
+                // Only check proximity if destination position is valid
+                if (dest != null && !Double.isNaN(dest.x) && !Double.isNaN(dest.y) && !Double.isNaN(dest.z)) {
+                    System.out.println("[OptiPortal] UsedTeleporter detected: dest="
+                        + dest.x + "," + dest.y + "," + dest.z + " world=" + worldName);
+                    checkProximityAndPreload(null, worldName, dest.x, dest.y, dest.z);
+                } else {
+                    System.out.println("[OptiPortal] AddPlayerToWorld: UsedTeleporter has invalid destination position");
+                }
             } else {
                 System.out.println("[OptiPortal] AddPlayerToWorld: no UsedTeleporter (login or non-teleporter move)");
             }
@@ -336,7 +374,7 @@ public class TeleportInterceptor {
                 com.optiportal.model.CacheTier current = cm.getZoneTier(id);
                 if (current != com.optiportal.model.CacheTier.HOT) {
                     cm.setZoneTier(id, com.optiportal.model.CacheTier.HOT);
-                    System.out.println("[OptiPortal] Proximity HOT: " + id
+                    LOG.fine("[OptiPortal] Proximity HOT: " + id
                         + " dist=" + String.format("%.1f", horizDist)
                         + " (was " + current + ")");
                 }
@@ -344,7 +382,7 @@ public class TeleportInterceptor {
                 // PREDICTIVE: cooldown guards chunk load
                 if (isOnCooldown(null, id)) continue;
                 recordCooldown(null, id);
-                System.out.println("[OptiPortal] Proximity PREDICTIVE: " + id
+                LOG.fine("[OptiPortal] Proximity PREDICTIVE: " + id
                     + " dist=" + String.format("%.1f", horizDist) + " → load cx=" + cx + " cz=" + cz);
                 predictiveLoadWithRam(id, worldName, cx, cz, radius);
             }
@@ -360,7 +398,7 @@ public class TeleportInterceptor {
                         int lcx = ChunkPreloader.toChunkCoord(linked.getX());
                         int lcz = ChunkPreloader.toChunkCoord(linked.getZ());
                         int lradius = resolveRadius(linked);
-                        System.out.println("[OptiPortal] Linked preload: " + linkedId
+                        LOG.fine("[OptiPortal] Linked preload: " + linkedId
                             + " (linked to " + id + ") cx=" + lcx + " cz=" + lcz);
                         predictiveLoadWithRam(linkedId, linked.getWorld(), lcx, lcz, lradius);
                     });
@@ -467,7 +505,11 @@ public class TeleportInterceptor {
         Player player = event.getPlayer();
         if (player == null) return;
 
-        World world = player.getWorld();
+        @SuppressWarnings("removal")
+        PlayerRef ref = player.getPlayerRef();
+        if (ref == null) return;
+
+        World world = chunkPreloader.getWorldRegistry().getWorldForPlayer(ref);
         if (world == null) return;
 
         String worldName = world.getName();
@@ -478,8 +520,6 @@ public class TeleportInterceptor {
         // If the UUID is already in playerRefs, this is a respawn or return from instance
         // rather than a fresh login — mark as pending respawn capture.
         chunkPreloader.getWorldRegistry().addWorld(world);
-        @SuppressWarnings("deprecation")
-        PlayerRef ref = player.getPlayerRef();
         if (ref != null) {
             UUID uuid = ref.getUuid();
             if (uuid != null) {
@@ -631,7 +671,8 @@ public class TeleportInterceptor {
      */
     private void predictiveLoadWithRam(String zoneId, String worldName, int cx, int cz, int radius) {
         int chunkCount = (2 * radius + 1) * (2 * radius + 1);
-        double estimatedMB = (chunkCount * config.getBytesPerChunk()) / (1024.0 * 1024.0);
+        // More accurate RAM estimation: 64KB per chunk for data + 1.5x overhead for entities/metadata
+        double estimatedMB = (chunkCount * 65536.0 * 1.5) / (1024.0 * 1024.0);
 
         chunkPreloader.predictiveLoad(zoneId, worldName, cx, cz, radius)
                 .thenRun(() -> {
@@ -639,6 +680,8 @@ public class TeleportInterceptor {
                     if (opt.isPresent()) {
                         com.optiportal.model.PortalEntry e = opt.get();
                         e.setRamEstimatedMB(estimatedMB);
+                        e.setRamMarginalMB(estimatedMB); // Also update marginal RAM
+                        chunkPreloader.updateEntryStats(e, chunkCount);
                         storage.save(e);
                     }
                 });
