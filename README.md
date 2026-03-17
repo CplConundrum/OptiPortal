@@ -25,7 +25,6 @@ All commands use the `/preload` prefix.
 | Command | Description |
 |---|---|
 | `/preload ram` | Show estimated RAM usage across all warm zones |
-| `/preload stats` | Show plugin metrics summary |
 
 ### Maintenance
 
