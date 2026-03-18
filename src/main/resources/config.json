@@ -108,7 +108,10 @@
     "predictiveCacheTTLDays": 2,
 
     "_startupLoadStrategy_info": "Overrides the top-level startupLoadStrategy for the disk cache specifically. Usually keep these in sync.",
-    "startupLoadStrategy": "STAGED"
+    "startupLoadStrategy": "STAGED",
+
+    "_ownershipAuditIntervalMinutes_info": "How often (in minutes) to audit chunk ownership for drift (chunks evicted by the engine without OptiPortal noticing). Default: 5.",
+    "ownershipAuditIntervalMinutes": 5
   },
 
   "_section_low_traffic": "=== LOW TRAFFIC ===",
@@ -144,6 +147,22 @@
 
     "_pollIntervalSeconds_info": "How often (seconds) the decay system checks all zones. Lower = more responsive, slightly more CPU.",
     "pollIntervalSeconds": 1
+  },
+
+  "_section_async": "=== ASYNC TPS MONITORING ===",
+  "_async_info": "Server load sensing: monitors TPS and adjusts chunk loading behavior to reduce load during server stress.",
+  "async": {
+    "_tpsMonitorEnabled_info": "Enable TPS monitoring. When enabled, OptiPortal will reduce chunk loading when server TPS drops.",
+    "tpsMonitorEnabled": true,
+
+    "_tpsLowThreshold_info": "TPS below this value triggers reduced batch sizes. Default: 15.0.",
+    "tpsLowThreshold": 15.0,
+
+    "_tpsCriticalThreshold_info": "TPS below this value queues all non-critical operations. Default: 12.0.",
+    "tpsCriticalThreshold": 12.0,
+
+    "_maxLoadedChunksPressureThreshold_info": "If ChunkStore.getLoadedChunksCount() exceeds this across any world, batch size is reduced proportionally. Default: 2000. -1 = disabled.",
+    "maxLoadedChunksPressureThreshold": 2000
   },
 
   "_section_warps": "=== WARP FILE INTEGRATION ===",

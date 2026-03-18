@@ -11,6 +11,7 @@ import com.optiportal.async.AsyncMetrics;
 import com.optiportal.async.WorldThreadBridge;
 import com.optiportal.cache.CacheManager;
 import com.optiportal.config.PluginConfig;
+import com.optiportal.metrics.MetricsCollector;
 import com.optiportal.storage.StorageBackend;
 
 /**
@@ -30,19 +31,41 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
     // Cache manager reference for ownership registration
     private final CacheManager cacheManager;
     
+    /** Optional corridor index for path-proximity prioritization. Null = disabled. */
+    private final CorridorIndex corridorIndex;
+    
     public EnhancedChunkPreloader(PluginConfig config,
-                                 CacheManager cacheManager,
-                                 WorldRegistry worldRegistry,
-                                 ScheduledExecutorService executor,
-                                 WorldThreadBridge worldBridge,
-                                 AsyncLoadBalancer loadBalancer,
-                                 AsyncMetrics metrics,
-                                 StorageBackend storage) {
-        super(config, cacheManager, worldRegistry, executor, storage, null);
+                                  CacheManager cacheManager,
+                                  WorldRegistry worldRegistry,
+                                  ScheduledExecutorService executor,
+                                  WorldThreadBridge worldBridge,
+                                  AsyncLoadBalancer loadBalancer,
+                                  AsyncMetrics metrics,
+                                  StorageBackend storage,
+                                  MetricsCollector metricsCollector,
+                                  CorridorIndex corridorIndex) {
+        super(config, cacheManager, worldRegistry, executor, storage, metricsCollector);
         this.worldBridge = worldBridge;
         this.loadBalancer = loadBalancer;
         this.metrics = metrics;
         this.cacheManager = cacheManager;
+        this.corridorIndex = corridorIndex; // may be null if disabled
+    }
+    
+    /**
+     * Backward-compat constructor without CorridorIndex — for callers not yet updated.
+     */
+    public EnhancedChunkPreloader(PluginConfig config,
+                                  CacheManager cacheManager,
+                                  WorldRegistry worldRegistry,
+                                  ScheduledExecutorService executor,
+                                  WorldThreadBridge worldBridge,
+                                  AsyncLoadBalancer loadBalancer,
+                                  AsyncMetrics metrics,
+                                  StorageBackend storage,
+                                  MetricsCollector metricsCollector) {
+        this(config, cacheManager, worldRegistry, executor, worldBridge,
+             loadBalancer, metrics, storage, metricsCollector, null);
     }
     
     /**
@@ -126,7 +149,7 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
      * @return CompletableFuture that completes when all chunks are loaded
      */
     private CompletableFuture<Void> loadChunksAsync(String worldName, List<int[]> chunks, 
-                                                   boolean nonTicking, String zoneId, int batchSize) {
+                                                    boolean nonTicking, String zoneId, int batchSize) {
         if (chunks.isEmpty()) {
             return CompletableFuture.completedFuture(null);
         }
@@ -136,67 +159,93 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
         
         for (int i = 0; i < chunks.size(); i += batchSize) {
             List<int[]> batch = chunks.subList(i, Math.min(i + batchSize, chunks.size()));
-            
+  
             // Load batch with proper async handling
-            CompletableFuture<Void> batchFuture = loadChunkBatch(worldName, batch, nonTicking);
+            CompletableFuture<Void> batchFuture = loadChunkBatch(worldName, batch, nonTicking, zoneId);
             batchFutures.add(batchFuture);
         }
         
-        // Wait for all batches with proper error handling
-        return CompletableFuture.allOf(batchFutures.toArray(new CompletableFuture[0]))
+        // Wait for all batches — ownership is registered per-chunk in loadChunkBatch
+        return CompletableFuture.allOf(batchFutures.toArray(CompletableFuture[]::new))
                 .whenComplete((result, ex) -> {
                     if (ex == null) {
-                        // Register ownership after successful load
-                        registerChunkOwnership(zoneId, worldName, chunks);
-                        LOG.info("[OptiPortal] Enhanced chunk load completed: " + zoneId + 
+                        LOG.info(() -> "[OptiPortal] Enhanced chunk load completed: " + zoneId +
                                 " (" + chunks.size() + " chunks)");
                     } else {
-                        LOG.warning("[OptiPortal] Enhanced chunk load failed for " + zoneId + ": " + ex.getMessage());
+                        LOG.warning(() -> "[OptiPortal] Enhanced chunk load failed for " + zoneId + ": " + ex.getMessage());
                     }
                 });
     }
     
     /**
      * Load a batch of chunks using the world thread bridge.
-     * 
+     *
      * @param worldName World name
      * @param batch List of chunk coordinates
      * @param nonTicking Whether to load as non-ticking
+     * @param zoneId Zone ID for complexity scoring
      * @return CompletableFuture that completes when batch is loaded
      */
-    private CompletableFuture<Void> loadChunkBatch(String worldName, List<int[]> batch, boolean nonTicking) {
+    private CompletableFuture<Void> loadChunkBatch(String worldName, List<int[]> batch,
+                                                   boolean nonTicking, String zoneId) {
         List<CompletableFuture<Void>> chunkFutures = new ArrayList<>();
-        
+
+        double baseKbPerChunk = getBytesPerChunk() / 1024.0;
+
         for (int[] coord : batch) {
+            final int cx = coord[0];
+            final int cz = coord[1];
+
             CompletableFuture<Void> chunkFuture = worldBridge.getChunkAsync(
-                getWorldRegistry().getWorld(worldName), coord[0], coord[1], nonTicking)
-                    .thenRun(() -> {
-                        // Chunk loaded successfully
-                        metrics.recordChunkLoadSuccess(coord[0], coord[1], 0);
+                getWorldRegistry().getWorld(worldName), cx, cz, nonTicking)
+                    .thenAccept(chunk -> {
+                        metrics.recordChunkLoadSuccess(cx, cz, 0);
+                        if (chunk != null) {
+                            // Register ownership immediately using the live chunk reference.
+                            // This is the only reliable point to call addKeepLoaded() — using
+                            // getChunkIfLoaded() later returns null for non-ticking chunks,
+                            // causing the pin to be skipped and the chunk to be evicted.
+                            cacheManager.registerOwnership(zoneId, worldName, cx, cz, chunk);
+                            scoreAndRecord(chunk, zoneId, baseKbPerChunk);
+                        }
                     })
                     .exceptionally(ex -> {
-                        // Handle chunk load error
-                        metrics.recordChunkLoadError(coord[0], coord[1], 0);
-                        LOG.warning("[OptiPortal] Chunk load failed: " + coord[0] + "," + coord[1] + ": " + ex.getMessage());
+                        metrics.recordChunkLoadError(cx, cz, 0);
+                        LOG.warning("[OptiPortal] Chunk load failed: " + cx + "," + cz
+                                + ": " + ex.getMessage());
                         return null;
                     });
-            
+
             chunkFutures.add(chunkFuture);
         }
-        
+
         return CompletableFuture.allOf(chunkFutures.toArray(new CompletableFuture[0]));
     }
     
     /**
-     * Register chunk ownership after successful load.
-     * 
-     * @param zoneId Zone ID
-     * @param worldName World name
-     * @param chunks List of chunk coordinates
+     * Score the loaded chunk and record the complexity and RAM estimate at FINE log level.
+     * Does NOT store to disk — this is observational only in Phase 3.
+     * Phase 4's density-based plan may hook ComplexityScoreCache here.
+     *
+     * @param chunk          The loaded WorldChunk (never null here)
+     * @param zoneId         Zone ID for log context (may be null)
+     * @param baseKbPerChunk Base KB per chunk from config
      */
-    private void registerChunkOwnership(String zoneId, String worldName, List<int[]> chunks) {
-        for (int[] coord : chunks) {
-            cacheManager.registerOwnership(zoneId, worldName, coord[0], coord[1]);
+    private void scoreAndRecord(com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk chunk,
+                                String zoneId, double baseKbPerChunk) {
+        try {
+            float complexity = ChunkComplexityScorer.score(chunk);
+            double estimatedRamMB = ChunkComplexityScorer.estimateRamMB(chunk, baseKbPerChunk);
+  
+            LOG.fine("[OptiPortal] Chunk scored: zone=" + zoneId
+                    + " chunk=" + chunk.getX() + "," + chunk.getZ()
+                    + " complexity=" + String.format("%.3f", complexity)
+                    + " estimatedRamMB=" + String.format("%.4f", estimatedRamMB));
+  
+            // Phase 4 hook: if ComplexityScoreCache is injected, store score here:
+            // complexityScoreCache.store(chunk.getIndex(), complexity);
+        } catch (Exception e) {
+            LOG.fine("[OptiPortal] scoreAndRecord error: " + e.getMessage());
         }
     }
     
@@ -233,11 +282,28 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
                 list.add(new int[]{cx + dx, cz + dz});
             }
         }
-        // Sort centre-outward for better loading priority
-        list.sort((c1, c2) -> Integer.compare(
-            Math.abs(c1[0] - cx) + Math.abs(c1[1] - cz),
-            Math.abs(c2[0] - cx) + Math.abs(c2[1] - cz)
-        ));
+        
+        // Sort centre-outward with optional corridor boost.
+        // Corridor chunks are treated as if they are 1 ring closer to centre for
+        // sorting purposes — they load slightly ahead of non-corridor chunks at the
+        // same Chebyshev distance.
+        final boolean corridorEnabled = corridorIndex != null
+                && !corridorIndex.isEmpty()
+                && getConfig().isCorridorPrioritizationEnabled();
+        
+        list.sort((c1, c2) -> {
+            int dist1 = Math.abs(c1[0] - cx) + Math.abs(c1[1] - cz);
+            int dist2 = Math.abs(c2[0] - cx) + Math.abs(c2[1] - cz);
+            
+            if (corridorEnabled) {
+                // Apply -1 effective distance to corridor chunks (make them sort earlier)
+                if (corridorIndex.isCorridor(c1[0], c1[1])) dist1 = Math.max(0, dist1 - 1);
+                if (corridorIndex.isCorridor(c2[0], c2[1])) dist2 = Math.max(0, dist2 - 1);
+            }
+            
+            return Integer.compare(dist1, dist2);
+        });
+        
         return list;
     }
 }

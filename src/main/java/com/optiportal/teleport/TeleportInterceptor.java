@@ -1,34 +1,33 @@
 package com.optiportal.teleport;
 
+import java.util.Collections;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
+import com.hypixel.hytale.builtin.adventure.teleporter.interaction.server.UsedTeleporter;
 import com.hypixel.hytale.event.EventRegistry;
+import com.hypixel.hytale.math.vector.Location;
 import com.hypixel.hytale.server.core.entity.entities.Player;
 import com.hypixel.hytale.server.core.event.events.ecs.DiscoverZoneEvent;
 import com.hypixel.hytale.server.core.event.events.player.AddPlayerToWorldEvent;
 import com.hypixel.hytale.server.core.event.events.player.PlayerReadyEvent;
+import com.hypixel.hytale.server.core.modules.entity.teleport.TeleportRecord;
 import com.hypixel.hytale.server.core.universe.PlayerRef;
 import com.hypixel.hytale.server.core.universe.world.World;
-import com.hypixel.hytale.builtin.adventure.teleporter.interaction.server.UsedTeleporter;
-import com.hypixel.hytale.math.vector.Location;
-import com.hypixel.hytale.math.vector.Vector3i;
-import com.hypixel.hytale.server.core.modules.entity.teleport.TeleportRecord;
-import com.hypixel.hytale.server.core.universe.world.WorldMapTracker;
 import com.optiportal.OptiPortal;
 import com.optiportal.config.PluginConfig;
-import com.optiportal.player.DeathLocationTracker;
-import com.optiportal.player.RespawnTracker;
 import com.optiportal.integrations.GravestoneIntegration;
 import com.optiportal.model.PortalEntry;
 import com.optiportal.model.WarmStrategy;
+import com.optiportal.player.DeathLocationTracker;
+import com.optiportal.player.RespawnTracker;
 import com.optiportal.preload.ChunkPreloader;
 import com.optiportal.preload.WarmZoneManager;
 import com.optiportal.storage.StorageBackend;
-
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Wires up player events to chunk pre-loading.
@@ -188,7 +187,7 @@ public class TeleportInterceptor {
                     int radius = resolveRadius(entry);
                     System.out.println("[OptiPortal] Zone discovery trigger: " + normalizedZone
                             + " → predictive load cx=" + cx + " cz=" + cz + " r=" + radius);
-                    predictiveLoadWithRam(normalizedZone, entry.getWorld(), cx, cz, radius);
+                    triggerPredictiveLoad(normalizedZone, entry.getWorld(), cx, cz, radius, null);
                     matched = true;
                 }
             }
@@ -208,7 +207,7 @@ public class TeleportInterceptor {
                         int cz = ChunkPreloader.toChunkCoord(entry.getZ());
                         System.out.println("[OptiPortal] Zone discovery trigger (raw): " + zoneName
                                 + " → predictive load cx=" + cx + " cz=" + cz);
-                        predictiveLoadWithRam(zoneName, entry.getWorld(), cx, cz, resolveRadius(entry));
+                        triggerPredictiveLoad(zoneName, entry.getWorld(), cx, cz, resolveRadius(entry), null);
                         matched = true;
                     }
                 }
@@ -667,12 +666,33 @@ public class TeleportInterceptor {
     // -------------------------------------------------------------------------
 
     /**
+     * Hook called when a predictive load is about to be triggered from DiscoverZoneEvent.
+     * AsyncTeleportInterceptor overrides this to add velocity-aware radius adjustment.
+     *
+     * @param zoneId    Zone ID
+     * @param worldName World name
+     * @param cx        Chunk X
+     * @param cz        Chunk Z
+     * @param radius    Resolved base radius
+     * @param playerRef The player whose zone discovery triggered this (may be null)
+     */
+    protected void triggerPredictiveLoad(String zoneId, String worldName,
+            int cx, int cz, int radius,
+            com.hypixel.hytale.server.core.universe.PlayerRef playerRef) {
+        predictiveLoadWithRam(zoneId, worldName, cx, cz, radius);
+    }
+
+    /**
      * Fire a predictive load and record RAM delta + estimate on completion.
      */
-    private void predictiveLoadWithRam(String zoneId, String worldName, int cx, int cz, int radius) {
+    protected void predictiveLoadWithRam(String zoneId, String worldName, int cx, int cz, int radius) {
         int chunkCount = (2 * radius + 1) * (2 * radius + 1);
-        // More accurate RAM estimation: 64KB per chunk for data + 1.5x overhead for entities/metadata
-        double estimatedMB = (chunkCount * 65536.0 * 1.5) / (1024.0 * 1024.0);
+
+        // Use configurable bytesPerChunk instead of hardcoded 65536.
+        // Keep the 1.5x overhead multiplier for entity/metadata overhead estimate.
+        // config.getBytesPerChunk() default = 262144 (256 KB).
+        double estimatedMB = (chunkCount * (double) config.getBytesPerChunk() * 1.5)
+                             / (1024.0 * 1024.0);
 
         chunkPreloader.predictiveLoad(zoneId, worldName, cx, cz, radius)
                 .thenRun(() -> {
@@ -680,7 +700,7 @@ public class TeleportInterceptor {
                     if (opt.isPresent()) {
                         com.optiportal.model.PortalEntry e = opt.get();
                         e.setRamEstimatedMB(estimatedMB);
-                        e.setRamMarginalMB(estimatedMB); // Also update marginal RAM
+                        // updateEntryStats sets ramMarginalMB from config.getBytesPerChunk() too
                         chunkPreloader.updateEntryStats(e, chunkCount);
                         storage.save(e);
                     }

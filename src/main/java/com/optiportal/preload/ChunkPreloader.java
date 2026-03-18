@@ -34,7 +34,8 @@ public class ChunkPreloader {
     /** Chunks within this Chebyshev radius gate the future returned to callers. */
     private static final int INNER_RING_RADIUS = 2;
 
-    /** Approximate RAM per chunk in MB (16KB per chunk). */
+    /** Approximate RAM per chunk in MB (16KB per chunk). Deprecated — use config.getBytesPerChunk() instead. */
+    @Deprecated
     private static final double CHUNK_RAM_MB = 0.016;
 
     private final PluginConfig config;
@@ -59,6 +60,13 @@ public class ChunkPreloader {
     }
 
     /**
+     * Protected getter for config to allow subclasses to access it.
+     */
+    protected PluginConfig getConfig() {
+        return config;
+    }
+
+    /**
      * Updates the PortalEntry with preload statistics.
      * Increments preload count and calculates marginal RAM based on chunks loaded.
      *
@@ -69,11 +77,24 @@ public class ChunkPreloader {
         if (entry == null) return;
         
         entry.incrementPreloadCount();
-        entry.setRamMarginalMB(chunkCount * CHUNK_RAM_MB);
+        
+        // Use configurable bytesPerChunk instead of the hardcoded CHUNK_RAM_MB constant.
+        // config.getBytesPerChunk() returns int (default 262144 = 256 KB).
+        // Convert: (chunkCount * bytesPerChunk) / (1024 * 1024) = MB
+        double marginalMB = (chunkCount * (double) config.getBytesPerChunk()) / (1024.0 * 1024.0);
+        entry.setRamMarginalMB(marginalMB);
         
         LOG.fine("[OptiPortal] Updated entry stats: " + entry.getId() +
                  " preloadCount=" + entry.getPreloadCount() +
-                 " ramMarginalMB=" + String.format("%.2f", entry.getRamMarginalMB()));
+                 " ramMarginalMB=" + String.format("%.3f", entry.getRamMarginalMB()));
+    }
+
+    /**
+     * Protected getter for bytesPerChunk to allow subclasses to access it.
+     * @return bytesPerChunk value from config
+     */
+    protected int getBytesPerChunk() {
+        return config.getBytesPerChunk();
     }
 
     // -------------------------------------------------------------------------
@@ -292,12 +313,12 @@ public class ChunkPreloader {
             // Calculate distance from center (lower = closer)
             int dist1 = Math.max(Math.abs(c1[0] - cx), Math.abs(c1[1] - cz));
             int dist2 = Math.max(Math.abs(c2[0] - cx), Math.abs(c2[1] - cz));
-            
+  
             // Primary sort: distance from center (closer first)
             if (dist1 != dist2) {
                 return Integer.compare(dist1, dist2);
             }
-            
+  
             // Secondary sort: for chunks at same distance, prioritize based on some heuristic
             // In a real implementation, this would use HytaleServer's density functions
             return 0; // Placeholder - in reality this would be more complex

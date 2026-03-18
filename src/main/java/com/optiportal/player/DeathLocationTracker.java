@@ -59,7 +59,7 @@ public class DeathLocationTracker {
         storage.loadById(id).ifPresent(entry -> {
             int cx = com.optiportal.preload.ChunkPreloader.toChunkCoord(entry.getX());
             int cz = com.optiportal.preload.ChunkPreloader.toChunkCoord(entry.getZ());
-            preloader.predictiveLoad(entry.getWorld(), cx, cz, 7);
+            preloader.predictiveLoad(id, entry.getWorld(), cx, cz, 7);
         });
     }
 }

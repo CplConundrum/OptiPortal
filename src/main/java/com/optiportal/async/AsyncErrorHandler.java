@@ -21,13 +21,13 @@ public class AsyncErrorHandler {
     private final ScheduledExecutorService executor;
     private final RetryPolicy retryPolicy;
     
-    public AsyncErrorHandler(AsyncMetrics metrics, 
+    public AsyncErrorHandler(AsyncMetrics metrics,
                            CircuitBreaker circuitBreaker,
                            ScheduledExecutorService executor) {
         this.metrics = metrics;
         this.circuitBreaker = circuitBreaker;
         this.executor = executor;
-        this.retryPolicy = new RetryPolicy();
+        this.retryPolicy = new RetryPolicy(executor);
     }
     
     /**
@@ -55,16 +55,16 @@ public class AsyncErrorHandler {
      * @param cx Chunk X coordinate
      * @param cz Chunk Z coordinate
      */
-    public void handleChunkLoadError(Exception e, int cx, int cz) {
+    public void handleChunkLoadError(Exception e,
+                                     com.hypixel.hytale.server.core.universe.world.World world,
+                                     int cx, int cz) {
         metrics.recordChunkLoadError(cx, cz, 0);
-        
+
         String chunkKey = cx + ":" + cz;
-        
-        // Implement retry logic with exponential backoff
+
         retryPolicy.executeWithRetry(() -> {
-            LOG.info("Retrying chunk load for " + chunkKey);
-            // This would be called by the retry mechanism
-            return retryChunkLoad(cx, cz);
+            LOG.fine("[OptiPortal] Retrying chunk load for " + chunkKey);
+            return retryChunkLoad(world, cx, cz);
         }, "chunkLoad", chunkKey);
     }
     
@@ -145,16 +145,48 @@ public class AsyncErrorHandler {
     
     /**
      * Retry chunk load operation.
-     * 
-     * @param cx Chunk X coordinate
-     * @param cz Chunk Z coordinate
-     * @return CompletableFuture for the retry operation
+     *
+     * @param world The world containing the chunk
+     * @param cx    Chunk X coordinate
+     * @param cz    Chunk Z coordinate
+     * @return CompletableFuture that completes with the loaded chunk, or null on skip
      */
-    private CompletableFuture<Void> retryChunkLoad(int cx, int cz) {
-        // This would be implemented by the calling component
-        // For now, just log the retry attempt
-        LOG.info("Would retry chunk load for " + cx + "," + cz);
-        return CompletableFuture.completedFuture(null);
+    private CompletableFuture<com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk>
+            retryChunkLoad(com.hypixel.hytale.server.core.universe.world.World world, int cx, int cz) {
+
+        // Guard: circuit breaker open — do not hammer the world thread further
+        if (circuitBreaker.isOpen()) {
+            LOG.fine("[OptiPortal] retryChunkLoad skipped (circuit open): " + cx + "," + cz);
+            return CompletableFuture.completedFuture(null);
+        }
+
+        // Guard: world null or not ticking
+        if (world == null) {
+            LOG.fine("[OptiPortal] retryChunkLoad skipped (world null): " + cx + "," + cz);
+            return CompletableFuture.completedFuture(null);
+        }
+
+        // Guard: engine-level backoff for this chunk
+        long chunkIndex = ((long)(cx & 0xFFFFFFFF)) | ((long)(cz & 0xFFFFFFFF) << 32);
+        try {
+            if (world.getChunkStore().isChunkOnBackoff(chunkIndex, System.nanoTime())) {
+                LOG.fine("[OptiPortal] retryChunkLoad skipped (engine backoff): " + cx + "," + cz);
+                return CompletableFuture.completedFuture(null);
+            }
+        } catch (Exception e) {
+            // isChunkOnBackoff is a read — should not throw, but guard defensively
+            LOG.fine("[OptiPortal] retryChunkLoad: isChunkOnBackoff threw: " + e.getMessage());
+        }
+
+        LOG.info("[OptiPortal] Retrying chunk load: " + cx + "," + cz);
+        return world.getChunkAsync(cx, cz)
+                .thenApply(chunk -> {
+                    if (chunk != null) {
+                        circuitBreaker.recordSuccess();
+                        LOG.fine("[OptiPortal] Retry succeeded: " + cx + "," + cz);
+                    }
+                    return chunk;
+                });
     }
     
     /**

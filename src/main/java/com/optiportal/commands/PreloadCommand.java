@@ -213,7 +213,7 @@ public class PreloadCommand extends AbstractCommand {
             int effective = radius > 0 ? radius : plugin.getPluginConfig().getDefaultWarmRadius();
             int cx = ChunkPreloader.toChunkCoord(entry.getX());
             int cz = ChunkPreloader.toChunkCoord(entry.getZ());
-            plugin.getChunkPreloader().warmLoad(entry.getWorld(), cx, cz, effective);
+            plugin.getChunkPreloader().warmLoad(id, entry.getWorld(), cx, cz, effective);
             reply(ctx, "[OptiPortal] " + id + " → WARM (r=" + effective + "). Loading now...");
             return CompletableFuture.<Void>completedFuture(null);
         }).orElseGet(() -> { reply(ctx, "[OptiPortal] Portal '" + id + "' not found."); return done(); });
@@ -276,7 +276,7 @@ public class PreloadCommand extends AbstractCommand {
             int cx = ChunkPreloader.toChunkCoord(entry.getX());
             int cz = ChunkPreloader.toChunkCoord(entry.getZ());
             int radius = entry.getWarmRadius() < 0 ? plugin.getPluginConfig().getPredictiveRadius() : entry.getWarmRadius();
-            plugin.getChunkPreloader().predictiveLoad(entry.getWorld(), cx, cz, radius);
+            plugin.getChunkPreloader().predictiveLoad(id, entry.getWorld(), cx, cz, radius);
             reply(ctx, "[OptiPortal] Force-preloading " + id + " (world=" + entry.getWorld() + " r=" + radius + ")");
             return CompletableFuture.<Void>completedFuture(null);
         }).orElseGet(() -> { reply(ctx, "[OptiPortal] Portal '" + id + "' not found."); return done(); });

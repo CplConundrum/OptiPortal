@@ -1,7 +1,7 @@
 package com.optiportal.async;
 
-import java.util.ArrayList;
-import java.util.List;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
@@ -13,7 +13,7 @@ import java.util.logging.Logger;
 
 /**
  * Load balancer for async operations to prevent world thread overload.
- * 
+ *
  * This component manages the scheduling and execution of async operations,
  * implementing load balancing, adaptive batch sizing, and priority-based
  * scheduling to optimize world thread usage.
@@ -34,25 +34,37 @@ public class AsyncLoadBalancer {
     private final AtomicLong totalOperations = new AtomicLong(0);
     private final AtomicLong totalExecutionTime = new AtomicLong(0);
     private final AtomicInteger currentBatchSize = new AtomicInteger(DEFAULT_BATCH_SIZE);
+    private final AtomicInteger totalQueuedCount = new AtomicInteger(0);
     
     // Priority queues
-    private final ConcurrentHashMap<AsyncMetrics.AsyncTaskPriority, List<Supplier<CompletableFuture<Void>>>> pendingTasks = 
+    private final ConcurrentHashMap<AsyncMetrics.AsyncTaskPriority, Deque<Supplier<CompletableFuture<Void>>>> pendingTasks =
             new ConcurrentHashMap<>();
     
     private final ScheduledExecutorService executor;
     private final AsyncMetrics metrics;
     private final AsyncErrorHandler errorHandler;
     
+    /** Optional TPS monitor for server-load-aware scheduling. Null = disabled. */
+    private final WorldTpsMonitor tpsMonitor;
+    
     public AsyncLoadBalancer(ScheduledExecutorService executor,
                             AsyncMetrics metrics,
                             AsyncErrorHandler errorHandler) {
+        this(executor, metrics, errorHandler, null);
+    }
+    
+    public AsyncLoadBalancer(ScheduledExecutorService executor,
+                            AsyncMetrics metrics,
+                            AsyncErrorHandler errorHandler,
+                            WorldTpsMonitor tpsMonitor) {
         this.executor = executor;
         this.metrics = metrics;
         this.errorHandler = errorHandler;
+        this.tpsMonitor = tpsMonitor;
         
         // Initialize priority queues
         for (AsyncMetrics.AsyncTaskPriority priority : AsyncMetrics.AsyncTaskPriority.values()) {
-            pendingTasks.put(priority, new ArrayList<>());
+            pendingTasks.put(priority, new ArrayDeque<>());
         }
         
         // Start load adjustment scheduler
@@ -64,13 +76,23 @@ public class AsyncLoadBalancer {
     
     /**
      * Schedule a load operation with priority.
-     * 
+     *
      * @param operation The operation to schedule
      * @param priority Operation priority
      * @return CompletableFuture that completes when operation is done
      */
     public CompletableFuture<Void> scheduleLoad(Supplier<CompletableFuture<Void>> operation,
                                                AsyncMetrics.AsyncTaskPriority priority) {
+        // Under critical TPS: queue ALL new operations regardless of active count.
+        // This prevents adding new load to a server already failing to keep up.
+        // Exception: CRITICAL priority tasks (player teleports) always execute immediately.
+        if (tpsMonitor != null
+                && tpsMonitor.isCriticallyLoaded()
+                && priority != AsyncMetrics.AsyncTaskPriority.CRITICAL) {
+            LOG.fine("[OptiPortal] AsyncLoadBalancer: TPS critical — queuing " + priority + " operation");
+            return queueOperation(operation, priority);
+        }
+        
         if (activeOperations.get() >= MAX_CONCURRENT_OPERATIONS) {
             // Queue the operation if we're at capacity
             return queueOperation(operation, priority);
@@ -81,8 +103,8 @@ public class AsyncLoadBalancer {
     }
     
     /**
-     * Calculate optimal batch size based on current load.
-     * 
+     * Calculate optimal batch size based on current load and TPS.
+     *
      * @param totalChunks Total number of chunks to process
      * @return Optimal batch size
      */
@@ -90,18 +112,38 @@ public class AsyncLoadBalancer {
         int currentLoad = activeOperations.get();
         double avgExecutionTime = getAverageExecutionTime();
         
-        // Adjust batch size based on current load and performance
+        // Start with the current adaptive batch size
         int adjustedSize = currentBatchSize.get();
         
+        // Existing load-based adjustment
         if (currentLoad > MAX_CONCURRENT_OPERATIONS * 0.8) {
-            // High load - reduce batch size
             adjustedSize = Math.max(MIN_BATCH_SIZE, adjustedSize / 2);
         } else if (currentLoad < MAX_CONCURRENT_OPERATIONS * 0.3 && avgExecutionTime < 100) {
-            // Low load and good performance - increase batch size
             adjustedSize = Math.min(MAX_BATCH_SIZE, adjustedSize + 1);
         }
         
-        // Ensure we don't exceed total chunks
+        // TPS-based adjustment (applied on top of load-based)
+        if (tpsMonitor != null) {
+            double tps = tpsMonitor.getCurrentTps();
+            
+            if (tps < WorldTpsMonitor.TPS_CRITICAL_THRESHOLD) {
+                // Server critically lagged — force minimum batch size
+                adjustedSize = MIN_BATCH_SIZE;
+                LOG.fine("[OptiPortal] AsyncLoadBalancer: TPS=" + String.format("%.1f", tps)
+                        + " (critical) → batch capped at " + MIN_BATCH_SIZE);
+            } else if (tps < 15.0) {
+                // Severely lagged — cap at 2
+                adjustedSize = Math.min(adjustedSize, 2);
+            } else if (tps < WorldTpsMonitor.TPS_LOW_THRESHOLD) {
+                // Moderately lagged — halve the calculated size
+                adjustedSize = Math.max(MIN_BATCH_SIZE, adjustedSize / 2);
+            } else if (tps < WorldTpsMonitor.NOMINAL_TPS) {
+                // Slightly under nominal (18–20 TPS) — reduce by 25%
+                adjustedSize = Math.max(MIN_BATCH_SIZE, (int)(adjustedSize * 0.75));
+            }
+        }
+        
+        // Never exceed the total chunk count
         return Math.min(adjustedSize, totalChunks);
     }
     
@@ -130,11 +172,11 @@ public class AsyncLoadBalancer {
     private CompletableFuture<Void> queueOperation(Supplier<CompletableFuture<Void>> operation,
                                                   AsyncMetrics.AsyncTaskPriority priority) {
         CompletableFuture<Void> future = new CompletableFuture<>();
-        
+
         // Add to priority queue
-        List<Supplier<CompletableFuture<Void>>> queue = pendingTasks.get(priority);
+        Deque<Supplier<CompletableFuture<Void>>> queue = pendingTasks.get(priority);
         synchronized (queue) {
-            queue.add(() -> {
+            queue.addLast(() -> {
                 return operation.get().whenComplete((result, ex) -> {
                     if (ex == null) {
                         future.complete(null);
@@ -143,8 +185,9 @@ public class AsyncLoadBalancer {
                     }
                 });
             });
+            totalQueuedCount.incrementAndGet();
         }
-        
+
         LOG.fine("Queued operation with priority: " + priority);
         return future;
     }
@@ -235,29 +278,32 @@ public class AsyncLoadBalancer {
      * Process queued tasks by priority.
      */
     private void processQueuedTasks() {
-        if (activeOperations.get() >= MAX_CONCURRENT_OPERATIONS) {
-            return; // Still at capacity
+        if (totalQueuedCount.get() == 0) {
+            return; // Nothing queued — skip all monitor acquisitions
         }
-        
-        // Process tasks by priority (CRITICAL first)
+        int available = MAX_CONCURRENT_OPERATIONS - activeOperations.get();
+        if (available <= 0) {
+            return; // At capacity
+        }
+
+        int dispatched = 0;
+
+        // Process tasks by priority (CRITICAL first, then HIGH, NORMAL, LOW, BACKGROUND)
         for (AsyncMetrics.AsyncTaskPriority priority : AsyncMetrics.AsyncTaskPriority.values()) {
-            List<Supplier<CompletableFuture<Void>>> queue = pendingTasks.get(priority);
-            
-            Supplier<CompletableFuture<Void>> operation;
-            synchronized (queue) {
-                if (!queue.isEmpty()) {
-                    operation = queue.remove(0);
-                } else {
-                    continue;
+            if (dispatched >= available) break;
+
+            Deque<Supplier<CompletableFuture<Void>>> queue = pendingTasks.get(priority);
+
+            while (dispatched < available) {
+                Supplier<CompletableFuture<Void>> operation;
+                synchronized (queue) {
+                    operation = queue.pollFirst(); // O(1) on ArrayDeque
                 }
-            }
-            
-            // Execute the operation
-            executeOperation(operation, priority);
-            
-            // Check if we're at capacity now
-            if (activeOperations.get() >= MAX_CONCURRENT_OPERATIONS) {
-                break;
+                if (operation == null) break; // This priority queue is empty
+
+                totalQueuedCount.decrementAndGet();
+                executeOperation(operation, priority);
+                dispatched++;
             }
         }
     }
@@ -279,7 +325,7 @@ public class AsyncLoadBalancer {
      */
     private int getQueuedTaskCount() {
         int total = 0;
-        for (List<Supplier<CompletableFuture<Void>>> queue : pendingTasks.values()) {
+        for (Deque<Supplier<CompletableFuture<Void>>> queue : pendingTasks.values()) {
             synchronized (queue) {
                 total += queue.size();
             }

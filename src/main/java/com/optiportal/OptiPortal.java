@@ -13,7 +13,9 @@ import com.optiportal.async.AsyncLoadBalancer;
 import com.optiportal.async.AsyncMetrics;
 import com.optiportal.async.CircuitBreaker;
 import com.optiportal.async.WorldThreadBridge;
+import com.optiportal.async.WorldTpsMonitor;
 import com.optiportal.cache.CacheManager;
+import com.optiportal.cache.ChunkOwnershipAuditor;
 import com.optiportal.cache.SnapshotScheduler;
 import com.optiportal.cache.WalManager;
 import com.optiportal.commands.PreloadCommand;
@@ -26,6 +28,8 @@ import com.optiportal.player.DeathLocationTracker;
 import com.optiportal.player.RespawnTracker;
 import com.optiportal.preload.AsyncKeepaliveManager;
 import com.optiportal.preload.ChunkPreloader;
+import com.optiportal.preload.CorridorIndex;
+import com.optiportal.preload.EnhancedChunkPreloader;
 import com.optiportal.preload.WarmZoneManager;
 import com.optiportal.preload.WorldRegistry;
 import com.optiportal.storage.StorageBackend;
@@ -71,6 +75,7 @@ public class OptiPortal extends JavaPlugin {
     private CacheManager cacheManager;
     private WalManager walManager;
     private SnapshotScheduler snapshotScheduler;
+    private ChunkOwnershipAuditor ownershipAuditor;
 
     // Zone management
     private WorldRegistry worldRegistry;
@@ -92,6 +97,12 @@ public class OptiPortal extends JavaPlugin {
 
     // Metrics
     private MetricsCollector metricsCollector;
+
+    // TPS monitor
+    private WorldTpsMonitor tpsMonitor;
+
+    // Corridor index (Phase 4)
+    private CorridorIndex corridorIndex;
 
     // --- Public API for other plugins ---
 
@@ -117,22 +128,48 @@ public class OptiPortal extends JavaPlugin {
             // WAL manager for crash protection
             walManager = new WalManager(config);
 
-            // Cache manager
-            cacheManager = new CacheManager(config, walManager, executor);
-            cacheManager.loadRegistry();
-            // Initialize metrics collector for cache operations
-            cacheManager.getMetricsCollector();
-
             // World registry — populated via AddWorldEvent/RemoveWorldEvent
             worldRegistry = new WorldRegistry();
             worldRegistry.register(getEventRegistry());
 
+            // TPS monitor — must come after worldRegistry, before loadBalancer and worldBridge
+            if (config.isTpsMonitorEnabled()) {
+                tpsMonitor = new WorldTpsMonitor(worldRegistry, executor);
+                tpsMonitor.start();
+            }
+
+            // Cache manager — must be after worldRegistry for tryReleaseKeepLoaded
+            cacheManager = new CacheManager(config, walManager, executor, worldRegistry);
+            cacheManager.loadRegistry();
+            // Initialize metrics collector for cache operations
+            cacheManager.getMetricsCollector();
+
+            // Ownership drift auditor — requires both cacheManager and worldRegistry
+            ownershipAuditor = new ChunkOwnershipAuditor(cacheManager, worldRegistry, executor, config);
+            ownershipAuditor.start();
+
             // Metrics — must be initialised before ChunkPreloader so it isn't passed null
             metricsCollector = new MetricsCollector();
 
+            // Initialize async infrastructure — must come before EnhancedChunkPreloader
+            metrics = new AsyncMetrics();
+            errorHandler = new AsyncErrorHandler(metrics, new CircuitBreaker(), executor);
+            worldBridge = new WorldThreadBridge(executor, errorHandler, metrics, tpsMonitor);
+            loadBalancer = new AsyncLoadBalancer(executor, metrics, errorHandler, tpsMonitor);
+
+            // CorridorIndex — build after worldRegistry is available
+            if (config.isCorridorPrioritizationEnabled()) {
+                corridorIndex = new CorridorIndex(worldRegistry, config.getCorridorRadiusChunks());
+                corridorIndex.registerEventListener(getEventRegistry());
+                executor.submit(corridorIndex::buildIndex);
+            } else {
+                corridorIndex = null;
+            }
+
             // Zone manager
             warmZoneManager = new WarmZoneManager(config, storage, cacheManager, executor);
-            chunkPreloader = new ChunkPreloader(config, cacheManager, worldRegistry, executor, storage, metricsCollector);
+            chunkPreloader = new EnhancedChunkPreloader(config, cacheManager, worldRegistry, executor,
+                    worldBridge, loadBalancer, metrics, storage, metricsCollector, corridorIndex);
             warmZoneManager.setChunkPreloader(chunkPreloader); // break circular dep via setter
 
             // Register AllWorldsLoadedEvent listener — actual chunk loading is gated on this
@@ -144,12 +181,6 @@ public class OptiPortal extends JavaPlugin {
 
             // Portal link registry — learns links from observed teleports
             portalLinkRegistry = new com.optiportal.preload.PortalLinkRegistry(getDataDirectory().toFile());
-
-            // Initialize async infrastructure
-            metrics = new AsyncMetrics();
-            errorHandler = new AsyncErrorHandler(metrics, new CircuitBreaker(), executor);
-            worldBridge = new WorldThreadBridge(executor, errorHandler, metrics);
-            loadBalancer = new AsyncLoadBalancer(executor, metrics, errorHandler);
 
             // Teleport interceptor - use async version for better performance
             teleportInterceptor = new AsyncTeleportInterceptor(this, config, warmZoneManager, chunkPreloader, storage, portalLinkRegistry, respawnTracker, deathLocationTracker, gravestoneIntegration, executor, worldBridge, loadBalancer, metrics);
@@ -289,7 +320,8 @@ public class OptiPortal extends JavaPlugin {
     public void triggerPredictiveLoad(String worldName, double x, double z) {
         int cx = com.optiportal.preload.ChunkPreloader.toChunkCoord(x);
         int cz = com.optiportal.preload.ChunkPreloader.toChunkCoord(z);
-        chunkPreloader.predictiveLoad(worldName, cx, cz, config.getPredictiveRadius());
+        String zoneId = "api:" + worldName + ":" + cx + ":" + cz;
+        chunkPreloader.predictiveLoad(zoneId, worldName, cx, cz, config.getPredictiveRadius());
     }
 
     // --- Getter methods for other components ---

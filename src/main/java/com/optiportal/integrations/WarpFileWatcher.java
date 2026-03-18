@@ -31,7 +31,7 @@ public class WarpFileWatcher {
     private long lastModified = -1;
 
     // Track known warp IDs for diff detection
-    private final Set<String> knownWarpIds = new HashSet<>();
+    private final Set<String> knownWarpIds = ConcurrentHashMap.newKeySet();
 
     public WarpFileWatcher(PluginConfig config, StorageBackend storage,
                            WarmZoneManager warmZoneManager, ScheduledExecutorService executor) {

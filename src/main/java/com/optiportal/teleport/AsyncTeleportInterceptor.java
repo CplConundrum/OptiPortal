@@ -133,6 +133,9 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
      * Update player positions in batches to reduce world thread impact.
      */
     private void updatePlayerPositionsBatch() {
+        if (getPlayerRefs().isEmpty()) {
+            return;
+        }
         List<UUID> playerBatch = getNextPlayerBatch();
         
         if (playerBatch.isEmpty()) {
@@ -424,8 +427,69 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
     }
     
     /**
+     * Trigger a predictive load with velocity-aware radius adjustment.
+     *
+     * Fires the base-radius load immediately, then asynchronously reads the player's
+     * speed. If speed exceeds the configured threshold and baseRadius < maxRadius,
+     * fires a second load at baseRadius+1 to cover the extra ring a fast-moving
+     * player will reach before preloading completes.
+     */
+    private void predictiveLoadWithVelocity(String zoneId, World world, String worldName,
+            com.hypixel.hytale.server.core.universe.PlayerRef playerRef,
+            int cx, int cz, int baseRadius) {
+
+        // Fire base radius load immediately — do not wait for velocity read
+        predictiveLoadWithRam(zoneId, worldName, cx, cz, baseRadius);
+
+        // Only attempt velocity boost if feature is enabled
+        if (!getConfig().isVelocityAwareActivation()) {
+            return;
+        }
+
+        double speedThreshold = getConfig().getVelocityRadiusBoostThreshold();
+        int maxRadius = getConfig().getPredictiveRadius();
+
+        // Async velocity check — runs on world thread, result delivered on executor thread
+        worldBridge.getPlayerSpeedAsync(world, playerRef)
+                .thenAccept(speed -> {
+                    if (speed == null) return;
+                    if (speed > speedThreshold && baseRadius < maxRadius) {
+                        int boostedRadius = baseRadius + 1; // cap at +1
+                        LOG.fine("[OptiPortal] Velocity boost: speed=" + String.format("%.2f", speed)
+                                + " threshold=" + speedThreshold
+                                + " radius=" + baseRadius + " → " + boostedRadius
+                                + " zone=" + zoneId);
+                        predictiveLoadWithRam(zoneId, worldName, cx, cz, boostedRadius);
+                    }
+                })
+                .exceptionally(ex -> {
+                    LOG.fine("[OptiPortal] predictiveLoadWithVelocity: speed check failed: "
+                            + ex.getMessage());
+                    return null;
+                });
+    }
+
+    @Override
+    protected void triggerPredictiveLoad(String zoneId, String worldName,
+            int cx, int cz, int radius,
+            com.hypixel.hytale.server.core.universe.PlayerRef playerRef) {
+        if (playerRef == null) {
+            super.triggerPredictiveLoad(zoneId, worldName, cx, cz, radius, null);
+            return;
+        }
+
+        World world = getChunkPreloader().getWorldRegistry().getWorldForPlayer(playerRef);
+        if (world == null) {
+            super.triggerPredictiveLoad(zoneId, worldName, cx, cz, radius, playerRef);
+            return;
+        }
+
+        predictiveLoadWithVelocity(zoneId, world, worldName, playerRef, cx, cz, radius);
+    }
+
+    /**
      * Get current async performance statistics.
-     * 
+     *
      * @return Performance statistics
      */
     public AsyncLoadBalancer.LoadStats getAsyncLoadStats() {

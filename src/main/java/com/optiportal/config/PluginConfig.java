@@ -121,9 +121,43 @@ public class PluginConfig {
     private int keepaliveColdIntervalMinutes = 60;
 
     // Tier decay
-    private int hotDecaySeconds  = 30;
+    private int hotDecaySeconds = 30;
     private int warmDecayMinutes = 30;
     private int pollIntervalSeconds = 1;
+
+    // Server load sensing
+    /** Whether TPS monitoring is active. Default: true. */
+    private boolean tpsMonitorEnabled = true;
+
+    /** TPS below which batch size is capped at its minimum. Default: 15.0. */
+    private double tpsLowThreshold = 15.0;
+
+    /** TPS below which all new non-critical operations are queued. Default: 12.0. */
+    private double tpsCriticalThreshold = 12.0;
+
+    /**
+     * If ChunkStore.getLoadedChunksCount() exceeds this across any world,
+     * batch size is reduced proportionally. Default: 2000. -1 = disabled.
+     */
+    private int maxLoadedChunksPressureThreshold = 2000;
+
+    // Ownership drift detection
+    /** How often to audit chunk ownership for drift, in minutes. Default: 5. */
+    private int ownershipAuditIntervalMinutes = 5;
+
+    // Corridor prioritization (Phase 4)
+    /** Whether CorridorIndex path-proximity prioritization is active. Default: true. */
+    private boolean corridorPrioritizationEnabled = true;
+
+    /** Chunk radius around each WorldPath waypoint to include as corridor. Default: 3. */
+    private int corridorRadiusChunks = 3;
+
+    // Velocity-aware activation (Phase 4)
+    /** Whether velocity-based radius boost is enabled. Default: true. */
+    private boolean velocityAwareActivation = true;
+
+    /** Player speed (blocks/tick) above which radius is boosted by 1. Default: 0.5. */
+    private double velocityRadiusBoostThreshold = 0.5;
 
     // Data folder reference
     private File dataFolder;
@@ -149,6 +183,9 @@ public class PluginConfig {
                 return config; // Return defaults
             }
         }
+
+        // Merge any missing keys from the bundled default config into the user's file
+        migrateConfig(configFile);
 
         // Parse config
         try (Reader reader = new FileReader(configFile)) {
@@ -198,6 +235,11 @@ public class PluginConfig {
             if (activation.has("facingCheck")) facingCheck = activation.get("facingCheck").getAsBoolean();
             if (activation.has("cooldownSeconds")) activationCooldownSeconds = activation.get("cooldownSeconds").getAsInt();
             if (activation.has("commitWindowSeconds")) activationCommitWindowSeconds = activation.get("commitWindowSeconds").getAsInt();
+            // Velocity-aware activation (Phase 4)
+            if (activation.has("velocityAwareActivation"))
+                velocityAwareActivation = activation.get("velocityAwareActivation").getAsBoolean();
+            if (activation.has("velocityRadiusBoostThreshold"))
+                velocityRadiusBoostThreshold = activation.get("velocityRadiusBoostThreshold").getAsDouble();
         }
 
         if (json.has("ttl")) {
@@ -292,11 +334,112 @@ public class PluginConfig {
             if (decay.has("warmDecayMinutes"))   warmDecayMinutes   = decay.get("warmDecayMinutes").getAsInt();
             if (decay.has("pollIntervalSeconds")) pollIntervalSeconds = decay.get("pollIntervalSeconds").getAsInt();
         }
+
+        if (json.has("async")) {
+            JsonObject async = json.getAsJsonObject("async");
+            if (async.has("tpsMonitorEnabled"))
+                tpsMonitorEnabled = async.get("tpsMonitorEnabled").getAsBoolean();
+            if (async.has("tpsLowThreshold"))
+                tpsLowThreshold = async.get("tpsLowThreshold").getAsDouble();
+            if (async.has("tpsCriticalThreshold"))
+                tpsCriticalThreshold = async.get("tpsCriticalThreshold").getAsDouble();
+            if (async.has("maxLoadedChunksPressureThreshold"))
+                maxLoadedChunksPressureThreshold = async.get("maxLoadedChunksPressureThreshold").getAsInt();
+        }
+
+        if (json.has("cache")) {
+            JsonObject cache = json.getAsJsonObject("cache");
+            if (cache.has("ownershipAuditIntervalMinutes"))
+                ownershipAuditIntervalMinutes = cache.get("ownershipAuditIntervalMinutes").getAsInt();
+        }
+
+        // Corridor prioritization (Phase 4)
+        if (json.has("densityBased")) {
+            JsonObject db = json.getAsJsonObject("densityBased");
+            if (db.has("corridor")) {
+                JsonObject corridor = db.getAsJsonObject("corridor");
+                if (corridor.has("enabled"))
+                    corridorPrioritizationEnabled = corridor.get("enabled").getAsBoolean();
+                if (corridor.has("radiusChunks"))
+                    corridorRadiusChunks = corridor.get("radiusChunks").getAsInt();
+            }
+        }
     }
 
     // --- Getters ---
 
     public File getDataFolder() { return dataFolder; }
+
+    /**
+     * Deep-merges missing keys from the bundled default config.json into the
+     * server's existing config.json on disk. Existing values are never overwritten —
+     * only absent keys are added. This ensures new config sections introduced in
+     * plugin updates are visible to server operators without resetting their settings.
+     *
+     * <p>The merge is recursive for JsonObject values. Scalar values and arrays are
+     * copied as-is when absent. {@code _comment} keys from defaults are copied only
+     * when the containing object itself is new; existing objects keep their own comments.
+     */
+    private static void migrateConfig(File configFile) {
+        // Load bundled defaults
+        JsonObject defaults;
+        try (InputStream in = PluginConfig.class.getResourceAsStream("/config.json")) {
+            if (in == null) return; // no bundled resource — nothing to migrate
+            defaults = GSON.fromJson(new java.io.InputStreamReader(in, java.nio.charset.StandardCharsets.UTF_8),
+                    JsonObject.class);
+        } catch (Exception e) {
+            System.err.println("[OptiPortal] Could not read bundled config.json for migration: " + e.getMessage());
+            return;
+        }
+        if (defaults == null) return;
+
+        // Load user's file
+        JsonObject user;
+        try (Reader reader = new FileReader(configFile)) {
+            user = GSON.fromJson(reader, JsonObject.class);
+        } catch (Exception e) {
+            System.err.println("[OptiPortal] Could not read config.json for migration: " + e.getMessage());
+            return;
+        }
+        if (user == null) user = new JsonObject();
+
+        boolean changed = deepMergeDefaults(user, defaults);
+
+        if (changed) {
+            try (Writer writer = new FileWriter(configFile)) {
+                GSON.toJson(user, writer);
+                System.out.println("[OptiPortal] config.json updated with new default keys from this version.");
+            } catch (Exception e) {
+                System.err.println("[OptiPortal] Could not write migrated config.json: " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Recursively adds keys present in {@code defaults} but absent in {@code target}.
+     *
+     * @return true if any key was added (caller should write the file back)
+     */
+    private static boolean deepMergeDefaults(JsonObject target, JsonObject defaults) {
+        boolean changed = false;
+        for (var entry : defaults.entrySet()) {
+            String key = entry.getKey();
+            com.google.gson.JsonElement defaultVal = entry.getValue();
+
+            if (!target.has(key)) {
+                // Key entirely absent — copy the whole subtree from defaults
+                target.add(key, defaultVal.deepCopy());
+                changed = true;
+            } else if (defaultVal.isJsonObject() && target.get(key).isJsonObject()) {
+                // Both sides are objects — recurse to fill in missing nested keys
+                if (deepMergeDefaults(target.getAsJsonObject(key), defaultVal.getAsJsonObject())) {
+                    changed = true;
+                }
+            }
+            // Otherwise the user already has a value — leave it alone
+        }
+        return changed;
+    }
 
     /**
      * Runs path discovery for warps and gravestones if either path looks like
@@ -475,4 +618,23 @@ public class PluginConfig {
     private int bytesPerChunk = 262144; // 256 KB default
 
     public int getBytesPerChunk() { return bytesPerChunk; }
+
+    /**
+     * How often to audit chunk ownership for drift, in minutes.
+     */
+    public int getOwnershipAuditIntervalMinutes() { return ownershipAuditIntervalMinutes; }
+
+    // TPS monitor getters
+    public boolean isTpsMonitorEnabled() { return tpsMonitorEnabled; }
+    public double getTpsLowThreshold() { return tpsLowThreshold; }
+    public double getTpsCriticalThreshold() { return tpsCriticalThreshold; }
+    public int getMaxLoadedChunksPressureThreshold() { return maxLoadedChunksPressureThreshold; }
+
+    // Phase 4: Corridor prioritization getters
+    public boolean isCorridorPrioritizationEnabled() { return corridorPrioritizationEnabled; }
+    public int getCorridorRadiusChunks() { return corridorRadiusChunks; }
+
+    // Phase 4: Velocity-aware activation getters
+    public boolean isVelocityAwareActivation() { return velocityAwareActivation; }
+    public double getVelocityRadiusBoostThreshold() { return velocityRadiusBoostThreshold; }
 }
