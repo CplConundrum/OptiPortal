@@ -26,6 +26,23 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
     private static final Gson GSON = new Gson();
     protected HikariDataSource dataSource;
 
+    // Optional cache updater for async invalidation
+    private CacheUpdater cacheUpdater;
+
+    /**
+     * Interface for cache update notifications.
+     */
+    public interface CacheUpdater {
+        void onUpdate(List<PortalEntry> currentEntries);
+    }
+
+    /**
+     * Set the cache updater for invalidation notifications.
+     */
+    public void setCacheUpdater(CacheUpdater cacheUpdater) {
+        this.cacheUpdater = cacheUpdater;
+    }
+
     @Override
     public void init() throws Exception {
         dataSource = createDataSource();
@@ -116,6 +133,10 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
         } catch (SQLException e) {
             System.err.println("[OptiPortal] SQL save error: " + e.getMessage());
         }
+        // Notify cache updater
+        if (cacheUpdater != null) {
+            cacheUpdater.onUpdate(loadAll());
+        }
     }
 
     @Override
@@ -136,6 +157,10 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
         } catch (SQLException e) {
             System.err.println("[OptiPortal] SQL saveAll error: " + e.getMessage());
         }
+        // Notify cache updater
+        if (cacheUpdater != null) {
+            cacheUpdater.onUpdate(loadAll());
+        }
     }
 
     @Override
@@ -147,6 +172,10 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
             ps.executeUpdate();
         } catch (SQLException e) {
             System.err.println("[OptiPortal] SQL delete error: " + e.getMessage());
+        }
+        // Notify cache updater
+        if (cacheUpdater != null) {
+            cacheUpdater.onUpdate(loadAll());
         }
     }
 

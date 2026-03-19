@@ -1,6 +1,5 @@
 package com.optiportal.cache;
 
-import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -94,9 +93,6 @@ public class ChunkOwnershipAuditor {
     private void auditWorld(World world) {
         String worldName = world.getName();
 
-        // Prefix for this world's chunk keys
-        String worldPrefix = worldName + ":";
-
         // Fetch all loaded chunk indexes from the ChunkStore in one call.
         // getChunkIndexes() covers both ticking and non-ticking chunks, unlike
         // getChunkIfLoaded() which silently returns null for non-ticking chunks.
@@ -109,43 +105,23 @@ public class ChunkOwnershipAuditor {
             return;
         }
 
+        // Get only the packed chunk keys owned in this world — no prefix filtering needed.
+        // Key encoding: cx = (int) key,  cz = (int)(key >>> 32)
+        Set<Long> ownedKeys = cacheManager.getOwnedChunkKeys(worldName);
+        if (ownedKeys.isEmpty()) return;
+
         int checkedCount = 0;
         int evictedCount = 0;
 
         // Collect evictions before applying them so we can run the sanity check first.
         java.util.List<int[]> evictions = new java.util.ArrayList<>();
 
-        // Iterate the ownership map; we use the unmodifiable view from CacheManager.
-        // ConcurrentHashMap iteration is safe without external locking.
-        Map<String, Set<String>> ownership = cacheManager.getChunkOwnership();
-
-        for (Map.Entry<String, Set<String>> ownerEntry : ownership.entrySet()) {
-            String chunkKey = ownerEntry.getKey();
-            if (!chunkKey.startsWith(worldPrefix)) {
-                continue; // Not in this world
-            }
-
+        for (Long packedKey : ownedKeys) {
             checkedCount++;
-
-            // Parse chunk coordinates from the key: "worldName:cx:cz"
-            // Use the same last-two-colons strategy as CacheManager.parseChunkKey.
-            int lastColon = chunkKey.lastIndexOf(':');
-            int secondLastColon = chunkKey.lastIndexOf(':', lastColon - 1);
-            if (lastColon < 0 || secondLastColon < 0) continue;
-
-            int cx, cz;
-            try {
-                cx = Integer.parseInt(chunkKey.substring(secondLastColon + 1, lastColon));
-                cz = Integer.parseInt(chunkKey.substring(lastColon + 1));
-            } catch (NumberFormatException e) {
-                LOG.fine(() -> "[OptiPortal] ChunkOwnershipAuditor: malformed key: " + chunkKey);
-                continue;
-            }
-
-            long chunkIndex = ((long)(cx & 0xFFFFFFFF)) | ((long)(cz & 0xFFFFFFFF) << 32);
-
-            if (!loadedIndexes.contains(chunkIndex)) {
+            if (!loadedIndexes.contains(packedKey)) {
                 evictedCount++;
+                int cx = (int)(long) packedKey;
+                int cz = (int)(packedKey >>> 32);
                 evictions.add(new int[]{cx, cz});
             }
         }

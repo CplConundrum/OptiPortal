@@ -1,9 +1,9 @@
 package com.optiportal.async;
 
-import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -36,8 +36,12 @@ public class AsyncLoadBalancer {
     private final AtomicInteger currentBatchSize = new AtomicInteger(DEFAULT_BATCH_SIZE);
     private final AtomicInteger totalQueuedCount = new AtomicInteger(0);
     
+    // EMA for execution time — α=0.1 gives ~95% weight to last 29 samples
+    private static final double EMA_ALPHA = 0.1;
+    private volatile double emaExecutionTimeMs = 0.0;
+    
     // Priority queues
-    private final ConcurrentHashMap<AsyncMetrics.AsyncTaskPriority, Deque<Supplier<CompletableFuture<Void>>>> pendingTasks =
+    private final ConcurrentHashMap<AsyncMetrics.AsyncTaskPriority, ConcurrentLinkedDeque<Supplier<CompletableFuture<Void>>>> pendingTasks =
             new ConcurrentHashMap<>();
     
     private final ScheduledExecutorService executor;
@@ -64,7 +68,7 @@ public class AsyncLoadBalancer {
         
         // Initialize priority queues
         for (AsyncMetrics.AsyncTaskPriority priority : AsyncMetrics.AsyncTaskPriority.values()) {
-            pendingTasks.put(priority, new ArrayDeque<>());
+            pendingTasks.put(priority, new ConcurrentLinkedDeque<>());
         }
         
         // Start load adjustment scheduler
@@ -125,7 +129,7 @@ public class AsyncLoadBalancer {
         // TPS-based adjustment (applied on top of load-based)
         if (tpsMonitor != null) {
             double tps = tpsMonitor.getCurrentTps();
-            
+        
             if (tps < WorldTpsMonitor.TPS_CRITICAL_THRESHOLD) {
                 // Server critically lagged — force minimum batch size
                 adjustedSize = MIN_BATCH_SIZE;
@@ -170,24 +174,19 @@ public class AsyncLoadBalancer {
      * @return CompletableFuture that completes when operation is done
      */
     private CompletableFuture<Void> queueOperation(Supplier<CompletableFuture<Void>> operation,
-                                                  AsyncMetrics.AsyncTaskPriority priority) {
+                                                   AsyncMetrics.AsyncTaskPriority priority) {
         CompletableFuture<Void> future = new CompletableFuture<>();
-
-        // Add to priority queue
         Deque<Supplier<CompletableFuture<Void>>> queue = pendingTasks.get(priority);
-        synchronized (queue) {
-            queue.addLast(() -> {
-                return operation.get().whenComplete((result, ex) -> {
-                    if (ex == null) {
-                        future.complete(null);
-                    } else {
-                        future.completeExceptionally(ex);
-                    }
-                });
+        queue.addLast(() -> {
+            return operation.get().whenComplete((result, ex) -> {
+                if (ex == null) {
+                    future.complete(null);
+                } else {
+                    future.completeExceptionally(ex);
+                }
             });
-            totalQueuedCount.incrementAndGet();
-        }
-
+        });
+        totalQueuedCount.incrementAndGet();
         LOG.fine("Queued operation with priority: " + priority);
         return future;
     }
@@ -213,14 +212,17 @@ public class AsyncLoadBalancer {
         return operation.get().whenComplete((result, ex) -> {
             long duration = System.currentTimeMillis() - startTime;
             activeOperations.decrementAndGet();
-            totalExecutionTime.addAndGet(duration);
-             
+            totalExecutionTime.addAndGet(duration);  // keep for LoadStats.totalOperations context
+
+            // Update EMA — volatile double, no lock needed (slight race acceptable; result converges)
+            emaExecutionTimeMs = EMA_ALPHA * duration + (1.0 - EMA_ALPHA) * emaExecutionTimeMs;
+
             if (metrics != null) {
                 metrics.recordAsyncTaskComplete(priority, duration);
             }
-             
             if (ex != null) {
-                errorHandler.handleWorldThreadError(ex instanceof Exception ? (Exception) ex : new Exception(ex), "loadBalancer");
+                errorHandler.handleWorldThreadError(
+                        ex instanceof Exception ? (Exception) ex : new Exception(ex), "loadBalancer");
             }
         });
     }
@@ -295,10 +297,7 @@ public class AsyncLoadBalancer {
             Deque<Supplier<CompletableFuture<Void>>> queue = pendingTasks.get(priority);
 
             while (dispatched < available) {
-                Supplier<CompletableFuture<Void>> operation;
-                synchronized (queue) {
-                    operation = queue.pollFirst(); // O(1) on ArrayDeque
-                }
+                Supplier<CompletableFuture<Void>> operation = queue.pollFirst(); // lock-free
                 if (operation == null) break; // This priority queue is empty
 
                 totalQueuedCount.decrementAndGet();
@@ -309,13 +308,12 @@ public class AsyncLoadBalancer {
     }
     
     /**
-     * Get average execution time.
+     * Get average execution time using EMA.
      * 
-     * @return Average execution time in milliseconds
+     * @return EMA of execution time in milliseconds
      */
     private double getAverageExecutionTime() {
-        long ops = totalOperations.get();
-        return ops > 0 ? (double) totalExecutionTime.get() / ops : 0.0;
+        return emaExecutionTimeMs;
     }
     
     /**
@@ -325,10 +323,8 @@ public class AsyncLoadBalancer {
      */
     private int getQueuedTaskCount() {
         int total = 0;
-        for (Deque<Supplier<CompletableFuture<Void>>> queue : pendingTasks.values()) {
-            synchronized (queue) {
-                total += queue.size();
-            }
+        for (ConcurrentLinkedDeque<Supplier<CompletableFuture<Void>>> queue : pendingTasks.values()) {
+            total += queue.size(); // ConcurrentLinkedDeque.size() is O(n), but called rarely
         }
         return total;
     }

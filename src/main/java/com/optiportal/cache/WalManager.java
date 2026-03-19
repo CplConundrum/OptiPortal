@@ -1,7 +1,9 @@
 package com.optiportal.cache;
 
 import java.io.File;
+import java.io.FileWriter;
 import java.io.IOException;
+import java.io.Writer;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.BasicFileAttributes;
@@ -55,6 +57,26 @@ public class WalManager {
 
     private String sanitize(String key) {
         return key.replaceAll("[^a-zA-Z0-9_\\-]", "_");
+    }
+
+    /**
+     * Write content to a file atomically using a temp file + rename pattern.
+     * This prevents corruption from mid-write crashes.
+     * @param target the target file to write
+     * @param content the content to write
+     * @throws IOException if write fails
+     */
+    public void writeAtomic(File target, String content) throws IOException {
+        File tmp = new File(target.getParent(), target.getName() + ".tmp");
+        try (Writer w = new FileWriter(tmp)) {
+            w.write(content);
+        }
+        // Atomic rename — on most OS this is atomic at filesystem level
+        if (!tmp.renameTo(target)) {
+            // Fallback: copy + delete
+            Files.move(tmp.toPath(), target.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING);
+        }
     }
 
     /**

@@ -11,6 +11,8 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.Semaphore;
 
 import com.hypixel.hytale.event.EventRegistry;
 import com.hypixel.hytale.server.core.universe.Universe;
@@ -90,6 +92,7 @@ public class WarmZoneManager {
             }
 
             worldsReady.set(true);
+            if (pollTask != null) pollTask.cancel(false);
             if (stagedLoadStarted.compareAndSet(false, true)) {
                 logWorldNames("AllWorldsLoadedEvent");
                 executor.submit(this::runStagedLoad);
@@ -100,6 +103,7 @@ public class WarmZoneManager {
     public void triggerStagedLoadOnce() {
         System.out.println("[OptiPortal] triggerStagedLoadOnce called, stagedLoadStarted=" + stagedLoadStarted.get());
         worldsReady.set(true);
+        if (pollTask != null) pollTask.cancel(false);
         if (stagedLoadStarted.compareAndSet(false, true)) {
             logWorldNames("first player join");
             executor.submit(this::runStagedLoad);
@@ -108,16 +112,22 @@ public class WarmZoneManager {
         }
     }
 
+    /** Scheduled task for pollWorldsReady. */
+    private volatile java.util.concurrent.ScheduledFuture<?> pollTask;
+
     public void startStagedLoad() {
         // Just start the polling fallback — actual load is triggered by triggerStagedLoadOnce()
         // from PlayerReadyEvent, which ensures WorldRegistry is seeded before load starts.
-        executor.scheduleWithFixedDelay(this::pollWorldsReady, 2, 2, java.util.concurrent.TimeUnit.SECONDS);
+        pollTask = executor.scheduleWithFixedDelay(this::pollWorldsReady, 2, 2, java.util.concurrent.TimeUnit.SECONDS);
     }
 
     private final java.util.concurrent.atomic.AtomicInteger pollCount = new java.util.concurrent.atomic.AtomicInteger(0);
 
     private void pollWorldsReady() {
-        if (worldsReady.get()) return; // player join or event already triggered
+        if (worldsReady.get()) {
+            if (pollTask != null) pollTask.cancel(false);
+            return;
+        }
         if (chunkPreloader == null) return;
         int count = pollCount.incrementAndGet();
         // Polling is a last-resort fallback — primary trigger is triggerStagedLoadOnce()
@@ -125,6 +135,7 @@ public class WarmZoneManager {
         if (count >= 30) {
             System.err.println("[OptiPortal] No player joined after 60s — staged load skipped.");
             worldsReady.set(true);
+            if (pollTask != null) pollTask.cancel(false);
         }
     }
 
@@ -152,22 +163,46 @@ public class WarmZoneManager {
         System.out.println("[OptiPortal] Staged load: " + warmZones.size()
                 + " WARM zones (skipping " + (all.size() - warmZones.size()) + " PREDICTIVE)");
 
-        int loaded = 0;
-        int skipped = 0;
-        for (PortalEntry zone : warmZones) {
-            try {
-                loadWarmZone(zone).get(120, TimeUnit.SECONDS);
-                loaded++;
-            } catch (TimeoutException e) {
-                System.err.println("[OptiPortal] Warm load timed out for " + zone.getId() + " — skipping");
-                skipped++;
-            } catch (Exception e) {
-                System.err.println("[OptiPortal] Warm load failed for " + zone.getId() + ": " + e.getMessage());
-                skipped++;
-            }
+        if (warmZones.isEmpty()) {
+            System.out.println("[OptiPortal] Startup load complete: 0 loaded, 0 skipped.");
+            return;
         }
 
-        System.out.println("[OptiPortal] Startup load complete: " + loaded + " loaded, " + skipped + " skipped.");
+        int maxConcurrent = Math.max(1, config.getStagedLoadConcurrency());
+        Semaphore sem = new Semaphore(maxConcurrent);
+        AtomicInteger loaded = new AtomicInteger(0);
+        AtomicInteger skipped = new AtomicInteger(0);
+        List<CompletableFuture<Void>> futures = new java.util.ArrayList<>();
+
+        for (PortalEntry zone : warmZones) {
+            try {
+                sem.acquire(); // wait for a free slot — bounded by zone load time, not 120s
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                System.err.println("[OptiPortal] runStagedLoad interrupted.");
+                break;
+            }
+
+            CompletableFuture<Void> f = loadWarmZone(zone)
+                    .orTimeout(120, TimeUnit.SECONDS)
+                    .handle((v, ex) -> {
+                        sem.release();
+                        if (ex != null) {
+                            System.err.println("[OptiPortal] Warm load failed for "
+                                    + zone.getId() + ": " + ex.getMessage());
+                            skipped.incrementAndGet();
+                        } else {
+                            loaded.incrementAndGet();
+                        }
+                        return (Void) null;
+                    });
+            futures.add(f);
+        }
+
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                .whenComplete((v, ex) ->
+                    System.out.println("[OptiPortal] Startup load complete: "
+                            + loaded.get() + " loaded, " + skipped.get() + " skipped."));
     }
 
     private int startupPriority(PortalEntry e) {

@@ -1,13 +1,16 @@
 package com.optiportal.preload;
 
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.Consumer;
+
 import com.hypixel.hytale.event.EventRegistry;
 import com.hypixel.hytale.server.core.universe.world.World;
 import com.hypixel.hytale.server.core.universe.world.events.AddWorldEvent;
 import com.hypixel.hytale.server.core.universe.world.events.RemoveWorldEvent;
-
-import java.util.Collection;
-import java.util.Collections;
-import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Maintains a name → World map by listening to AddWorldEvent / RemoveWorldEvent.
@@ -17,6 +20,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class WorldRegistry {
 
     private final ConcurrentHashMap<String, World> worlds = new ConcurrentHashMap<>();
+    private final List<Consumer<String>> worldUnloadCallbacks = new CopyOnWriteArrayList<>();
 
     @SuppressWarnings({"unchecked", "rawtypes"})
     public void register(EventRegistry events) {
@@ -28,6 +32,8 @@ public class WorldRegistry {
         events.<String, RemoveWorldEvent>registerGlobal(RemoveWorldEvent.class, event -> {
             World world = event.getWorld();
             worlds.remove(world.getName());
+            String name = world.getName();
+            worldUnloadCallbacks.forEach(cb -> cb.accept(name));
         });
     }
 
@@ -37,6 +43,11 @@ public class WorldRegistry {
     /** Manually register a world — used as fallback when AddWorldEvent fires before plugin loads. */
     public void addWorld(World world) {
         worlds.put(world.getName(), world);
+    }
+
+    /** Register a callback to be invoked (with world name) on RemoveWorldEvent. */
+    public void addWorldUnloadCallback(Consumer<String> callback) {
+        worldUnloadCallbacks.add(callback);
     }
 
     public World getWorld(String name) {

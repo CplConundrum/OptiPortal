@@ -1,5 +1,6 @@
 package com.optiportal;
 
+import java.io.File;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.logging.Level;
@@ -32,6 +33,7 @@ import com.optiportal.preload.CorridorIndex;
 import com.optiportal.preload.EnhancedChunkPreloader;
 import com.optiportal.preload.WarmZoneManager;
 import com.optiportal.preload.WorldRegistry;
+import com.optiportal.storage.JsonStorageBackend;
 import com.optiportal.storage.StorageBackend;
 import com.optiportal.storage.StorageFactory;
 import com.optiportal.teleport.AsyncTeleportInterceptor;
@@ -139,7 +141,10 @@ public class OptiPortal extends JavaPlugin {
             }
 
             // Cache manager — must be after worldRegistry for tryReleaseKeepLoaded
-            cacheManager = new CacheManager(config, walManager, executor, worldRegistry);
+            // P11: Create registry file path and pass to CacheManager constructor
+            File registryFile = new File(getDataDirectory().toFile(), "cache-registry.json");
+            cacheManager = new CacheManager(config, walManager, executor, worldRegistry, registryFile);
+            // P11: Load persisted registry before staged load so warm zones are restored
             cacheManager.loadRegistry();
             // Initialize metrics collector for cache operations
             cacheManager.getMetricsCollector();
@@ -180,13 +185,21 @@ public class OptiPortal extends JavaPlugin {
             deathLocationTracker = new DeathLocationTracker(config, storage, cacheManager, chunkPreloader);
 
             // Portal link registry — learns links from observed teleports
-            portalLinkRegistry = new com.optiportal.preload.PortalLinkRegistry(getDataDirectory().toFile());
+            portalLinkRegistry = new com.optiportal.preload.PortalLinkRegistry(getDataDirectory().toFile(), executor);
 
             // Teleport interceptor - use async version for better performance
             teleportInterceptor = new AsyncTeleportInterceptor(this, config, warmZoneManager, chunkPreloader, storage, portalLinkRegistry, respawnTracker, deathLocationTracker, gravestoneIntegration, executor, worldBridge, loadBalancer, metrics);
 
+            // Wire cache updater to storage backend for portal cache invalidation
+            if (storage instanceof JsonStorageBackend) {
+                ((JsonStorageBackend) storage).setCacheUpdater(
+                    entries -> teleportInterceptor.updatePortalCache(entries)
+                );
+            }
+
             // File watchers
-            warpFileWatcher = new WarpFileWatcher(config, storage, warmZoneManager, executor);
+            warpFileWatcher = new WarpFileWatcher(config, storage, warmZoneManager, executor,
+                    teleportInterceptor::refreshPortalCache);
             warpFileWatcher.start();
 
             // Gravestone integration
@@ -241,6 +254,7 @@ public class OptiPortal extends JavaPlugin {
             if (warpFileWatcher != null) warpFileWatcher.stop();
             if (snapshotScheduler != null) snapshotScheduler.stop();
             if (keepaliveManager != null) keepaliveManager.stop();
+            if (portalLinkRegistry != null) portalLinkRegistry.flush();
             if (warmZoneManager != null) warmZoneManager.serializeAll();
             if (cacheManager != null) cacheManager.saveRegistry();
             if (storage != null) storage.close();

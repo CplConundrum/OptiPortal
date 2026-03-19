@@ -1,7 +1,7 @@
 $C = "Common.ui";
 
 $C.@Container {
-  Anchor: (Width: 960, Height: 720);
+  Anchor: (Width: 1000, Height: 720);
 
   #Title {
     Group {
@@ -44,7 +44,7 @@ $C.@Container {
       }
       Label #HdrRamMarginal {
         Style: (FontSize: 16, RenderBold: true);
-        Anchor: (Width: 90);
+        Anchor: (Width: 130);
       }
       Label #HdrPreload {
         Style: (FontSize: 16, RenderBold: true);
@@ -91,7 +91,7 @@ $C.@Container {
       }
       Label #ColRamMarginal {
         Style: (FontSize: 14);
-        Anchor: (Width: 90);
+        Anchor: (Width: 130);
       }
       Label #ColPreload {
         Style: (FontSize: 14);

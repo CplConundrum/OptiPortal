@@ -1,16 +1,29 @@
 package com.optiportal.integrations;
 
-import com.google.gson.*;
+import java.io.File;
+import java.io.FileReader;
+import java.io.IOException;
+import java.io.Reader;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
 import com.optiportal.config.PluginConfig;
 import com.optiportal.model.PortalEntry;
 import com.optiportal.model.WarmStrategy;
 import com.optiportal.preload.WarmZoneManager;
 import com.optiportal.storage.StorageBackend;
-
-import java.io.*;
-import java.time.Instant;
-import java.util.*;
-import java.util.concurrent.*;
 
 /**
  * Watches warps.json for changes and syncs new/removed/updated warps
@@ -26,19 +39,25 @@ public class WarpFileWatcher {
     private final StorageBackend storage;
     private final WarmZoneManager warmZoneManager;
     private final ScheduledExecutorService executor;
-
+    private final Runnable onSyncComplete;
+    
     private ScheduledFuture<?> task;
     private long lastModified = -1;
-
-    // Track known warp IDs for diff detection
-    private final Set<String> knownWarpIds = ConcurrentHashMap.newKeySet();
-
+    
     public WarpFileWatcher(PluginConfig config, StorageBackend storage,
-                           WarmZoneManager warmZoneManager, ScheduledExecutorService executor) {
+                           WarmZoneManager warmZoneManager, ScheduledExecutorService executor,
+                           Runnable onSyncComplete) {
         this.config = config;
         this.storage = storage;
         this.warmZoneManager = warmZoneManager;
         this.executor = executor;
+        this.onSyncComplete = onSyncComplete;
+    }
+    
+    /** Constructor for backwards compatibility - delegates with empty callback. */
+    public WarpFileWatcher(PluginConfig config, StorageBackend storage,
+                           WarmZoneManager warmZoneManager, ScheduledExecutorService executor) {
+        this(config, storage, warmZoneManager, executor, () -> {});
     }
 
     public void start() {
@@ -115,13 +134,17 @@ public class WarpFileWatcher {
     }
 
     private void syncWarps(List<PortalEntry> incomingWarps) {
+        // Single bulk load replaces N per-warp loadById() calls
+        Map<String, PortalEntry> existing = storage.loadAll()
+                .stream().collect(Collectors.toMap(PortalEntry::getId, e -> e));
+    
         Set<String> incomingIds = new HashSet<>();
-
+    
         for (PortalEntry incoming : incomingWarps) {
             incomingIds.add(incoming.getId());
-
-            Optional<PortalEntry> existing = storage.loadById(incoming.getId());
-            if (existing.isEmpty()) {
+    
+            PortalEntry ex = existing.get(incoming.getId());
+            if (ex == null) {
                 // New warp - register with default strategy
                 incoming.setStrategy(WarmStrategy.PREDICTIVE);
                 storage.save(incoming);
@@ -129,7 +152,6 @@ public class WarpFileWatcher {
                         + " [" + incoming.getX() + ", " + incoming.getY() + ", " + incoming.getZ() + "] → PREDICTIVE");
             } else {
                 // Check if coordinates changed
-                PortalEntry ex = existing.get();
                 if (ex.getX() != incoming.getX() || ex.getY() != incoming.getY() || ex.getZ() != incoming.getZ()) {
                     // Coordinates moved - purge old cache, update
                     ex.setX(incoming.getX());
@@ -141,16 +163,16 @@ public class WarpFileWatcher {
                 }
             }
         }
-
-        // Remove warps that no longer exist in file
-        for (String knownId : new HashSet<>(knownWarpIds)) {
-            if (!incomingIds.contains(knownId)) {
-                storage.delete(knownId);
-                System.out.println("[OptiPortal] Warp removed: " + knownId);
+    
+        // Remove warps that are in storage but no longer exist in file
+        for (String existingId : existing.keySet()) {
+            if (!incomingIds.contains(existingId)) {
+                storage.delete(existingId);
+                System.out.println("[OptiPortal] Warp removed: " + existingId);
             }
         }
 
-        knownWarpIds.clear();
-        knownWarpIds.addAll(incomingIds);
+        // Notify portal cache that storage has changed
+        onSyncComplete.run();
     }
 }

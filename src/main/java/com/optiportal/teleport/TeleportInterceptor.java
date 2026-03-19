@@ -1,6 +1,7 @@
 package com.optiportal.teleport;
 
 import java.util.Collections;
+import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -14,6 +15,7 @@ import com.hypixel.hytale.math.vector.Location;
 import com.hypixel.hytale.server.core.entity.entities.Player;
 import com.hypixel.hytale.server.core.event.events.ecs.DiscoverZoneEvent;
 import com.hypixel.hytale.server.core.event.events.player.AddPlayerToWorldEvent;
+import com.hypixel.hytale.server.core.event.events.player.PlayerDisconnectEvent;
 import com.hypixel.hytale.server.core.event.events.player.PlayerReadyEvent;
 import com.hypixel.hytale.server.core.modules.entity.teleport.TeleportRecord;
 import com.hypixel.hytale.server.core.universe.PlayerRef;
@@ -113,6 +115,10 @@ public class TeleportInterceptor {
         return config;
     }
 
+    protected OptiPortal getPlugin() {
+        return plugin;
+    }
+
     protected ConcurrentHashMap<UUID, PlayerRef> getPlayerRefs() {
         return playerRefs;
     }
@@ -123,6 +129,14 @@ public class TeleportInterceptor {
 
     protected ChunkPreloader getChunkPreloader() {
         return chunkPreloader;
+    }
+
+    /**
+     * Returns all portal entries for proximity checks.
+     * Subclasses override this to return an in-memory cache instead of hitting storage.
+     */
+    protected List<PortalEntry> getAllPortalEntries() {
+        return storage.loadAll();
     }
 
     protected ConcurrentHashMap<UUID, Long> getLastSeenTeleportNanos() {
@@ -152,6 +166,10 @@ public class TeleportInterceptor {
         // PlayerReadyEvent — PlayerEvent<String> → registerGlobal
         events.<String, PlayerReadyEvent>registerGlobal(
                 PlayerReadyEvent.class, this::onPlayerReady);
+
+        // PlayerDisconnectEvent — IEvent<Void> → registerGlobal
+        events.<Void, PlayerDisconnectEvent>registerGlobal(
+                PlayerDisconnectEvent.class, this::onPlayerDisconnect);
     }
 
     // -------------------------------------------------------------------------
@@ -237,7 +255,14 @@ public class TeleportInterceptor {
             PlayerRef pRef = entry.getValue();
             try {
                 World world = chunkPreloader.getWorldRegistry().getWorldForPlayer(pRef);
-                if (world == null) continue;
+                if (world == null) {
+                    // Player is no longer in any world — clean up stale ref
+                    playerRefs.remove(uuid);
+                    lastSeenTeleportNanos.remove(uuid);
+                    lastKnownPosition.remove(uuid);
+                    cooldowns.remove(uuid);
+                    continue;
+                }
                 final World w = world;
                 w.execute(() -> {
                     try {
@@ -349,7 +374,7 @@ public class TeleportInterceptor {
         double maxDist = config.getActivationDistance();
         final double VERTICAL_BOUND = 4.0;
 
-        for (com.optiportal.model.PortalEntry entry : storage.loadAll()) {
+        for (com.optiportal.model.PortalEntry entry : getAllPortalEntries()) {
             if (entry.isInstanced()) continue;
             if (!entry.getWorld().equals(worldName)) continue;
             if (entry.getId().contains(":")) continue; // skip death:, respawn:, etc.
@@ -417,7 +442,7 @@ public class TeleportInterceptor {
         PortalEntry destEntry = null;
         double bestDist = Double.MAX_VALUE;
 
-        for (PortalEntry entry : storage.loadAll()) {
+        for (PortalEntry entry : getAllPortalEntries()) {
             if (entry.isInstanced()) continue;
             if (!entry.getWorld().equals(destWorld)) continue;
             if (entry.getId().contains(":")) continue;
@@ -463,7 +488,7 @@ public class TeleportInterceptor {
     private String findNearestPortal(String worldName, double px, double py, double pz) {
         String best = null;
         double bestDist = config.getActivationDistance();
-        for (PortalEntry entry : storage.loadAll()) {
+        for (PortalEntry entry : getAllPortalEntries()) {
             if (entry.isInstanced()) continue;
             if (!entry.getWorld().equals(worldName)) continue;
             if (entry.getId().contains(":")) continue;
@@ -482,7 +507,7 @@ public class TeleportInterceptor {
         // Find nearest portal to pre-teleport position across all worlds
         String prevZoneId = null;
         double bestDist = Double.MAX_VALUE;
-        for (PortalEntry entry : storage.loadAll()) {
+        for (PortalEntry entry : getAllPortalEntries()) {
             if (entry.isInstanced()) continue;
             if (entry.getId().contains(":")) continue;
             double dist = Math.sqrt(Math.pow(entry.getX() - prePos[0], 2) + Math.pow(entry.getZ() - prePos[2], 2));
@@ -604,8 +629,15 @@ public class TeleportInterceptor {
         return playerRefs.get(uuid);
     }
 
+    private void onPlayerDisconnect(PlayerDisconnectEvent event) {
+        UUID uuid = event.getPlayerRef().getUuid();
+        if (uuid != null) {
+            removePlayerRef(uuid);
+        }
+    }
+
     /**
-     * Remove a player's cached ref on disconnect (call from a disconnect handler if available).
+     * Remove a player's cached ref on disconnect.
      */
     /**
      * Returns true if the zone has been loaded (tier is not UNVISITED).

@@ -97,6 +97,14 @@ public class ChunkPreloader {
         return config.getBytesPerChunk();
     }
 
+    /**
+     * Protected getter for storage to allow subclasses to access it.
+     * @return Storage backend instance
+     */
+    protected StorageBackend getStorage() {
+        return storage;
+    }
+
     // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------

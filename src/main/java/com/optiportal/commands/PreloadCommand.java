@@ -71,6 +71,7 @@ public class PreloadCommand extends AbstractCommand {
         return switch (args[0].toLowerCase()) {
             case "list"      -> handleList(context);
             case "strategy"  -> handleStrategy(context, args);
+            case "shape"     -> handleShape(context, args);
             case "radius"    -> handleRadius(context, args);
             case "radiusxz"  -> handleRadiusXZ(context, args);
             case "migrate"   -> handleMigrate(context, args);
@@ -97,6 +98,7 @@ public class PreloadCommand extends AbstractCommand {
         reply(ctx, "[OptiPortal] Commands:");
         reply(ctx, "  /preload list — list all portals");
         reply(ctx, "  /preload strategy <id> <WARM|PREDICTIVE> — set strategy");
+        reply(ctx, "  /preload shape <id> <ELLIPSOID|CYLINDER|BOX> — set activation shape");
         reply(ctx, "  /preload radius <id> <n> — set uniform radius");
         reply(ctx, "  /preload radiusxz <id> <rx> <rz> — set asymmetric radius");
         reply(ctx, "  /preload setwarm <id> [radius] — set WARM and preload now");
@@ -135,6 +137,21 @@ public class PreloadCommand extends AbstractCommand {
                     entry.getRamEstimatedMB()));
         }
         return done();
+    }
+
+    private CompletableFuture<Void> handleShape(CommandContext ctx, String[] args) {
+        if (args.length < 3) { reply(ctx, "Usage: /preload shape <id> <ELLIPSOID|CYLINDER|BOX>"); return done(); }
+        String id = args[1];
+        String shape = args[2].toUpperCase();
+        if (!shape.equals("ELLIPSOID") && !shape.equals("CYLINDER") && !shape.equals("BOX")) {
+            reply(ctx, "[OptiPortal] Invalid shape. Use ELLIPSOID, CYLINDER, or BOX."); return done();
+        }
+        return plugin.getStorage().loadById(id).map(entry -> {
+            entry.setActivationShape(shape);
+            plugin.getStorage().save(entry);
+            reply(ctx, "[OptiPortal] " + id + " shape → " + shape + ".");
+            return CompletableFuture.<Void>completedFuture(null);
+        }).orElseGet(() -> { reply(ctx, "[OptiPortal] Portal '" + id + "' not found."); return done(); });
     }
 
     private CompletableFuture<Void> handleStrategy(CommandContext ctx, String[] args) {

@@ -19,7 +19,7 @@ import com.google.gson.JsonObject;
  */
 public class PluginConfig {
 
-    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
 
     // Backend
     private String backend = "JSON";
@@ -46,8 +46,8 @@ public class PluginConfig {
     private int defaultBufferSecondsPredictive = 20;
 
     // Activation
-    private double activationDistance = 16;
-    private double activationDistanceVertical = 8;
+    private double activationDistance = 10;
+    private double activationDistanceVertical = 3;
     private String activationShape = "ELLIPSOID";
     private boolean floorCeilingCheck = true;
     private boolean facingCheck = true;
@@ -144,6 +144,9 @@ public class PluginConfig {
     // Ownership drift detection
     /** How often to audit chunk ownership for drift, in minutes. Default: 5. */
     private int ownershipAuditIntervalMinutes = 5;
+
+    /** Staged load concurrency — number of concurrent warm zone loads at startup. Default: 3. */
+    private int stagedLoadConcurrency = 3;
 
     // Corridor prioritization (Phase 4)
     /** Whether CorridorIndex path-proximity prioritization is active. Default: true. */
@@ -351,6 +354,10 @@ public class PluginConfig {
             JsonObject cache = json.getAsJsonObject("cache");
             if (cache.has("ownershipAuditIntervalMinutes"))
                 ownershipAuditIntervalMinutes = cache.get("ownershipAuditIntervalMinutes").getAsInt();
+        }
+
+        if (json.has("stagedLoadConcurrency")) {
+            stagedLoadConcurrency = json.get("stagedLoadConcurrency").getAsInt();
         }
 
         // Corridor prioritization (Phase 4)
@@ -637,4 +644,7 @@ public class PluginConfig {
     // Phase 4: Velocity-aware activation getters
     public boolean isVelocityAwareActivation() { return velocityAwareActivation; }
     public double getVelocityRadiusBoostThreshold() { return velocityRadiusBoostThreshold; }
+
+    // Phase 5C: Staged load concurrency getter
+    public int getStagedLoadConcurrency() { return stagedLoadConcurrency; }
 }

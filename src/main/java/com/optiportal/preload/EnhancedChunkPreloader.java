@@ -12,6 +12,7 @@ import com.optiportal.async.WorldThreadBridge;
 import com.optiportal.cache.CacheManager;
 import com.optiportal.config.PluginConfig;
 import com.optiportal.metrics.MetricsCollector;
+import com.optiportal.model.CacheTier;
 import com.optiportal.storage.StorageBackend;
 
 /**
@@ -24,15 +25,19 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
     
     private static final Logger LOG = Logger.getLogger("OptiPortal");
     
+    private final ScheduledExecutorService executor;
     private final WorldThreadBridge worldBridge;
     private final AsyncLoadBalancer loadBalancer;
     private final AsyncMetrics metrics;
-    
+
     // Cache manager reference for ownership registration
     private final CacheManager cacheManager;
-    
+
     /** Optional corridor index for path-proximity prioritization. Null = disabled. */
     private final CorridorIndex corridorIndex;
+    
+    /** Complexity score cache — avoids recomputing score() for already-seen chunks. */
+    private final ChunkComplexityScorer.Cache complexityCache = new ChunkComplexityScorer.Cache();
     
     public EnhancedChunkPreloader(PluginConfig config,
                                   CacheManager cacheManager,
@@ -45,11 +50,15 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
                                   MetricsCollector metricsCollector,
                                   CorridorIndex corridorIndex) {
         super(config, cacheManager, worldRegistry, executor, storage, metricsCollector);
+        this.executor = executor;
         this.worldBridge = worldBridge;
         this.loadBalancer = loadBalancer;
         this.metrics = metrics;
         this.cacheManager = cacheManager;
         this.corridorIndex = corridorIndex; // may be null if disabled
+        
+        // Invalidate cached scores when a world unloads
+        worldRegistry.addWorldUnloadCallback(complexityCache::clearWorld);
     }
     
     /**
@@ -119,11 +128,15 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
      */
     private CompletableFuture<Void> enhancedPredictiveLoad(String zoneId, String worldName, int cx, int cz, int radius) {
         List<int[]> chunks = buildChunkListEnhanced(cx, cz, radius);
-        
+
         // Use adaptive batch sizing
         int batchSize = loadBalancer.calculateOptimalBatchSize(chunks.size());
-        
-        return loadChunksAsync(worldName, chunks, false, zoneId, batchSize);
+
+        CompletableFuture<Void> load = loadChunksAsync(worldName, chunks, false, zoneId, batchSize);
+        if (zoneId != null) {
+            return load.thenRunAsync(() -> cacheManager.setZoneTier(zoneId, CacheTier.HOT), executor);
+        }
+        return load;
     }
     
     /**
@@ -169,7 +182,7 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
         return CompletableFuture.allOf(batchFutures.toArray(CompletableFuture[]::new))
                 .whenComplete((result, ex) -> {
                     if (ex == null) {
-                        LOG.info(() -> "[OptiPortal] Enhanced chunk load completed: " + zoneId +
+                        LOG.fine(() -> "[OptiPortal] Enhanced chunk load completed: " + zoneId +
                                 " (" + chunks.size() + " chunks)");
                     } else {
                         LOG.warning(() -> "[OptiPortal] Enhanced chunk load failed for " + zoneId + ": " + ex.getMessage());
@@ -198,17 +211,15 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
 
             CompletableFuture<Void> chunkFuture = worldBridge.getChunkAsync(
                 getWorldRegistry().getWorld(worldName), cx, cz, nonTicking)
-                    .thenAccept(chunk -> {
+                    .thenAcceptAsync(chunk -> {
                         metrics.recordChunkLoadSuccess(cx, cz, 0);
                         if (chunk != null) {
                             // Register ownership immediately using the live chunk reference.
-                            // This is the only reliable point to call addKeepLoaded() — using
-                            // getChunkIfLoaded() later returns null for non-ticking chunks,
-                            // causing the pin to be skipped and the chunk to be evicted.
+                            // addKeepLoaded() is an AtomicInteger op — safe from any thread.
                             cacheManager.registerOwnership(zoneId, worldName, cx, cz, chunk);
-                            scoreAndRecord(chunk, zoneId, baseKbPerChunk);
+                            scoreAndRecord(chunk, zoneId, baseKbPerChunk, worldName);
                         }
-                    })
+                    }, executor)
                     .exceptionally(ex -> {
                         metrics.recordChunkLoadError(cx, cz, 0);
                         LOG.warning("[OptiPortal] Chunk load failed: " + cx + "," + cz
@@ -224,29 +235,63 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
     
     /**
      * Score the loaded chunk and record the complexity and RAM estimate at FINE log level.
-     * Does NOT store to disk — this is observational only in Phase 3.
-     * Phase 4's density-based plan may hook ComplexityScoreCache here.
+     * Uses complexityCache to avoid recomputing score() for already-seen chunks.
      *
      * @param chunk          The loaded WorldChunk (never null here)
      * @param zoneId         Zone ID for log context (may be null)
      * @param baseKbPerChunk Base KB per chunk from config
+     * @param worldName      World name for cache key
      */
     private void scoreAndRecord(com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk chunk,
-                                String zoneId, double baseKbPerChunk) {
+                                String zoneId, double baseKbPerChunk, String worldName) {
         try {
-            float complexity = ChunkComplexityScorer.score(chunk);
-            double estimatedRamMB = ChunkComplexityScorer.estimateRamMB(chunk, baseKbPerChunk);
+            float complexity = complexityCache.getOrComputeScore(worldName, chunk.getX(), chunk.getZ(), chunk);
+            double measuredRamMB = complexityCache.getOrComputeRam(
+                    worldName, chunk.getX(), chunk.getZ(), chunk, baseKbPerChunk);
   
             LOG.fine("[OptiPortal] Chunk scored: zone=" + zoneId
                     + " chunk=" + chunk.getX() + "," + chunk.getZ()
                     + " complexity=" + String.format("%.3f", complexity)
-                    + " estimatedRamMB=" + String.format("%.4f", estimatedRamMB));
-  
-            // Phase 4 hook: if ComplexityScoreCache is injected, store score here:
-            // complexityScoreCache.store(chunk.getIndex(), complexity);
+                    + " measuredRamMB=" + String.format("%.4f", measuredRamMB));
+      
+            // Update PortalEntry with measured RAM after first load
+            // This replaces the pre-load estimate with actual post-load measurement
+            updatePortalEntryRamEstimate(zoneId, worldName, chunk.getX(), chunk.getZ(), measuredRamMB);
         } catch (Exception e) {
             LOG.fine("[OptiPortal] scoreAndRecord error: " + e.getMessage());
         }
+    }
+    
+    /**
+     * Update the PortalEntry's ramMarginalMB with the measured post-load value.
+     * This implements Phase 3 improvement: RAM estimation using post-load chunk data.
+     *
+     * @param zoneId Zone ID (may be null for non-zone chunk loads)
+     * @param worldName World name
+     * @param cx Chunk X coordinate
+     * @param cz Chunk Z coordinate
+     * @param measuredRamMB Measured RAM in MB from post-load analysis
+     */
+    private void updatePortalEntryRamEstimate(String zoneId, String worldName, int cx, int cz, double measuredRamMB) {
+        if (zoneId == null) return; // No zone context, skip update
+        
+        // Try to find a matching PortalEntry for this zone
+        getStorage().loadAll().stream()
+            .filter(entry -> entry.getId().equals(zoneId))
+            .findFirst()
+            .ifPresent(entry -> {
+                // Update ramMarginalMB with measured value
+                // This replaces the pre-load estimate with actual post-load measurement
+                double oldMarginal = entry.getRamMarginalMB();
+                entry.setRamMarginalMB(measuredRamMB);
+  
+                LOG.fine(() -> "[OptiPortal] Updated ramMarginalMB for zone '" + zoneId
+                        + "': " + String.format("%.4f", oldMarginal) + " → "
+                        + String.format("%.4f", measuredRamMB) + " MB");
+  
+                // Persist the updated entry
+                getStorage().save(entry);
+            });
     }
     
     /**
@@ -294,13 +339,13 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
         list.sort((c1, c2) -> {
             int dist1 = Math.abs(c1[0] - cx) + Math.abs(c1[1] - cz);
             int dist2 = Math.abs(c2[0] - cx) + Math.abs(c2[1] - cz);
-            
+      
             if (corridorEnabled) {
                 // Apply -1 effective distance to corridor chunks (make them sort earlier)
                 if (corridorIndex.isCorridor(c1[0], c1[1])) dist1 = Math.max(0, dist1 - 1);
                 if (corridorIndex.isCorridor(c2[0], c2[1])) dist2 = Math.max(0, dist2 - 1);
             }
-            
+      
             return Integer.compare(dist1, dist2);
         });
         

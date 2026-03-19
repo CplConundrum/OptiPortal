@@ -1,6 +1,7 @@
 package com.optiportal.teleport;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -17,6 +18,7 @@ import com.optiportal.async.AsyncMetrics;
 import com.optiportal.async.WorldThreadBridge;
 import com.optiportal.config.PluginConfig;
 import com.optiportal.integrations.GravestoneIntegration;
+import com.optiportal.model.CacheTier;
 import com.optiportal.model.PortalEntry;
 import com.optiportal.player.DeathLocationTracker;
 import com.optiportal.player.RespawnTracker;
@@ -41,6 +43,9 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
     // Player position cache for staggered updates
     private final ConcurrentHashMap<UUID, PlayerPositionCache> positionCaches;
     
+    // In-memory portal cache - populated at startup, invalidated on mutations
+    private volatile List<PortalEntry> portalCache = Collections.emptyList();
+    
     // Staggered position update configuration
     private static final int POSITION_UPDATE_BATCH_SIZE = 10;
     private static final int POSITION_UPDATE_INTERVAL_MS = 200;
@@ -62,6 +67,9 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
         this.loadBalancer = loadBalancer;
         this.metrics = metrics;
         this.positionCaches = new ConcurrentHashMap<>();
+        
+        // Initialize portal cache from storage
+        updatePortalCache(storage.loadAll());
         
         // Start staggered position updates instead of polling all players
         startStaggeredPositionUpdates();
@@ -117,6 +125,38 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
     }
     
     /**
+     * Update the portal cache with a new list of entries.
+     * Thread-safe via volatile write.
+     * Public for access from OptiPortal.
+     */
+    public void updatePortalCache(List<PortalEntry> newCache) {
+        this.portalCache = Collections.unmodifiableList(new ArrayList<>(newCache));
+    }
+
+    /**
+     * Re-fetch all entries from storage and replace the cache.
+     * Call this after any external mutation (WarpFileWatcher sync, command edits, etc.).
+     */
+    public void refreshPortalCache() {
+        updatePortalCache(getStorage().loadAll());
+    }
+
+    /**
+     * Returns the in-memory portal cache instead of hitting storage on every check.
+     */
+    @Override
+    protected List<PortalEntry> getAllPortalEntries() {
+        return portalCache;
+    }
+
+    /**
+     * Get the current portal cache (thread-safe read).
+     */
+    private List<PortalEntry> getPortalCache() {
+        return portalCache;
+    }
+    
+    /**
      * Start staggered position updates to reduce world thread impact.
      */
     private void startStaggeredPositionUpdates() {
@@ -145,12 +185,12 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
         // Process batch with load balancer
         loadBalancer.scheduleLoad(() -> {
             List<CompletableFuture<Void>> futures = new ArrayList<>();
-            
+          
             for (UUID playerId : playerBatch) {
                 CompletableFuture<Void> future = updatePlayerPositionAsync(playerId);
                 futures.add(future);
             }
-            
+          
             return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
         }, AsyncMetrics.AsyncTaskPriority.NORMAL);
     }
@@ -168,7 +208,7 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
             if (processed >= POSITION_UPDATE_BATCH_SIZE) {
                 break;
             }
-            
+  
             PlayerPositionCache cache = positionCaches.get(playerId);
             if (cache == null || cache.shouldUpdate()) {
                 batch.add(playerId);
@@ -194,18 +234,20 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
         // Get world for this player
         World world = getChunkPreloader().getWorldRegistry().getWorldForPlayer(playerRef);
         if (world == null) {
+            // Fallback: world lookup failed — clean up any lingering ref
+            removePlayerRef(playerId);
             return CompletableFuture.completedFuture(null);
         }
         
         return worldBridge.getPlayerPositionAsync(world, playerRef)
-                .thenAccept(position -> {
+                .thenAcceptAsync(position -> {
                     if (position != null) {
                         updatePositionCache(playerId, position);
-                        checkProximityAndPreloadAsync(playerId, position);
+                        checkProximityAndPreloadAsync(playerId, world.getName(), position.x, position.y, position.z);
                     }
-                })
+                }, getExecutor())
                 .exceptionally(ex -> {
-                    LOG.warning("Position update error for player " + playerId + ": " + ex.getMessage());
+                    LOG.warning(() -> "Position update error for player " + playerId + ": " + ex.getMessage());
                     return null;
                 });
     }
@@ -224,17 +266,31 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
     
     /**
      * Check proximity and trigger preload asynchronously.
-     * 
-     * @param playerId Player ID
-     * @param position Player position
+     *
+     * @param playerId  Player ID
+     * @param worldName World name (matches PortalEntry.getWorld())
+     * @param x         Player X position
+     * @param z         Player Z position
      */
-    private void checkProximityAndPreloadAsync(UUID playerId, WorldThreadBridge.PlayerPosition position) {
-        // Use cached portal data to avoid storage access on every check
-        List<PortalEntry> nearbyPortals = getNearbyPortals(
-            position.worldUuid.toString(), position.x, position.z);
-        
+    @Override
+    public void removePlayerRef(UUID uuid) {
+        super.removePlayerRef(uuid);
+        positionCaches.remove(uuid);
+    }
+
+    private void checkProximityAndPreloadAsync(UUID playerId, String worldName, double x, double y, double z) {
+        List<PortalEntry> nearbyPortals = getNearbyPortals(worldName, x, y, z);
         for (PortalEntry portal : nearbyPortals) {
-            if (shouldPreloadPortal(playerId, portal, position)) {
+            CacheTier tier = getPlugin().getCacheManager().getZoneTier(portal.getId());
+            if (tier == CacheTier.HOT || tier == CacheTier.WARM) {
+                // Chunks are present — just ensure tier is HOT, no reload needed
+                if (tier != CacheTier.HOT) {
+                    getPlugin().getCacheManager().setZoneTier(portal.getId(), CacheTier.HOT);
+                }
+                continue;
+            }
+            // COLD or UNVISITED — chunks absent, trigger load
+            if (!isOnCooldown(playerId, portal.getId())) {
                 triggerAsyncPreload(portal, playerId);
             }
         }
@@ -248,45 +304,34 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
      * @param z Player Z position
      * @return List of nearby portals
      */
-    private List<PortalEntry> getNearbyPortals(String worldName, double x, double z) {
+    private List<PortalEntry> getNearbyPortals(String worldName, double x, double y, double z) {
         List<PortalEntry> nearby = new ArrayList<>();
-        double maxDist = getPluginConfig().getActivationDistance();
-        
-        for (PortalEntry entry : getStorage().loadAll()) {
+        double rH = getPluginConfig().getActivationDistance();
+        double rV = getPluginConfig().getActivationDistanceVertical();
+        String globalShape = getPluginConfig().getActivationShape();
+        List<PortalEntry> cache = getPortalCache();
+
+        for (PortalEntry entry : cache) {
             if (entry.isInstanced()) continue;
             if (!entry.getWorld().equals(worldName)) continue;
             if (entry.getId().contains(":")) continue;
-            
-            double dist = Math.sqrt(Math.pow(entry.getX() - x, 2) + Math.pow(entry.getZ() - z, 2));
-            if (dist <= maxDist) {
-                nearby.add(entry);
-            }
+
+            double dx = entry.getX() - x;
+            double dy = entry.getY() - y;
+            double dz = entry.getZ() - z;
+
+            String shape = entry.getActivationShape() != null ? entry.getActivationShape() : globalShape;
+
+            boolean inside = switch (shape.toUpperCase()) {
+                case "ELLIPSOID" -> (dx * dx) / (rH * rH) + (dy * dy) / (rV * rV) + (dz * dz) / (rH * rH) <= 1.0;
+                case "BOX"       -> Math.abs(dx) <= rH && Math.abs(dy) <= rV && Math.abs(dz) <= rH;
+                default          -> Math.abs(dy) <= rV && dx * dx + dz * dz <= rH * rH; // CYLINDER
+            };
+
+            if (inside) nearby.add(entry);
         }
-        
+
         return nearby;
-    }
-    
-    /**
-     * Check if a portal should be preloaded for a player.
-     * 
-     * @param playerId Player ID
-     * @param portal Portal entry
-     * @param position Player position
-     * @return True if portal should be preloaded
-     */
-    private boolean shouldPreloadPortal(UUID playerId, PortalEntry portal, 
-                                       WorldThreadBridge.PlayerPosition position) {
-        // Check cooldown
-        if (isOnCooldown(playerId, portal.getId())) {
-            return false;
-        }
-        
-        // Check distance
-        double dist = Math.sqrt(Math.pow(portal.getX() - position.x, 2) + 
-                               Math.pow(portal.getZ() - position.z, 2));
-        double maxDist = getPluginConfig().getActivationDistance();
-        
-        return dist <= maxDist;
     }
     
     /**
@@ -311,25 +356,28 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
             if (ex != null) {
                 LOG.warning("Async preload failed for " + portal.getId() + ": " + ex.getMessage());
             } else {
-                LOG.info("Async preload completed for " + portal.getId());
+                LOG.info(() -> "Async preload completed for " + portal.getId());
             }
         });
     }
     
     /**
      * Enhanced teleport record polling with better async handling.
+     * Batches all player checks into a single load-balancer task to reduce
+     * task queue overhead and lock contention.
      */
     protected void pollTeleportRecords() {
-        // Use world bridge for safer async access
-        for (java.util.Map.Entry<UUID, PlayerRef> entry : getPlayerRefs().entrySet()) {
-            UUID uuid = entry.getKey();
-            PlayerRef pRef = entry.getValue();
-            
-            // Schedule async teleport record check
-            loadBalancer.scheduleLoad(() -> {
-                return checkTeleportRecordAsync(uuid, pRef);
-            }, AsyncMetrics.AsyncTaskPriority.HIGH);
-        }
+        List<java.util.Map.Entry<UUID, PlayerRef>> entries =
+                new ArrayList<>(getPlayerRefs().entrySet());
+        if (entries.isEmpty()) return;
+
+        loadBalancer.scheduleLoad(() -> {
+            List<CompletableFuture<Void>> futures = new ArrayList<>(entries.size());
+            for (java.util.Map.Entry<UUID, PlayerRef> e : entries) {
+                futures.add(checkTeleportRecordAsync(e.getKey(), e.getValue()));
+            }
+            return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
+        }, AsyncMetrics.AsyncTaskPriority.HIGH);
     }
     
     /**
@@ -343,6 +391,8 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
         com.hypixel.hytale.server.core.universe.world.World world =
                 getChunkPreloader().getWorldRegistry().getWorldForPlayer(playerRef);
         if (world == null) {
+            getPlayerRefs().remove(playerId);
+            positionCaches.remove(playerId);
             return java.util.concurrent.CompletableFuture.completedFuture(null);
         }
         return worldBridge.getTeleportRecordAsync(world, playerRef)
@@ -370,7 +420,7 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
         
         if (prev == null || prev != ts) {
             getLastSeenTeleportNanos().put(playerId, ts);
-            
+  
             // Check age
             long ageNanos = System.nanoTime() - ts;
             if (ageNanos <= 3_000_000_000L) { // 3 seconds
@@ -398,8 +448,7 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
      */
     private void processTeleportAsync(UUID playerId, String worldName, double x, double y, double z) {
         loadBalancer.scheduleLoad(() -> {
-            checkProximityAndPreloadAsync(playerId, 
-                new WorldThreadBridge.PlayerPosition(null, x, y, z));
+            checkProximityAndPreloadAsync(playerId, worldName, x, y, z);
             return CompletableFuture.completedFuture(null);
         }, AsyncMetrics.AsyncTaskPriority.CRITICAL);
     }

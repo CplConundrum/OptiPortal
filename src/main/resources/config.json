@@ -50,10 +50,10 @@
   "_activation_info": "Controls when PreloadPlugin decides a player is 'approaching' a zone and should trigger a pre-load.",
   "activation": {
     "_distance_info": "Horizontal distance (in blocks/units) at which a nearby zone is considered 'approached' and pre-loading begins.",
-    "distance": 16,
+    "distance": 10,
 
     "_distanceVertical_info": "Vertical distance for the same check. Smaller than horizontal because players usually approach portals head-on.",
-    "distanceVertical": 8,
+    "distanceVertical": 3,
 
     "_shape_info": "Shape of the detection volume around the zone. ELLIPSOID = oval (smoother), CYLINDER = flat circle, BOX = rectangular.",
     "shape": "ELLIPSOID",
@@ -113,6 +113,9 @@
     "_ownershipAuditIntervalMinutes_info": "How often (in minutes) to audit chunk ownership for drift (chunks evicted by the engine without OptiPortal noticing). Default: 5.",
     "ownershipAuditIntervalMinutes": 5
   },
+
+  "_stagedLoadConcurrency_info": "Number of WARM zones loaded concurrently at startup. Higher = faster startup but more world-thread pressure. Default: 3.",
+  "stagedLoadConcurrency": 3,
 
   "_section_low_traffic": "=== LOW TRAFFIC ===",
   "_lowTrafficThreshold_info": "If a zone has fewer than this many active players, it's considered 'low traffic' and uses a shorter TTL (see ttl.lowTraffic).",

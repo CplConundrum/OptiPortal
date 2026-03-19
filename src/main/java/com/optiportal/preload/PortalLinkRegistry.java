@@ -8,6 +8,9 @@ import java.io.Writer;
 import java.lang.reflect.Type;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
 import com.google.gson.Gson;
@@ -31,7 +34,7 @@ import com.google.gson.reflect.TypeToken;
 public class PortalLinkRegistry {
 
     private static final Logger LOG = Logger.getLogger("OptiPortal");
-    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
 
     private final File linksFile;
 
@@ -42,9 +45,27 @@ public class PortalLinkRegistry {
      */
     private final Map<String, String> links = new HashMap<>();
 
-    public PortalLinkRegistry(File dataFolder) {
+    // Async debounced save fields
+    private final ScheduledExecutorService executor;
+    private volatile ScheduledFuture<?> pendingSave;
+    private static final long SAVE_DEBOUNCE_MS = 2_000;
+
+    /**
+     * Constructor with executor for async debounced saves.
+     * Saves are debounced for 2 seconds to batch multiple link changes.
+     */
+    public PortalLinkRegistry(File dataFolder, ScheduledExecutorService executor) {
         this.linksFile = new File(dataFolder, "portal-links.json");
+        this.executor = executor;
         load();
+    }
+
+    /**
+     * Constructor for tests / contexts without a scheduled executor.
+     * Saves synchronously.
+     */
+    public PortalLinkRegistry(File dataFolder) {
+        this(dataFolder, null);
     }
 
     /**
@@ -78,7 +99,7 @@ public class PortalLinkRegistry {
         links.put(destinationId, originId);
 
         LOG.info("[OptiPortal] PortalLinks: learned " + originId + " ↔ " + destinationId);
-        save();
+        scheduleSave();
     }
 
     /**
@@ -103,8 +124,38 @@ public class PortalLinkRegistry {
         if (linked != null) {
             links.remove(linked);
             LOG.info("[OptiPortal] PortalLinks: removed link for " + portalId);
-            save();
+            scheduleSave();
         }
+    }
+
+    // ------ Debounced Save
+    // -------------------------------------------------------------------------
+
+    /**
+     * Schedules a save operation with debouncing.
+     * Cancels any pending save and schedules a new one after the debounce interval.
+     */
+    private void scheduleSave() {
+        if (executor == null) {
+            save(); // fallback for no-executor constructor
+            return;
+        }
+        ScheduledFuture<?> existing = pendingSave;
+        if (existing != null) existing.cancel(false);
+        pendingSave = executor.schedule(this::save, SAVE_DEBOUNCE_MS, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Force an immediate save, cancelling any pending debounced write.
+     * Call from shutdown hook to ensure last recorded links are not lost.
+     */
+    public void flush() {
+        ScheduledFuture<?> existing = pendingSave;
+        if (existing != null) {
+            existing.cancel(false);
+            pendingSave = null;
+        }
+        save();
     }
 
     // -------------------------------------------------------------------------

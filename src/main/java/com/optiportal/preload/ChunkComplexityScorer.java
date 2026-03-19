@@ -2,6 +2,7 @@ package com.optiportal.preload;
 
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 
 import com.hypixel.hytale.server.core.universe.world.chunk.BlockChunk;
@@ -177,5 +178,99 @@ public final class ChunkComplexityScorer {
             LOG.fine("[OptiPortal] ChunkComplexityScorer.estimateRamMB error: " + e.getMessage());
             return baseKbPerChunk / 1024.0;
         }
+    }
+/**
+ * Optional result cache for ChunkComplexityScorer.score() and estimateRamMB().
+ * Keyed by worldName → packed chunk index (low32=cx, high32=cz).
+ * Thread-safe. Bounded per world via MAX_ENTRIES_PER_WORLD.
+ * Clear a world's entries with clearWorld(worldName) on RemoveWorldEvent.
+ */
+public static final class Cache {
+
+    private static final int MAX_ENTRIES_PER_WORLD = 5_000;
+
+    // outer key = world name, inner key = packChunkIndex(cx, cz)
+    private final ConcurrentHashMap<String, ConcurrentHashMap<Long, Float>> scores =
+            new ConcurrentHashMap<>();
+
+    // worldName → packed chunk index → [entityCount, tickingBlocks, sectionCount]
+    private final ConcurrentHashMap<String, ConcurrentHashMap<Long, long[]>> components =
+            new ConcurrentHashMap<>();
+
+    /** Return cached score, or compute-and-store via ChunkComplexityScorer.score(). */
+    public float getOrComputeScore(String worldName, int cx, int cz,
+                                   com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk chunk) {
+        ConcurrentHashMap<Long, Float> worldCache =
+                scores.computeIfAbsent(worldName, k -> new ConcurrentHashMap<>());
+        long key = packChunkIndex(cx, cz);
+        Float cached = worldCache.get(key);
+        if (cached != null) return cached;
+
+        float computed = ChunkComplexityScorer.score(chunk);
+        if (worldCache.size() < MAX_ENTRIES_PER_WORLD) {
+            worldCache.put(key, computed);
+        }
+        return computed;
+    }
+
+    /** Return cached RAM estimate, or compute-and-store via estimateRamMB(). */
+    public double getOrComputeRam(String worldName, int cx, int cz,
+                                  com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk chunk, double baseKbPerChunk) {
+        ConcurrentHashMap<Long, long[]> worldComponents =
+                components.computeIfAbsent(worldName, k -> new ConcurrentHashMap<>());
+        long key = packChunkIndex(cx, cz);
+        long[] cached = worldComponents.get(key);
+
+        long entityCount, tickingBlocks, sectionCount;
+        if (cached != null) {
+            // Use cached raw values — zero Hytale API calls
+            entityCount   = cached[0];
+            tickingBlocks = cached[1];
+            sectionCount  = cached[2];
+        } else {
+            // First time this chunk is seen — read from chunk and cache components
+            entityCount   = 0;
+            tickingBlocks = 0;
+            sectionCount  = 0;
+            if (chunk != null) {
+                try {
+                    var bc = chunk.getBlockChunk();
+                    var ec = chunk.getEntityChunk();
+                    if (ec != null) try { entityCount   = ec.getEntityHolders().size();  } catch (Exception ignored) {}
+                    if (bc != null) try { tickingBlocks = bc.getTickingBlocksCount();     } catch (Exception ignored) {}
+                    if (bc != null) try { sectionCount  = bc.getSectionCount();           } catch (Exception ignored) {}
+                } catch (Exception ignored) {}
+            }
+            if (worldComponents.size() < MAX_ENTRIES_PER_WORLD) {
+                worldComponents.put(key, new long[]{ entityCount, tickingBlocks, sectionCount });
+            }
+        }
+
+        double estimatedKb = baseKbPerChunk
+                + entityCount   * 2.0
+                + tickingBlocks * 0.5
+                + sectionCount  * 8.0;
+        return estimatedKb / 1024.0;
+    }
+
+    /** Remove all cached scores for a world. Call on RemoveWorldEvent. */
+    public void clearWorld(String worldName) {
+        scores.remove(worldName);
+        components.remove(worldName);
+    }
+
+    /** Remove all cached scores. */
+    public void clearAll() {
+        scores.clear();
+        components.clear();
+    }
+
+    public boolean isEmpty() {
+        return scores.isEmpty() && components.isEmpty();
+    }
+
+    private static long packChunkIndex(int cx, int cz) {
+        return ((long)(cx & 0xFFFFFFFF)) | ((long)(cz & 0xFFFFFFFF) << 32);
+    }
     }
 }

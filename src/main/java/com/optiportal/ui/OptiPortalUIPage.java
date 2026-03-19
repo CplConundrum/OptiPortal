@@ -56,6 +56,7 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.D
 
         int hot = 0, warm = 0, cold = 0, unvisited = 0;
         double totalRam = 0;
+        double totalActualRam = 0;
 
         // Set column headers
         cmd.set("#HdrTier.Text",   "TIER");
@@ -63,8 +64,8 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.D
         cmd.set("#HdrType.Text",   "TYPE");
         cmd.set("#HdrStrat.Text",  "STRAT");
         cmd.set("#HdrRadius.Text", "RADIUS");
-        cmd.set("#HdrRam.Text",    "RAM");
-        cmd.set("#HdrRamMarginal.Text", "RAM+");
+        cmd.set("#HdrRam.Text",    "EST RAM");
+        cmd.set("#HdrRamMarginal.Text", "ACTUAL RAM");
         cmd.set("#HdrPreload.Text", "PRELOAD");
         cmd.set("#HdrTTL.Text",    "TTL");
         cmd.set("#HdrStatus.Text", "STATUS");
@@ -95,6 +96,7 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.D
                 default        -> {}
             }
             totalRam += z.getRamEstimatedMB();
+            totalActualRam += z.getRamMarginalMB();
 
             String tierLabel = switch (tier) {
                 case HOT        -> "[HOT]";
@@ -165,15 +167,15 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.D
         cmd.set("#ColStatus.Text", colStatus.toString().trim());
 
         cmd.set("#CommandRef1.Text",
-                "/preload list   /preload strategy <id> <WARM|PRED>   /preload radius <id> <n>   " +
-                "/preload radiusxz <id> <rx> <rz>   /preload setwarm <id> [r]   /preload unsetwarm <id>");
+                "/preload list   /preload strategy <id> <WARM|PRED>   /preload shape <id> <ELLIPSOID|CYLINDER|BOX>   " +
+                "/preload radius <id> <n>   /preload radiusxz <id> <rx> <rz>   /preload setwarm <id> [r]   /preload unsetwarm <id>");
         cmd.set("#CommandRef2.Text",
                 "/preload ram   /preload refresh warps   /preload reload   " +
                 "/preload migrate <backend>   /preload backup <list|restore <date>>   /preload help");
 
         cmd.set("#WarpStats.Text", String.format(
-                "HOT %d   WARM %d   COLD %d   Unvisited %d   |   RAM Est %.1f MB   Shared %d chunks",
-                hot, warm, cold, unvisited, totalRam, cache.getTotalSharedChunks()));
+                "HOT %d   WARM %d   COLD %d   Unvisited %d   |   RAM Est %.1f MB   Actual %.1f MB   Shared %d chunks",
+                hot, warm, cold, unvisited, totalRam, totalActualRam, cache.getTotalSharedChunks()));
         cmd.set("#StorageBackend.Text", "Storage: " + cfg.getBackend().toUpperCase());
     }
 

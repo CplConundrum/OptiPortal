@@ -1,15 +1,30 @@
 package com.optiportal.storage;
 
-import com.google.gson.*;
-import com.optiportal.config.PluginConfig;
-import com.optiportal.model.CacheTier;
-import com.optiportal.model.PortalEntry;
-import com.optiportal.model.WarmStrategy;
-
-import java.io.*;
-import java.nio.file.*;
+import java.io.File;
+import java.io.FileReader;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.Reader;
+import java.io.Writer;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.time.Instant;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonDeserializer;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonPrimitive;
+import com.google.gson.JsonSerializer;
+import com.optiportal.config.PluginConfig;
+import com.optiportal.model.PortalEntry;
 
 /**
  * JSON file storage backend.
@@ -24,6 +39,7 @@ public class JsonStorageBackend implements StorageBackend {
                     new JsonPrimitive(src.toString()))
             .registerTypeAdapter(Instant.class, (JsonDeserializer<Instant>) (json, type, ctx) ->
                     Instant.parse(json.getAsString()))
+            .disableHtmlEscaping()
             .create();
 
     private final PluginConfig config;
@@ -33,6 +49,23 @@ public class JsonStorageBackend implements StorageBackend {
 
     // In-memory map for fast access
     private final Map<String, PortalEntry> entries = new LinkedHashMap<>();
+
+    // Optional cache updater for async invalidation
+    private CacheUpdater cacheUpdater;
+
+    /**
+     * Interface for cache update notifications.
+     */
+    public interface CacheUpdater {
+        void onUpdate(List<PortalEntry> currentEntries);
+    }
+
+    /**
+     * Set the cache updater for invalidation notifications.
+     */
+    public void setCacheUpdater(CacheUpdater cacheUpdater) {
+        this.cacheUpdater = cacheUpdater;
+    }
 
     public JsonStorageBackend(PluginConfig config) {
         this.config = config;
@@ -97,6 +130,10 @@ public class JsonStorageBackend implements StorageBackend {
     public void save(PortalEntry entry) {
         entries.put(entry.getId(), entry);
         flush();
+        // Notify cache updater
+        if (cacheUpdater != null) {
+            cacheUpdater.onUpdate(new ArrayList<>(entries.values()));
+        }
     }
 
     @Override
@@ -105,12 +142,22 @@ public class JsonStorageBackend implements StorageBackend {
             entries.put(e.getId(), e);
         }
         flush();
+        // Notify cache updater
+        if (cacheUpdater != null) {
+            cacheUpdater.onUpdate(new ArrayList<>(entries.values()));
+        }
     }
 
     @Override
     public void delete(String id) {
-        entries.remove(id);
-        flush();
+        PortalEntry removed = entries.remove(id);
+        if (removed != null) {
+            flush();
+            // Notify cache updater
+            if (cacheUpdater != null) {
+                cacheUpdater.onUpdate(new ArrayList<>(entries.values()));
+            }
+        }
     }
 
     @Override
