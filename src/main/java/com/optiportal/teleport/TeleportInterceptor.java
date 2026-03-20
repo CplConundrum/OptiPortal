@@ -12,14 +12,19 @@ import java.util.logging.Logger;
 import com.hypixel.hytale.builtin.adventure.teleporter.interaction.server.UsedTeleporter;
 import com.hypixel.hytale.event.EventRegistry;
 import com.hypixel.hytale.math.vector.Location;
+import com.hypixel.hytale.math.vector.Transform;
+import com.hypixel.hytale.server.core.entity.UUIDComponent;
 import com.hypixel.hytale.server.core.entity.entities.Player;
 import com.hypixel.hytale.server.core.event.events.ecs.DiscoverZoneEvent;
 import com.hypixel.hytale.server.core.event.events.player.AddPlayerToWorldEvent;
+import com.hypixel.hytale.server.core.event.events.player.DrainPlayerFromWorldEvent;
+import com.hypixel.hytale.server.core.event.events.player.PlayerConnectEvent;
 import com.hypixel.hytale.server.core.event.events.player.PlayerDisconnectEvent;
 import com.hypixel.hytale.server.core.event.events.player.PlayerReadyEvent;
 import com.hypixel.hytale.server.core.modules.entity.teleport.TeleportRecord;
 import com.hypixel.hytale.server.core.universe.PlayerRef;
 import com.hypixel.hytale.server.core.universe.world.World;
+import com.hypixel.hytale.server.core.universe.world.spawn.ISpawnProvider;
 import com.optiportal.OptiPortal;
 import com.optiportal.config.PluginConfig;
 import com.optiportal.integrations.GravestoneIntegration;
@@ -170,6 +175,18 @@ public class TeleportInterceptor {
         // PlayerDisconnectEvent — IEvent<Void> → registerGlobal
         events.<Void, PlayerDisconnectEvent>registerGlobal(
                 PlayerDisconnectEvent.class, this::onPlayerDisconnect);
+
+        // DrainPlayerFromWorldEvent — fires on the world thread when a player leaves
+        // any world (portal travel, world switch, etc.). Gives us the exact departure
+        // position for origin zone linger and portal link learning — zero polling delay.
+        events.<String, DrainPlayerFromWorldEvent>registerGlobal(
+                DrainPlayerFromWorldEvent.class, this::onDrainPlayerFromWorld);
+
+        // PlayerConnectEvent — fires before the player is placed in a world.
+        // IEvent<Void> → must use register(), not registerGlobal().
+        // We use this to pre-warm the spawn chunk area before the player arrives,
+        // eliminating cold-load spikes on first login and after world transitions.
+        events.register(PlayerConnectEvent.class, this::onPlayerConnect);
     }
 
     // -------------------------------------------------------------------------
@@ -182,12 +199,11 @@ public class TeleportInterceptor {
      */
     private void onDiscoverZone(DiscoverZoneEvent.Display event) {
         String zoneName = event.getDiscoveryInfo().regionName();
-        // Always log raw name so we can see what Hytale sends
-        System.out.println("[OptiPortal] DiscoverZoneEvent raw='" + zoneName + "'");
+        LOG.fine(() -> "[OptiPortal] DiscoverZoneEvent raw='" + zoneName + "'");
         if (zoneName == null || zoneName.isBlank()) return;
 
         String normalizedZone = normalizeZoneName(zoneName);
-        System.out.println("[OptiPortal] DiscoverZoneEvent normalized='" + normalizedZone + "'");
+        LOG.fine(() -> "[OptiPortal] DiscoverZoneEvent normalized='" + normalizedZone + "'");
 
         boolean matched = false;
 
@@ -195,7 +211,7 @@ public class TeleportInterceptor {
         var entry1 = storage.loadById(normalizedZone);
         if (entry1.isPresent()) {
             var entry = entry1.get();
-            System.out.println("[OptiPortal] DiscoverZoneEvent matched storage id='" + normalizedZone
+            LOG.fine(() -> "[OptiPortal] DiscoverZoneEvent matched storage id='" + normalizedZone
                 + "' strategy=" + entry.getStrategy());
             if (!entry.isInstanced() && entry.getStrategy() == WarmStrategy.PREDICTIVE) {
                 if (!isOnCooldown(null, normalizedZone)) {
@@ -203,7 +219,7 @@ public class TeleportInterceptor {
                     int cx = ChunkPreloader.toChunkCoord(entry.getX());
                     int cz = ChunkPreloader.toChunkCoord(entry.getZ());
                     int radius = resolveRadius(entry);
-                    System.out.println("[OptiPortal] Zone discovery trigger: " + normalizedZone
+                    LOG.fine(() -> "[OptiPortal] Zone discovery trigger: " + normalizedZone
                             + " → predictive load cx=" + cx + " cz=" + cz + " r=" + radius);
                     triggerPredictiveLoad(normalizedZone, entry.getWorld(), cx, cz, radius, null);
                     matched = true;
@@ -216,14 +232,14 @@ public class TeleportInterceptor {
             var entry2 = storage.loadById(zoneName);
             if (entry2.isPresent()) {
                 var entry = entry2.get();
-                System.out.println("[OptiPortal] DiscoverZoneEvent matched storage id='" + zoneName
+                LOG.fine(() -> "[OptiPortal] DiscoverZoneEvent matched storage id='" + zoneName
                     + "' strategy=" + entry.getStrategy());
                 if (!entry.isInstanced() && entry.getStrategy() == WarmStrategy.PREDICTIVE) {
                     if (!isOnCooldown(null, zoneName)) {
                         recordCooldown(null, zoneName);
                         int cx = ChunkPreloader.toChunkCoord(entry.getX());
                         int cz = ChunkPreloader.toChunkCoord(entry.getZ());
-                        System.out.println("[OptiPortal] Zone discovery trigger (raw): " + zoneName
+                        LOG.fine(() -> "[OptiPortal] Zone discovery trigger (raw): " + zoneName
                                 + " → predictive load cx=" + cx + " cz=" + cz);
                         triggerPredictiveLoad(zoneName, entry.getWorld(), cx, cz, resolveRadius(entry), null);
                         matched = true;
@@ -233,21 +249,16 @@ public class TeleportInterceptor {
         }
 
         if (!matched) {
-            System.out.println("[OptiPortal] DiscoverZoneEvent no match for raw='" + zoneName
+            LOG.fine(() -> "[OptiPortal] DiscoverZoneEvent no match for raw='" + zoneName
                 + "' normalized='" + normalizedZone + "' — check portal IDs in storage");
         }
     }
 
     /**
-     * Player arrived in a world. If any WARM zones exist for this world
-     * that aren't already loaded, trigger warm load for them.
-     * Also fires on world-switch teleports.
-     */
-        /**
      * Polls TeleportRecord for all online players every second.
      * Detects walk-through portal teleports that fire no player-facing event.
      */
-    private void pollTeleportRecords() {
+    protected void pollTeleportRecords() {
         // getComponent must be called on the world tick thread.
         // Submit the read to the world via World.execute(Runnable).
         for (java.util.Map.Entry<UUID, PlayerRef> entry : playerRefs.entrySet()) {
@@ -288,7 +299,7 @@ public class TeleportInterceptor {
                                                 // Snapshot pre-teleport position for origin portal lookup
                                                 final double[] prePos = lastKnownPosition.get(fUuid);
                                                 executor.execute(() -> {
-                                                    System.out.println("[OptiPortal] Poll teleport → "
+                                                    LOG.fine(() -> "[OptiPortal] Poll teleport → "
                                                         + dx + "," + dy + "," + dz + " world=" + dw);
                                                     lingerOriginZone(fUuid);
                                                     checkProximityAndPreload(fUuid, dw, dx, dy, dz);
@@ -320,7 +331,7 @@ public class TeleportInterceptor {
                             executor.execute(() -> checkProximityAndPreload(fUuid2, curWorld, cx, cy, cz));
                         }
                     } catch (Exception e) {
-                        System.out.println("[OptiPortal] poll error: " + e);
+                        LOG.warning("[OptiPortal] poll error: " + e);
                     }
                 });
             } catch (Exception e) {
@@ -355,14 +366,14 @@ public class TeleportInterceptor {
                 com.hypixel.hytale.math.vector.Vector3d dest = usedTeleporter.getDestinationPosition();
                 // Only check proximity if destination position is valid
                 if (dest != null && !Double.isNaN(dest.x) && !Double.isNaN(dest.y) && !Double.isNaN(dest.z)) {
-                    System.out.println("[OptiPortal] UsedTeleporter detected: dest="
+                    LOG.fine(() -> "[OptiPortal] UsedTeleporter detected: dest="
                         + dest.x + "," + dest.y + "," + dest.z + " world=" + worldName);
                     checkProximityAndPreload(null, worldName, dest.x, dest.y, dest.z);
                 } else {
-                    System.out.println("[OptiPortal] AddPlayerToWorld: UsedTeleporter has invalid destination position");
+                    LOG.fine("[OptiPortal] AddPlayerToWorld: UsedTeleporter has invalid destination position");
                 }
             } else {
-                System.out.println("[OptiPortal] AddPlayerToWorld: no UsedTeleporter (login or non-teleporter move)");
+                LOG.fine("[OptiPortal] AddPlayerToWorld: no UsedTeleporter (login or non-teleporter move)");
             }
         }
     }
@@ -372,19 +383,21 @@ public class TeleportInterceptor {
      */
     private void checkProximityAndPreload(UUID playerUuid, String worldName, double px, double py, double pz) {
         double maxDist = config.getActivationDistance();
-        final double VERTICAL_BOUND = 4.0;
 
         for (com.optiportal.model.PortalEntry entry : getAllPortalEntries()) {
             if (entry.isInstanced()) continue;
             if (!entry.getWorld().equals(worldName)) continue;
             if (entry.getId().contains(":")) continue; // skip death:, respawn:, etc.
 
-            // Vertical hard bound
+            // Vertical bound with per-zone override support
+            double vertBound = (entry.getActivationDistanceVertical() != null)
+                    ? entry.getActivationDistanceVertical()
+                    : config.getActivationDistanceVertical();
             double dy = Math.abs(py - entry.getY());
             double toX = entry.getX() - px;
             double toZ = entry.getZ() - pz;
             double horizDist = Math.sqrt(toX * toX + toZ * toZ);
-            if (dy > VERTICAL_BOUND) continue;
+            if (dy > vertBound) continue;
             if (horizDist > maxDist) continue;
 
             String id = entry.getId();
@@ -476,8 +489,10 @@ public class TeleportInterceptor {
         int cx = ChunkPreloader.toChunkCoord(destEntry.getX());
         int cz = ChunkPreloader.toChunkCoord(destEntry.getZ());
         int radius = resolveRadius(destEntry);
-        System.out.println("[OptiPortal] Reverse preload destination: " + destEntry.getId()
-            + " dist=" + String.format("%.1f", bestDist) + " cx=" + cx + " cz=" + cz);
+        final PortalEntry logEntry = destEntry;
+        final double logDist = bestDist;
+        LOG.fine(() -> "[OptiPortal] Reverse preload destination: " + logEntry.getId()
+            + " dist=" + String.format("%.1f", logDist) + " cx=" + cx + " cz=" + cz);
         predictiveLoadWithRam(destEntry.getId(), destEntry.getWorld(), cx, cz, radius);
     }
 
@@ -501,7 +516,7 @@ public class TeleportInterceptor {
         return best;
     }
 
-    private void lingerOriginZone(UUID playerUuid) {
+    protected void lingerOriginZone(UUID playerUuid) {
         double[] prePos = lastKnownPosition.get(playerUuid);
         if (prePos == null) return;
         // Find nearest portal to pre-teleport position across all worlds
@@ -517,8 +532,9 @@ public class TeleportInterceptor {
             }
         }
         if (prevZoneId == null || bestDist > config.getActivationDistance()) return;
-        plugin.getCacheManager().setZoneTier(prevZoneId, com.optiportal.model.CacheTier.HOT);
-        System.out.println("[OptiPortal] Linger HOT: " + prevZoneId + " (30s decay will clean up)");
+        final String lingerZoneId = prevZoneId;
+        plugin.getCacheManager().setZoneTier(lingerZoneId, com.optiportal.model.CacheTier.HOT);
+        LOG.fine(() -> "[OptiPortal] Linger HOT: " + lingerZoneId + " (30s decay will clean up)");
     }
 
     /**
@@ -558,7 +574,7 @@ public class TeleportInterceptor {
                     } else {
                         pendingRespawnCapture.add(uuid);
                     }
-                    System.out.println("[OptiPortal] Respawn detected (no gravestones) for " + uuid);
+                    LOG.fine(() -> "[OptiPortal] Respawn detected (no gravestones) for " + uuid);
                 }
             }
         }
@@ -595,7 +611,6 @@ public class TeleportInterceptor {
 
         // Read TeleportRecord from the cached PlayerRef to detect same-world portal teleports.
         // PlayerRef.getComponent() is a direct convenience method — no Holder traversal needed.
-        @SuppressWarnings("deprecation")
         PlayerRef cachedRef = playerRefs.get(ref != null ? ref.getUuid() : null);
         if (cachedRef != null) {
             TeleportRecord record = cachedRef.getComponent(TeleportRecord.getComponentType());
@@ -610,7 +625,7 @@ public class TeleportInterceptor {
                             String destWorld = dest.getWorld() != null ? dest.getWorld() : worldName;
                             com.hypixel.hytale.math.vector.Vector3d pos = dest.getPosition();
                             if (pos != null) {
-                                System.out.println("[OptiPortal] TeleportRecord dest: "
+                                LOG.fine(() -> "[OptiPortal] TeleportRecord dest: "
                                     + pos.x + "," + pos.y + "," + pos.z + " world=" + destWorld);
                                 checkProximityAndPreload(null, destWorld, pos.x, pos.y, pos.z);
                             }
@@ -622,11 +637,92 @@ public class TeleportInterceptor {
     }
 
     /**
-     * Look up a cached PlayerRef by UUID (populated on PlayerReadyEvent).
-     * Returns null if the player is not online or not yet ready.
+     * Player is leaving a world (portal travel or world switch).
+     * Fires on the world thread with the player's exact departure Transform.
+     *
+     * We use this to:
+     *   1. Capture the player's last known position before the world change.
+     *   2. Linger the origin zone HOT immediately (no 1-second poll delay).
+     *
+     * onPlayerDisconnect handles actual disconnects separately; this only fires
+     * for world-to-world transitions where the player stays on the server.
      */
-    public PlayerRef getPlayerRef(UUID uuid) {
-        return playerRefs.get(uuid);
+    private void onDrainPlayerFromWorld(DrainPlayerFromWorldEvent event) {
+        World world = event.getWorld();
+        Transform transform = event.getTransform();
+        if (world == null || transform == null) return;
+
+        com.hypixel.hytale.math.vector.Vector3d pos = transform.getPosition();
+        if (pos == null) return;
+
+        // Resolve player UUID from the departing entity's UUIDComponent.
+        // This runs on the world thread — component access is safe here.
+        UUIDComponent uuidComp = event.getHolder()
+                .getComponent(UUIDComponent.getComponentType());
+        UUID playerUuid = (uuidComp != null) ? uuidComp.getUuid() : null;
+
+        final double px = pos.x, py = pos.y, pz = pos.z;
+        final UUID fUuid = playerUuid;
+
+        // Offload to executor — linger/link ops are not world-thread-safe.
+        executor.execute(() -> {
+            if (fUuid == null) return; // no UUID = non-player entity, skip
+
+            // 1. Stamp the pre-portal position so the NEXT teleport poll can
+            //    use it for portal-link learning (replaces the stale poll value).
+            lastKnownPosition.put(fUuid, new double[]{px, py, pz});
+
+            // 2. Immediately linger the origin zone HOT.
+            //    lingerOriginZone() reads lastKnownPosition which we just set.
+            lingerOriginZone(fUuid);
+        });
+    }
+
+    /**
+     * Player is connecting to the server for the first time this session.
+     * Fires before the player is assigned to a world — the ideal moment to
+     * pre-warm their spawn-point chunks without blocking the world thread.
+     *
+     * IEvent<Void>: fires on the main/universe thread (not a world thread).
+     * Component access is NOT safe here — use only PlayerRef and World methods.
+     *
+     * We pre-load the spawn chunk area as a PREDICTIVE load so the world
+     * thread does not cold-load those chunks when the player arrives.
+     */
+    private void onPlayerConnect(PlayerConnectEvent event) {
+        World world = event.getWorld();
+        if (world == null) return;
+
+        com.hypixel.hytale.server.core.universe.PlayerRef playerRef = event.getPlayerRef();
+        UUID playerUuid = (playerRef != null) ? playerRef.getUuid() : null;
+
+        // Resolve spawn point via ISpawnProvider
+        ISpawnProvider spawnProvider = world.getWorldConfig().getSpawnProvider();
+        if (spawnProvider == null) return;
+
+        Transform spawnTransform;
+        try {
+            spawnTransform = spawnProvider.getSpawnPoint(world, playerUuid);
+        } catch (Exception e) {
+            // getSpawnPoint may throw if playerUuid is null or spawn not configured
+            return;
+        }
+        if (spawnTransform == null || spawnTransform.getPosition() == null) return;
+
+        com.hypixel.hytale.math.vector.Vector3d pos = spawnTransform.getPosition();
+        final String worldName = world.getName();
+        final double spawnX = pos.x;
+        final double spawnZ = pos.z;
+
+        // Fire predictive load on executor — never block the connect event handler
+        executor.execute(() -> {
+            int cx = com.optiportal.preload.ChunkPreloader.toChunkCoord(spawnX);
+            int cz = com.optiportal.preload.ChunkPreloader.toChunkCoord(spawnZ);
+            String zoneId = "spawn:" + worldName + ":" + cx + ":" + cz;
+            chunkPreloader.predictiveLoad(zoneId, worldName, cx, cz, config.getPredictiveRadius());
+            LOG.fine("[OptiPortal] onPlayerConnect: pre-warming spawn at "
+                    + worldName + " chunk (" + cx + ", " + cz + ")");
+        });
     }
 
     private void onPlayerDisconnect(PlayerDisconnectEvent event) {
@@ -640,6 +736,21 @@ public class TeleportInterceptor {
      * Remove a player's cached ref on disconnect.
      */
     /**
+     * Look up a cached PlayerRef by UUID (populated on PlayerReadyEvent).
+     * Returns null if the player is not online or not yet ready.
+     */
+    public com.hypixel.hytale.server.core.universe.PlayerRef getPlayerRef(UUID uuid) {
+        return playerRefs.get(uuid);
+    }
+
+    public void removePlayerRef(UUID uuid) {
+        playerRefs.remove(uuid);
+        cooldowns.remove(uuid);
+        lastKnownPosition.remove(uuid);
+        lastSeenTeleportNanos.remove(uuid);
+    }
+
+    /**
      * Returns true if the zone has been loaded (tier is not UNVISITED).
      * True positional HOT detection requires TransformComponent API access;
      * for now we simply report whether the zone is loaded (WARM) vs not (UNVISITED).
@@ -648,11 +759,6 @@ public class TeleportInterceptor {
     public boolean isPlayerNearChunk(String worldName, int cx, int cz, int chunkRadius) {
         // HOT = at least one known player is online (we cache refs from PlayerReadyEvent)
         return !playerRefs.isEmpty();
-    }
-
-    public void removePlayerRef(UUID uuid) {
-        playerRefs.remove(uuid);
-        cooldowns.remove(uuid);
     }
 
     // -------------------------------------------------------------------------
@@ -674,7 +780,6 @@ public class TeleportInterceptor {
     }
 
     private boolean isOnCooldown(UUID playerId, String zoneId) {
-        String key = (playerId != null ? playerId.toString() : "global") + ":" + zoneId;
         Long last = cooldowns
                 .computeIfAbsent(playerId != null ? playerId : new UUID(0, 0), k -> new ConcurrentHashMap<>())
                 .get(zoneId);

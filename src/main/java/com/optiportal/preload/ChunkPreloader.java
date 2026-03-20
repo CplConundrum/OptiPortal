@@ -9,8 +9,10 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.logging.Logger;
 
+import com.hypixel.hytale.math.util.ChunkUtil;
 import com.hypixel.hytale.server.core.universe.world.World;
 import com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk;
+import com.hypixel.hytale.server.core.universe.world.storage.ChunkStore;
 import com.optiportal.cache.CacheManager;
 import com.optiportal.config.PluginConfig;
 import com.optiportal.metrics.MetricsCollector;
@@ -144,24 +146,26 @@ public class ChunkPreloader {
             }
         }
         int skipped = allChunks.size() - toLoad.size();
-        if (skipped > 0 && toLoad.size() > 0) LOG.info("[OptiPortal] predictiveLoad " + zoneId + ": skipped " + skipped + " already-owned chunks");
+        if (skipped > 0 && toLoad.size() > 0) LOG.info(() -> "[OptiPortal] predictiveLoad " + zoneId + ": skipped " + skipped + " already-owned chunks");
 
         CompletableFuture<Void> future = toLoad.isEmpty()
                 ? CompletableFuture.completedFuture(null)
-                : loadChunks(world, toLoad, false);
+                : loadChunks(world, toLoad, false, zoneId);
 
         if (zoneId != null) {
             final String zid = zoneId;
             final int loadedCount = toLoad.size();
             final long startTime = System.nanoTime();
             future.thenRun(() -> {
-                // Register ownership for newly loaded chunks
-                for (int[] coord : toLoad) {
-                    cacheManager.registerOwnership(zid, worldName, coord[0], coord[1]);
+                // Register ownership for dedup path only (chunks already loaded by another zone)
+                for (int[] coord : allChunks) {
+                    if (!toLoad.contains(coord)) {
+                        cacheManager.registerOwnership(zid, worldName, coord[0], coord[1]);
+                    }
                 }
                 cacheManager.setZoneTier(zid, com.optiportal.model.CacheTier.HOT);
                 if (loadedCount > 0) {
-                    LOG.info("[OptiPortal] predictiveLoad complete: " + zid + " → HOT (loaded=" + loadedCount + " shared=" + skipped + ")");
+                    LOG.info(() -> "[OptiPortal] predictiveLoad complete: " + zid + " → HOT (loaded=" + loadedCount + " shared=" + skipped + ")");
                 }
                 // Update entry stats
                 Optional<PortalEntry> entryOpt = storage.loadById(zid);
@@ -204,11 +208,27 @@ public class ChunkPreloader {
      * WARM load with zone ID for ownership registration and dedup.
      */
     public CompletableFuture<Void> warmLoad(String zoneId, String worldName, int cx, int cz, int radius) {
+        return warmLoad(zoneId, worldName, cx, cz, radius, radius);
+    }
+
+    /**
+     * WARM load with asymmetric X/Z radii for ownership registration and dedup.
+     * This overload supports rectangular zones for corridors and bridges.
+     *
+     * @param zoneId Zone ID for ownership tracking
+     * @param worldName Hytale world name
+     * @param cx Centre chunk X
+     * @param cz Centre chunk Z
+     * @param radiusX X-axis radius (chunk radius in X direction)
+     * @param radiusZ Z-axis radius (chunk radius in Z direction)
+     * @return CompletableFuture that completes when all chunks are loaded
+     */
+    public CompletableFuture<Void> warmLoad(String zoneId, String worldName, int cx, int cz, int radiusX, int radiusZ) {
         World world = worldRegistry.getWorld(worldName);
         if (world == null) return CompletableFuture.completedFuture(null);
 
         // Dedup: claim already-owned chunks, only load new ones
-        List<int[]> allChunks = buildChunkList(cx, cz, radius);
+        List<int[]> allChunks = buildChunkListAsymmetric(cx, cz, radiusX, radiusZ);
         List<int[]> toLoad = new ArrayList<>();
         for (int[] coord : allChunks) {
             if (cacheManager.isChunkOwned(worldName, coord[0], coord[1])) {
@@ -218,21 +238,24 @@ public class ChunkPreloader {
             }
         }
         int skipped = allChunks.size() - toLoad.size();
-        if (skipped > 0) LOG.info("[OptiPortal] warmLoad " + zoneId + ": skipped " + skipped + " already-owned chunks");
+        if (skipped > 0) LOG.info(() -> "[OptiPortal] warmLoad " + zoneId + ": skipped " + skipped + " already-owned chunks");
 
         CompletableFuture<Void> future = toLoad.isEmpty()
                 ? CompletableFuture.completedFuture(null)
-                : loadChunks(world, toLoad, true);
+                : loadChunks(world, toLoad, true, zoneId);
 
         if (zoneId != null) {
             final String zid = zoneId;
             final int loadedCount = toLoad.size();
             final long startTime = System.nanoTime();
             future.thenRun(() -> {
-                for (int[] coord : toLoad) {
-                    cacheManager.registerOwnership(zid, worldName, coord[0], coord[1]);
+                // Register ownership for dedup path only (chunks already loaded by another zone)
+                for (int[] coord : allChunks) {
+                    if (!toLoad.contains(coord)) {
+                        cacheManager.registerOwnership(zid, worldName, coord[0], coord[1]);
+                    }
                 }
-                LOG.info("[OptiPortal] warmLoad complete: " + zid + " (loaded=" + loadedCount + " shared=" + skipped + ")");
+                LOG.info(() -> "[OptiPortal] warmLoad complete: " + zid + " (loaded=" + loadedCount + " shared=" + skipped + ")");
                 // Update entry stats
                 Optional<PortalEntry> entryOpt = storage.loadById(zid);
                 entryOpt.ifPresent(entry -> updateEntryStats(entry, loadedCount));
@@ -299,7 +322,7 @@ public class ChunkPreloader {
             return CompletableFuture.completedFuture(null);
         }
 
-        return loadChunks(world, toLoad, false);
+        return loadChunks(world, toLoad, false, null);
     }
 
     /**
@@ -326,7 +349,7 @@ public class ChunkPreloader {
             if (dist1 != dist2) {
                 return Integer.compare(dist1, dist2);
             }
-  
+
             // Secondary sort: for chunks at same distance, prioritize based on some heuristic
             // In a real implementation, this would use HytaleServer's density functions
             return 0; // Placeholder - in reality this would be more complex
@@ -343,7 +366,7 @@ public class ChunkPreloader {
     public WorldRegistry getWorldRegistry() { return worldRegistry; }
 
     public static int toChunkCoord(double worldCoord) {
-        return (int) Math.floor(worldCoord / 16.0);
+        return ChunkUtil.chunkCoordinate(worldCoord);
     }
 
     // -------------------------------------------------------------------------
@@ -363,9 +386,65 @@ public class ChunkPreloader {
         return list;
     }
 
+    /** Build the full flat list of chunk coords within asymmetric X/Z radii. */
+    private List<int[]> buildChunkListAsymmetric(int cx, int cz, int radiusX, int radiusZ) {
+        List<int[]> list = new ArrayList<>((2 * radiusX + 1) * (2 * radiusZ + 1));
+        for (int dx = -radiusX; dx <= radiusX; dx++) {
+            for (int dz = -radiusZ; dz <= radiusZ; dz++) {
+                list.add(new int[]{cx + dx, cz + dz});
+            }
+        }
+        // Sort centre-outward using Chebyshev distance
+        list.sort(Comparator.comparingInt(c -> Math.max(Math.abs(c[0] - cx), Math.abs(c[1] - cz))));
+        return list;
+    }
+
+    /**
+     * Resolve X-axis radius from entry, falling back to uniform radius then config default.
+     * Protected for subclass access.
+     */
+    protected int resolveRadiusX(com.optiportal.model.PortalEntry entry) {
+        if (entry.getWarmRadiusX() != null) return entry.getWarmRadiusX();
+        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
+        return config.getDefaultWarmRadius();
+    }
+
+    /**
+     * Resolve Z-axis radius from entry, falling back to uniform radius then config default.
+     * Protected for subclass access.
+     */
+    protected int resolveRadiusZ(com.optiportal.model.PortalEntry entry) {
+        if (entry.getWarmRadiusZ() != null) return entry.getWarmRadiusZ();
+        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
+        return config.getDefaultWarmRadius();
+    }
+
     /** Issue async load requests for every coord and return a future over all of them. */
-    private CompletableFuture<Void> loadChunks(World world, List<int[]> coords, boolean nonTicking) {
+    private CompletableFuture<Void> loadChunks(World world, List<int[]> coords, boolean nonTicking, String zoneId) {
         if (coords.isEmpty()) return CompletableFuture.completedFuture(null);
+
+        // Guard 1: JVM heap — stop loading if approaching the engine's desperate-eviction
+        // threshold (85%). A 5% margin gives the GC time to act before the engine starts
+        // evicting aggressively. Pure Java — no Hytale API required.
+        double heapUsed = 1.0 - (double) Runtime.getRuntime().freeMemory()
+                                / Runtime.getRuntime().maxMemory();
+        if (heapUsed >= 0.80) {
+            LOG.warning(() -> "[OptiPortal] loadChunks: aborting — JVM heap at "
+                    + String.format("%.1f", heapUsed * 100) + "% (threshold 80%)");
+            return CompletableFuture.completedFuture(null);
+        }
+
+        // Guard 2: Chunk count — abort if world already exceeds the configured ceiling.
+        // Skip if threshold is -1 (disabled) or if AsyncLoadBalancer already enforces it.
+        int pressureThreshold = config.getMaxLoadedChunksPressureThreshold();
+        if (pressureThreshold > 0) {
+            int liveCount = world.getChunkStore().getLoadedChunksCount();
+            if (liveCount >= pressureThreshold) {
+                LOG.warning(() -> "[OptiPortal] loadChunks: aborting — chunk pressure limit ("
+                        + liveCount + " >= " + pressureThreshold + ")");
+                return CompletableFuture.completedFuture(null);
+            }
+        }
 
         int batchSize  = config.getWarmBatchSize();   // default 4
         int batchDelay = config.getWarmBatchDelayMs(); // default 250
@@ -386,9 +465,32 @@ public class ChunkPreloader {
                 for (int i = 0; i < batch.size(); i++) {
                     int cx = batch.get(i)[0];
                     int cz = batch.get(i)[1];
-                    futures[i] = nonTicking
-                            ? world.getNonTickingChunkAsync(cx, cz)
-                            : world.getChunkAsync(cx, cz);
+                    long chunkIndex = ChunkUtil.indexChunk(cx, cz);
+                    
+                    // Guard: skip chunks on failure backoff to avoid hammering broken chunks
+                    if (world.getChunkStore().isChunkOnBackoff(chunkIndex, ChunkStore.MAX_FAILURE_BACKOFF_NANOS)) {
+                        LOG.fine(() -> "[OptiPortal] loadChunks: skipping chunk (" + cx + ", " + cz
+                                + ") — on failure backoff");
+                        futures[i] = CompletableFuture.completedFuture((WorldChunk) null);
+                    } else {
+                        final int finalCx = cx;
+                        final int finalCz = cz;
+                        final String finalZoneId = zoneId;
+
+                        // Store.getComponent() requires the WorldThread — use the async API
+                        // for all chunks; the engine returns a completed future for already-
+                        // resident chunks without a disk hop.
+                        CompletableFuture<WorldChunk> base = nonTicking
+                                ? world.getNonTickingChunkAsync(cx, cz)
+                                : world.getChunkAsync(cx, cz);
+                        futures[i] = base.thenApply(chunk -> {
+                            if (chunk != null && finalZoneId != null) {
+                                cacheManager.registerOwnership(finalZoneId,
+                                        world.getName(), finalCx, finalCz, chunk);
+                            }
+                            return chunk;
+                        });
+                    }
                 }
                 CompletableFuture<Void> batchDone = CompletableFuture.allOf(futures);
                 if (batchDelay <= 0) return batchDone;

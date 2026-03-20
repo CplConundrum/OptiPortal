@@ -99,8 +99,8 @@ public class PreloadCommand extends AbstractCommand {
         reply(ctx, "  /preload list — list all portals");
         reply(ctx, "  /preload strategy <id> <WARM|PREDICTIVE> — set strategy");
         reply(ctx, "  /preload shape <id> <ELLIPSOID|CYLINDER|BOX> — set activation shape");
-        reply(ctx, "  /preload radius <id> <n> — set uniform radius");
-        reply(ctx, "  /preload radiusxz <id> <rx> <rz> — set asymmetric radius");
+        reply(ctx, "  /preload radius <id> <X> [Z] — set asymmetric radius (Z defaults to X)");
+        reply(ctx, "  /preload radiusxz <id> <rx> <rz> — set asymmetric radius (deprecated, use radius)");
         reply(ctx, "  /preload setwarm <id> [radius] — set WARM and preload now");
         reply(ctx, "  /preload unsetwarm <id> — revert to PREDICTIVE");
         reply(ctx, "  /preload preload <id> — force predictive preload");
@@ -169,17 +169,20 @@ public class PreloadCommand extends AbstractCommand {
     }
 
     private CompletableFuture<Void> handleRadius(CommandContext ctx, String[] args) {
-        if (args.length < 3) { reply(ctx, "Usage: /preload radius <id> <n>"); return done(); }
+        if (args.length < 3) { reply(ctx, "Usage: /preload radius <id> <X> [Z]"); return done(); }
         String id = args[1];
-        int radius;
-        try { radius = Integer.parseInt(args[2]); }
-        catch (NumberFormatException e) { reply(ctx, "[OptiPortal] Radius must be an integer."); return done(); }
+        int rx, rz;
+        try {
+            rx = Integer.parseInt(args[2]);
+            rz = (args.length >= 4) ? Integer.parseInt(args[3]) : rx; // Z defaults to X for backward compatibility
+        }
+        catch (NumberFormatException e) { reply(ctx, "[OptiPortal] Radii must be integers."); return done(); }
         return plugin.getStorage().loadById(id).map(entry -> {
-            entry.setWarmRadius(radius);
-            entry.setWarmRadiusX(null);
-            entry.setWarmRadiusZ(null);
+            entry.setWarmRadius(-1);
+            entry.setWarmRadiusX(rx);
+            entry.setWarmRadiusZ(rz);
             plugin.getStorage().save(entry);
-            reply(ctx, "[OptiPortal] " + id + " radius → " + radius + ".");
+            reply(ctx, "[OptiPortal] " + id + " radius → " + rx + "x" + rz + ".");
             return CompletableFuture.<Void>completedFuture(null);
         }).orElseGet(() -> { reply(ctx, "[OptiPortal] Portal '" + id + "' not found."); return done(); });
     }
@@ -195,7 +198,7 @@ public class PreloadCommand extends AbstractCommand {
             entry.setWarmRadiusX(rx);
             entry.setWarmRadiusZ(rz);
             plugin.getStorage().save(entry);
-            reply(ctx, "[OptiPortal] " + id + " radius → " + rx + "x" + rz + ".");
+            reply(ctx, "[OptiPortal] " + id + " radius → " + rx + "x" + rz + " (deprecated: use /preload radius).");
             return CompletableFuture.<Void>completedFuture(null);
         }).orElseGet(() -> { reply(ctx, "[OptiPortal] Portal '" + id + "' not found."); return done(); });
     }

@@ -105,7 +105,6 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
     }
     
     protected boolean isOnCooldown(UUID playerId, String zoneId) {
-        String key = (playerId != null ? playerId.toString() : "global") + ":" + zoneId;
         Long last = getCooldowns()
                 .computeIfAbsent(playerId != null ? playerId : new UUID(0, 0), k -> new ConcurrentHashMap<>())
                 .get(zoneId);

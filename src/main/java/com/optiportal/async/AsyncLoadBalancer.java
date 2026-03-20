@@ -11,6 +11,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import java.util.logging.Logger;
 
+import com.optiportal.preload.WorldRegistry;
+
 /**
  * Load balancer for async operations to prevent world thread overload.
  *
@@ -48,6 +50,9 @@ public class AsyncLoadBalancer {
     private final AsyncMetrics metrics;
     private final AsyncErrorHandler errorHandler;
     
+    /** Optional world registry for chunk pressure sensing. Null = disabled. */
+    private final WorldRegistry worldRegistry;
+    
     /** Optional TPS monitor for server-load-aware scheduling. Null = disabled. */
     private final WorldTpsMonitor tpsMonitor;
     
@@ -61,10 +66,23 @@ public class AsyncLoadBalancer {
                             AsyncMetrics metrics,
                             AsyncErrorHandler errorHandler,
                             WorldTpsMonitor tpsMonitor) {
+        this(executor, metrics, errorHandler, tpsMonitor, null);
+    }
+    
+    /**
+     * Constructor with WorldRegistry for chunk pressure sensing.
+     * Use this in OptiPortal.start0() to enable server-wide chunk pressure awareness.
+     */
+    public AsyncLoadBalancer(ScheduledExecutorService executor,
+                            AsyncMetrics metrics,
+                            AsyncErrorHandler errorHandler,
+                            WorldTpsMonitor tpsMonitor,
+                            WorldRegistry worldRegistry) {
         this.executor = executor;
         this.metrics = metrics;
         this.errorHandler = errorHandler;
         this.tpsMonitor = tpsMonitor;
+        this.worldRegistry = worldRegistry;
         
         // Initialize priority queues
         for (AsyncMetrics.AsyncTaskPriority priority : AsyncMetrics.AsyncTaskPriority.values()) {
@@ -147,8 +165,34 @@ public class AsyncLoadBalancer {
             }
         }
         
+        // Chunk pressure adjustment: if the server has >4000 loaded chunks, reduce batch
+        // size to avoid adding GC and memory pressure. Thresholds are approximate.
+        int serverChunks = getTotalServerChunkCount();
+        if (serverChunks > 8000) {
+            // Very high chunk pressure — cap at 1
+            adjustedSize = MIN_BATCH_SIZE;
+            LOG.fine("[OptiPortal] AsyncLoadBalancer: server chunks=" + serverChunks
+                    + " (very high) → batch capped at " + MIN_BATCH_SIZE);
+        } else if (serverChunks > 4000) {
+            // High chunk pressure — halve the batch size
+            adjustedSize = Math.max(MIN_BATCH_SIZE, adjustedSize / 2);
+        }
+        
         // Never exceed the total chunk count
         return Math.min(adjustedSize, totalChunks);
+    }
+    
+    /**
+     * Sum of loaded chunks across all worlds. Returns 0 if worldRegistry is null
+     * or no worlds are loaded. Used for chunk pressure-aware batch sizing.
+     */
+    private int getTotalServerChunkCount() {
+        if (worldRegistry == null) return 0;
+        try {
+            return worldRegistry.getTotalLoadedChunkCount();
+        } catch (Exception e) {
+            return 0;
+        }
     }
     
     /**

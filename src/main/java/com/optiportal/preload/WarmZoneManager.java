@@ -8,14 +8,18 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.Semaphore;
+import java.util.logging.Logger;
 
+import com.hypixel.hytale.builtin.portals.PortalsPlugin;
+import com.hypixel.hytale.builtin.portals.resources.PortalWorld;
 import com.hypixel.hytale.event.EventRegistry;
+import com.hypixel.hytale.math.vector.Transform;
 import com.hypixel.hytale.server.core.universe.Universe;
+import com.hypixel.hytale.server.core.universe.world.World;
 import com.hypixel.hytale.server.core.universe.world.events.AllWorldsLoadedEvent;
 import com.optiportal.cache.CacheManager;
 import com.optiportal.config.PluginConfig;
@@ -36,6 +40,8 @@ import com.optiportal.storage.StorageBackend;
  * chunk loading calls require worlds to be registered in WorldRegistry first.
  */
 public class WarmZoneManager {
+
+    private static final Logger LOG = Logger.getLogger("OptiPortal");
 
     private final PluginConfig config;
     private final StorageBackend storage;
@@ -84,10 +90,12 @@ public class WarmZoneManager {
             if (universe != null && chunkPreloader != null) {
                 universe.getWorlds().values().forEach(world -> {
                     chunkPreloader.getWorldRegistry().addWorld(world);
-                    System.out.println("[OptiPortal] Seeded world from Universe: " + world.getName());
+                    LOG.info(() -> "[OptiPortal] Seeded world from Universe: " + world.getName());
+                    // Auto-detect portal destination worlds from PortalWorld resource
+                    scanWorldForPortalDestination(world);
                 });
             } else {
-                System.err.println("[OptiPortal] AllWorldsLoadedEvent: Universe.get()="
+                LOG.warning(() -> "[OptiPortal] AllWorldsLoadedEvent: Universe.get()="
                     + universe + " chunkPreloader=" + chunkPreloader);
             }
 
@@ -101,14 +109,14 @@ public class WarmZoneManager {
     }
 
     public void triggerStagedLoadOnce() {
-        System.out.println("[OptiPortal] triggerStagedLoadOnce called, stagedLoadStarted=" + stagedLoadStarted.get());
+        LOG.fine(() -> "[OptiPortal] triggerStagedLoadOnce called, stagedLoadStarted=" + stagedLoadStarted.get());
         worldsReady.set(true);
         if (pollTask != null) pollTask.cancel(false);
         if (stagedLoadStarted.compareAndSet(false, true)) {
             logWorldNames("first player join");
             executor.submit(this::runStagedLoad);
         } else {
-            System.out.println("[OptiPortal] triggerStagedLoadOnce: staged load already running, ignoring.");
+            LOG.fine(() -> "[OptiPortal] triggerStagedLoadOnce: staged load already running, ignoring.");
         }
     }
 
@@ -116,8 +124,26 @@ public class WarmZoneManager {
     private volatile java.util.concurrent.ScheduledFuture<?> pollTask;
 
     public void startStagedLoad() {
-        // Just start the polling fallback — actual load is triggered by triggerStagedLoadOnce()
-        // from PlayerReadyEvent, which ensures WorldRegistry is seeded before load starts.
+        // Primary path: hook into Universe.getUniverseReady() — fires exactly once when
+        // the universe is fully initialised. No polling needed.
+        Universe universe = Universe.get();
+        if (universe != null) {
+            universe.getUniverseReady().thenRunAsync(this::triggerStagedLoadOnce, executor)
+                    .exceptionally(ex -> {
+                        LOG.warning(() -> "[OptiPortal] startStagedLoad: Universe.getUniverseReady() failed: "
+                                + ex.getMessage() + " — falling back to polling");
+                        startPollingFallback();
+                        return null;
+                    });
+        } else {
+            // Universe not yet available — use polling fallback
+            LOG.warning(() -> "[OptiPortal] startStagedLoad: Universe.get() is null — using polling fallback");
+            startPollingFallback();
+        }
+    }
+
+    /** Polling fallback for environments where Universe.getUniverseReady() is unavailable. */
+    private void startPollingFallback() {
         pollTask = executor.scheduleWithFixedDelay(this::pollWorldsReady, 2, 2, java.util.concurrent.TimeUnit.SECONDS);
     }
 
@@ -133,7 +159,7 @@ public class WarmZoneManager {
         // Polling is a last-resort fallback — primary trigger is triggerStagedLoadOnce()
         // called from TeleportInterceptor when the first player joins.
         if (count >= 30) {
-            System.err.println("[OptiPortal] No player joined after 60s — staged load skipped.");
+            LOG.warning(() -> "[OptiPortal] No player joined after 60s — staged load skipped.");
             worldsReady.set(true);
             if (pollTask != null) pollTask.cancel(false);
         }
@@ -143,7 +169,7 @@ public class WarmZoneManager {
         if (chunkPreloader != null) {
             java.util.Collection<com.hypixel.hytale.server.core.universe.world.World> worlds =
                     chunkPreloader.getWorldRegistry().getWorlds();
-            System.out.println("[OptiPortal] Worlds ready (" + trigger + ", " + worlds.size() + " worlds): "
+            LOG.info(() -> "[OptiPortal] Worlds ready (" + trigger + ", " + worlds.size() + " worlds): "
                     + worlds.stream()
                         .map(com.hypixel.hytale.server.core.universe.world.World::getName)
                         .collect(java.util.stream.Collectors.joining(", ")));
@@ -151,7 +177,7 @@ public class WarmZoneManager {
     }
 
     private void runStagedLoad() {
-        System.out.println("[OptiPortal] runStagedLoad executing...");
+        LOG.info(() -> "[OptiPortal] runStagedLoad executing...");
         List<PortalEntry> all = storage.loadAll();
 
         List<PortalEntry> warmZones = all.stream()
@@ -160,11 +186,11 @@ public class WarmZoneManager {
                 .sorted(Comparator.comparingInt(this::startupPriority))
                 .toList();
 
-        System.out.println("[OptiPortal] Staged load: " + warmZones.size()
+        LOG.info(() -> "[OptiPortal] Staged load: " + warmZones.size()
                 + " WARM zones (skipping " + (all.size() - warmZones.size()) + " PREDICTIVE)");
 
         if (warmZones.isEmpty()) {
-            System.out.println("[OptiPortal] Startup load complete: 0 loaded, 0 skipped.");
+            LOG.info(() -> "[OptiPortal] Startup load complete: 0 loaded, 0 skipped.");
             return;
         }
 
@@ -179,7 +205,7 @@ public class WarmZoneManager {
                 sem.acquire(); // wait for a free slot — bounded by zone load time, not 120s
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                System.err.println("[OptiPortal] runStagedLoad interrupted.");
+                LOG.warning(() -> "[OptiPortal] runStagedLoad interrupted.");
                 break;
             }
 
@@ -188,7 +214,7 @@ public class WarmZoneManager {
                     .handle((v, ex) -> {
                         sem.release();
                         if (ex != null) {
-                            System.err.println("[OptiPortal] Warm load failed for "
+                            LOG.warning(() -> "[OptiPortal] Warm load failed for "
                                     + zone.getId() + ": " + ex.getMessage());
                             skipped.incrementAndGet();
                         } else {
@@ -201,7 +227,7 @@ public class WarmZoneManager {
 
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
                 .whenComplete((v, ex) ->
-                    System.out.println("[OptiPortal] Startup load complete: "
+                    LOG.info(() -> "[OptiPortal] Startup load complete: "
                             + loaded.get() + " loaded, " + skipped.get() + " skipped."));
     }
 
@@ -222,19 +248,28 @@ public class WarmZoneManager {
     public CompletableFuture<Void> loadWarmZone(PortalEntry entry) {
         int cx     = ChunkPreloader.toChunkCoord(entry.getX());
         int cz     = ChunkPreloader.toChunkCoord(entry.getZ());
-        int radius = resolveRadius(entry);
+        int radiusX = resolveRadiusX(entry);
+        int radiusZ = resolveRadiusZ(entry);
 
-        System.out.println("[OptiPortal] Loading WARM zone: " + entry.getId()
+        LOG.info(() -> "[OptiPortal] Loading WARM zone: " + entry.getId()
                 + " world=" + entry.getWorld()
-                + " cx=" + cx + " cz=" + cz + " r=" + radius);
+                + " cx=" + cx + " cz=" + cz + " rx=" + radiusX + " rz=" + radiusZ);
 
-        // Estimated RAM: (2R+1)^2 chunks × 64KB × 1.5x overhead for entities/metadata
-        int chunkCount = (2 * radius + 1) * (2 * radius + 1);
+        // Estimated RAM: (2*rx+1)*(2*rz+1) chunks × 64KB × 1.5x overhead for entities/metadata
+        int chunkCount = (2 * radiusX + 1) * (2 * radiusZ + 1);
         double estimatedMB = (chunkCount * 65536.0 * 1.5) / (1024.0 * 1024.0);
 
-        return chunkPreloader.warmLoad(entry.getId(), entry.getWorld(), cx, cz, radius)
+        return chunkPreloader.warmLoad(entry.getId(), entry.getWorld(), cx, cz, radiusX, radiusZ)
                 .thenRun(() -> {
                     cacheManager.setZoneTier(entry.getId(), CacheTier.HOT);
+                    // Exempt eternal-world zones from cache decay
+                    com.hypixel.hytale.server.core.universe.world.World zoneWorld =
+                            chunkPreloader.getWorldRegistry().getWorld(entry.getWorld());
+                    if (zoneWorld != null && !zoneWorld.getWorldConfig().canUnloadChunks()) {
+                        cacheManager.markNoDecay(entry.getId());
+                        LOG.info(() -> "[OptiPortal] Zone '" + entry.getId()
+                                + "' in eternal world — decay exempted.");
+                    }
                     // Heap-delta measurement is unreliable on a live server (GC + other plugins).
                     // Use estimate for both fields; TODO: instrument via chunk object sizing.
                     storage.loadById(entry.getId()).ifPresent(loaded -> {
@@ -243,11 +278,11 @@ public class WarmZoneManager {
                         chunkPreloader.updateEntryStats(loaded, chunkCount);
                         storage.save(loaded);
                     });
-                    System.out.println("[OptiPortal] WARM zone loaded: " + entry.getId()
+                    LOG.info(() -> "[OptiPortal] WARM zone loaded: " + entry.getId()
                             + " est=" + String.format("%.1f", estimatedMB) + "MB");
                 })
                 .exceptionally(ex -> {
-                    System.err.println("[OptiPortal] WARM zone load failed for "
+                    LOG.warning(() -> "[OptiPortal] WARM zone load failed for "
                             + entry.getId() + ": " + ex.getMessage());
                     return null;
                 });
@@ -271,6 +306,52 @@ public class WarmZoneManager {
     }
 
     /**
+     * Checks whether the given world is a portal destination (has a PortalWorld
+     * resource with a valid spawn point). If so, auto-registers the spawn point
+     * as a PREDICTIVE preload zone named "portaldest:<worldName>".
+     *
+     * Safe to call from any thread — storage.save() and executor.submit() are
+     * thread-safe; the zone is only loaded if worlds are already ready.
+     *
+     * Does nothing if PortalsPlugin is not installed.
+     */
+    public void scanWorldForPortalDestination(World world) {
+        // Guard: PortalsPlugin may not be installed
+        if (PortalsPlugin.getInstance() == null) return;
+
+        PortalWorld portalWorld;
+        try {
+            portalWorld = world.getEntityStore().getStore()
+                    .getResource(PortalWorld.getResourceType());
+        } catch (Exception e) {
+            // Resource not registered on this world — not a portal world
+            return;
+        }
+
+        if (portalWorld == null || !portalWorld.exists()) return;
+
+        Transform spawnPoint = portalWorld.getSpawnPoint();
+        if (spawnPoint == null) return; // spawn point not yet configured
+
+        com.hypixel.hytale.math.vector.Vector3d pos = spawnPoint.getPosition();
+        if (pos == null) return;
+
+        String zoneId = "portaldest:" + world.getName();
+
+        // Skip if already registered
+        if (storage.loadById(zoneId).isPresent()) return;
+
+        PortalEntry entry = new PortalEntry(zoneId, world.getName(), pos.x, pos.y, pos.z, 0);
+        entry.setStrategy(com.optiportal.model.WarmStrategy.PREDICTIVE);
+        entry.setType(PortalEntry.EntryType.MANUAL);
+
+        storage.save(entry);
+        LOG.info(() -> "[OptiPortal] Auto-registered portal destination zone: "
+                + zoneId + " at " + world.getName()
+                + " (" + pos.x + ", " + pos.y + ", " + pos.z + ")");
+    }
+
+    /**
      * Serialize all HOT/WARM zones to COLD on shutdown.
      */
     public void serializeAll() {
@@ -281,6 +362,26 @@ public class WarmZoneManager {
     }
 
     private int resolveRadius(PortalEntry entry) {
+        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
+        return config.getDefaultWarmRadius();
+    }
+
+    /**
+     * Resolve X-axis radius from entry, falling back to uniform radius then config default.
+     * Private to match existing resolveRadius pattern in this class.
+     */
+    private int resolveRadiusX(PortalEntry entry) {
+        if (entry.getWarmRadiusX() != null) return entry.getWarmRadiusX();
+        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
+        return config.getDefaultWarmRadius();
+    }
+
+    /**
+     * Resolve Z-axis radius from entry, falling back to uniform radius then config default.
+     * Private to match existing resolveRadius pattern in this class.
+     */
+    private int resolveRadiusZ(PortalEntry entry) {
+        if (entry.getWarmRadiusZ() != null) return entry.getWarmRadiusZ();
         if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
         return config.getDefaultWarmRadius();
     }

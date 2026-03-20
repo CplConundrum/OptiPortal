@@ -61,6 +61,7 @@ public class PluginConfig {
     private int ttlLowTraffic = 1;
     private int ttlBed = 3;
     private int ttlDeathLocation = 1;
+    private int ttlCleanupIntervalHours = 24;
 
     // Cache
     private boolean persistColdCache = true;
@@ -162,6 +163,13 @@ public class PluginConfig {
     /** Player speed (blocks/tick) above which radius is boosted by 1. Default: 0.5. */
     private double velocityRadiusBoostThreshold = 0.5;
 
+    // Portal link learning (Feature 3)
+    /** Observations required before a pending link is promoted to confirmed. Default: 3. */
+    private int portalLinksConfidenceThreshold = 3;
+
+    /** Days a pending link can be idle before it is decayed and removed. Default: 7. */
+    private int portalLinksPendingDecayDays = 7;
+
     // Data folder reference
     private File dataFolder;
 
@@ -253,6 +261,7 @@ public class PluginConfig {
             if (ttl.has("lowTraffic")) ttlLowTraffic = ttl.get("lowTraffic").getAsInt();
             if (ttl.has("bed")) ttlBed = ttl.get("bed").getAsInt();
             if (ttl.has("deathLocation")) ttlDeathLocation = ttl.get("deathLocation").getAsInt();
+            if (ttl.has("cleanupIntervalHours")) ttlCleanupIntervalHours = ttl.get("cleanupIntervalHours").getAsInt();
         }
 
         if (json.has("warps")) {
@@ -370,6 +379,15 @@ public class PluginConfig {
                 if (corridor.has("radiusChunks"))
                     corridorRadiusChunks = corridor.get("radiusChunks").getAsInt();
             }
+        }
+
+        // Portal link learning (Feature 3)
+        if (json.has("portalLinks")) {
+            JsonObject pl = json.getAsJsonObject("portalLinks");
+            if (pl.has("confidenceThreshold"))
+                portalLinksConfidenceThreshold = pl.get("confidenceThreshold").getAsInt();
+            if (pl.has("pendingDecayDays"))
+                portalLinksPendingDecayDays = pl.get("pendingDecayDays").getAsInt();
         }
     }
 
@@ -571,6 +589,7 @@ public class PluginConfig {
     public int getTtlLowTraffic() { return ttlLowTraffic; }
     public int getTtlBed() { return ttlBed; }
     public int getTtlDeathLocation() { return ttlDeathLocation; }
+    public int getTtlCleanupIntervalHours() { return ttlCleanupIntervalHours; }
     public boolean isPersistColdCache() { return persistColdCache; }
     public String getCacheDirectory() { return cacheDirectory; }
     public int getMaxCacheAgeDays() { return maxCacheAgeDays; }
@@ -647,4 +666,8 @@ public class PluginConfig {
 
     // Phase 5C: Staged load concurrency getter
     public int getStagedLoadConcurrency() { return stagedLoadConcurrency; }
+
+    // Feature 3: Portal link learning getters
+    public int getPortalLinksConfidenceThreshold() { return portalLinksConfidenceThreshold; }
+    public int getPortalLinksPendingDecayDays() { return portalLinksPendingDecayDays; }
 }

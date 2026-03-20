@@ -117,17 +117,17 @@ public class JsonStorageBackend implements StorageBackend {
     }
 
     @Override
-    public List<PortalEntry> loadAll() {
+    public synchronized List<PortalEntry> loadAll() {
         return new ArrayList<>(entries.values());
     }
 
     @Override
-    public Optional<PortalEntry> loadById(String id) {
+    public synchronized Optional<PortalEntry> loadById(String id) {
         return Optional.ofNullable(entries.get(id));
     }
 
     @Override
-    public void save(PortalEntry entry) {
+    public synchronized void save(PortalEntry entry) {
         entries.put(entry.getId(), entry);
         flush();
         // Notify cache updater
@@ -137,7 +137,7 @@ public class JsonStorageBackend implements StorageBackend {
     }
 
     @Override
-    public void saveAll(List<PortalEntry> newEntries) {
+    public synchronized void saveAll(List<PortalEntry> newEntries) {
         for (PortalEntry e : newEntries) {
             entries.put(e.getId(), e);
         }
@@ -149,7 +149,7 @@ public class JsonStorageBackend implements StorageBackend {
     }
 
     @Override
-    public void delete(String id) {
+    public synchronized void delete(String id) {
         PortalEntry removed = entries.remove(id);
         if (removed != null) {
             flush();

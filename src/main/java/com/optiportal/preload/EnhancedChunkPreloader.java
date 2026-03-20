@@ -6,6 +6,9 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.logging.Logger;
 
+import com.hypixel.hytale.math.util.ChunkUtil;
+import com.hypixel.hytale.server.core.universe.world.World;
+import com.hypixel.hytale.server.core.universe.world.storage.ChunkStore;
 import com.optiportal.async.AsyncLoadBalancer;
 import com.optiportal.async.AsyncMetrics;
 import com.optiportal.async.WorldThreadBridge;
@@ -116,10 +119,27 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
             LOG.warning("[OptiPortal] warmLoad: world not loaded: " + worldName);
             return CompletableFuture.completedFuture(null);
         }
-        
+
         // Use load balancer with normal priority for warm loads
         return loadBalancer.scheduleLoad(() -> {
             return enhancedWarmLoad(zoneId, worldName, cx, cz, radius);
+        }, AsyncMetrics.AsyncTaskPriority.NORMAL);
+    }
+
+    /**
+     * Enhanced warm load with asymmetric X/Z radii — used by WarmZoneManager for
+     * corridor and bridge zones where width and depth differ.
+     */
+    @Override
+    public CompletableFuture<Void> warmLoad(String zoneId, String worldName, int cx, int cz, int radiusX, int radiusZ) {
+        if (getWorldRegistry().getWorld(worldName) == null) {
+            LOG.warning("[OptiPortal] warmLoad: world not loaded: " + worldName);
+            return CompletableFuture.completedFuture(null);
+        }
+        return loadBalancer.scheduleLoad(() -> {
+            List<int[]> chunks = buildChunkListEnhanced(cx, cz, radiusX, radiusZ);
+            int batchSize = Math.min(loadBalancer.calculateOptimalBatchSize(chunks.size()) * 2, 16);
+            return loadChunksAsync(worldName, chunks, true, zoneId, batchSize);
         }, AsyncMetrics.AsyncTaskPriority.NORMAL);
     }
     
@@ -166,13 +186,39 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
         if (chunks.isEmpty()) {
             return CompletableFuture.completedFuture(null);
         }
+
+        // Guard 1: JVM heap — stop loading if approaching the engine's desperate-eviction
+        // threshold (85%). A 5% margin gives the GC time to act before the engine starts
+        // evicting aggressively. Pure Java — no Hytale API required.
+        double heapUsed = 1.0 - (double) Runtime.getRuntime().freeMemory()
+                                / Runtime.getRuntime().maxMemory();
+        if (heapUsed >= 0.80) {
+            LOG.warning(() -> "[OptiPortal] loadChunksAsync: aborting — JVM heap at "
+                    + String.format("%.1f", heapUsed * 100) + "% (threshold 80%)");
+            return CompletableFuture.completedFuture(null);
+        }
+
+        // Guard 2: Chunk count — abort if world already exceeds the configured ceiling.
+        // Skip if threshold is -1 (disabled) or if AsyncLoadBalancer already enforces it.
+        int pressureThreshold = getConfig().getMaxLoadedChunksPressureThreshold();
+        if (pressureThreshold > 0) {
+            World world = getWorldRegistry().getWorld(worldName);
+            if (world != null) {
+                int liveCount = world.getChunkStore().getLoadedChunksCount();
+                if (liveCount >= pressureThreshold) {
+                    LOG.warning(() -> "[OptiPortal] loadChunksAsync: aborting — chunk pressure limit ("
+                            + liveCount + " >= " + pressureThreshold + ")");
+                    return CompletableFuture.completedFuture(null);
+                }
+            }
+        }
         
         // Process chunks in adaptive batches
         List<CompletableFuture<Void>> batchFutures = new ArrayList<>();
         
         for (int i = 0; i < chunks.size(); i += batchSize) {
             List<int[]> batch = chunks.subList(i, Math.min(i + batchSize, chunks.size()));
-  
+
             // Load batch with proper async handling
             CompletableFuture<Void> batchFuture = loadChunkBatch(worldName, batch, nonTicking, zoneId);
             batchFutures.add(batchFuture);
@@ -201,27 +247,45 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
      */
     private CompletableFuture<Void> loadChunkBatch(String worldName, List<int[]> batch,
                                                    boolean nonTicking, String zoneId) {
-        List<CompletableFuture<Void>> chunkFutures = new ArrayList<>();
+        // Resolve world once — avoids N ConcurrentHashMap lookups and enables null guard.
+        // The world could unload between scheduleLoad submission and execution.
+        // WorldThreadBridge.getChunkAsync handles null world, but returning early is cleaner.
+        World world = getWorldRegistry().getWorld(worldName);
+        if (world == null) {
+            LOG.fine(() -> "[OptiPortal] loadChunkBatch: world '" + worldName + "' no longer loaded, skipping.");
+            return CompletableFuture.completedFuture(null);
+        }
 
+        List<CompletableFuture<Void>> chunkFutures = new ArrayList<>();
         double baseKbPerChunk = getBytesPerChunk() / 1024.0;
 
         for (int[] coord : batch) {
             final int cx = coord[0];
             final int cz = coord[1];
+            long chunkIndex = ChunkUtil.indexChunk(cx, cz);
 
-            CompletableFuture<Void> chunkFuture = worldBridge.getChunkAsync(
-                getWorldRegistry().getWorld(worldName), cx, cz, nonTicking)
+            // Guard A: backoff — mirrors ChunkPreloader.loadChunks. Skip chunks that
+            // recently failed to load to avoid hammering broken positions.
+            if (world.getChunkStore().isChunkOnBackoff(chunkIndex, ChunkStore.MAX_FAILURE_BACKOFF_NANOS)) {
+                LOG.fine(() -> "[OptiPortal] loadChunkBatch: skipping (" + cx + ", " + cz
+                        + ") — on failure backoff");
+                chunkFutures.add(CompletableFuture.completedFuture(null));
+                continue;
+            }
+
+            // Store.getComponent() requires the WorldThread — use the async API for all
+            // chunks; the engine returns a completed future for already-resident chunks.
+
+            // WorldThreadBridge.getChunkAsync already records success/error metrics with real
+            // duration — do NOT call metrics.record* here to avoid double-counting.
+            CompletableFuture<Void> chunkFuture = worldBridge.getChunkAsync(world, cx, cz, nonTicking)
                     .thenAcceptAsync(chunk -> {
-                        metrics.recordChunkLoadSuccess(cx, cz, 0);
                         if (chunk != null) {
-                            // Register ownership immediately using the live chunk reference.
-                            // addKeepLoaded() is an AtomicInteger op — safe from any thread.
                             cacheManager.registerOwnership(zoneId, worldName, cx, cz, chunk);
                             scoreAndRecord(chunk, zoneId, baseKbPerChunk, worldName);
                         }
                     }, executor)
                     .exceptionally(ex -> {
-                        metrics.recordChunkLoadError(cx, cz, 0);
                         LOG.warning("[OptiPortal] Chunk load failed: " + cx + "," + cz
                                 + ": " + ex.getMessage());
                         return null;
@@ -253,7 +317,7 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
                     + " chunk=" + chunk.getX() + "," + chunk.getZ()
                     + " complexity=" + String.format("%.3f", complexity)
                     + " measuredRamMB=" + String.format("%.4f", measuredRamMB));
-      
+          
             // Update PortalEntry with measured RAM after first load
             // This replaces the pre-load estimate with actual post-load measurement
             updatePortalEntryRamEstimate(zoneId, worldName, chunk.getX(), chunk.getZ(), measuredRamMB);
@@ -276,22 +340,19 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
         if (zoneId == null) return; // No zone context, skip update
         
         // Try to find a matching PortalEntry for this zone
-        getStorage().loadAll().stream()
-            .filter(entry -> entry.getId().equals(zoneId))
-            .findFirst()
-            .ifPresent(entry -> {
-                // Update ramMarginalMB with measured value
-                // This replaces the pre-load estimate with actual post-load measurement
-                double oldMarginal = entry.getRamMarginalMB();
-                entry.setRamMarginalMB(measuredRamMB);
+        getStorage().loadById(zoneId).ifPresent(entry -> {
+            // Update ramMarginalMB with measured value
+            // This replaces the pre-load estimate with actual post-load measurement
+            double oldMarginal = entry.getRamMarginalMB();
+            entry.setRamMarginalMB(measuredRamMB);
   
-                LOG.fine(() -> "[OptiPortal] Updated ramMarginalMB for zone '" + zoneId
-                        + "': " + String.format("%.4f", oldMarginal) + " → "
-                        + String.format("%.4f", measuredRamMB) + " MB");
+            LOG.fine(() -> "[OptiPortal] Updated ramMarginalMB for zone '" + zoneId
+                    + "': " + String.format("%.4f", oldMarginal) + " → "
+                    + String.format("%.4f", measuredRamMB) + " MB");
   
-                // Persist the updated entry
-                getStorage().save(entry);
-            });
+            // Persist the updated entry
+            getStorage().save(entry);
+        });
     }
     
     /**
@@ -320,35 +381,34 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
      * @param radius Radius
      * @return List of chunk coordinates
      */
-    private List<int[]> buildChunkListEnhanced(int cx, int cz, int radius) {
-        List<int[]> list = new ArrayList<>((2 * radius + 1) * (2 * radius + 1));
-        for (int dx = -radius; dx <= radius; dx++) {
-            for (int dz = -radius; dz <= radius; dz++) {
+    private List<int[]> buildChunkListEnhanced(int cx, int cz, int radiusX, int radiusZ) {
+        List<int[]> list = new ArrayList<>((2 * radiusX + 1) * (2 * radiusZ + 1));
+        for (int dx = -radiusX; dx <= radiusX; dx++) {
+            for (int dz = -radiusZ; dz <= radiusZ; dz++) {
                 list.add(new int[]{cx + dx, cz + dz});
             }
         }
-        
-        // Sort centre-outward with optional corridor boost.
-        // Corridor chunks are treated as if they are 1 ring closer to centre for
-        // sorting purposes — they load slightly ahead of non-corridor chunks at the
-        // same Chebyshev distance.
+
         final boolean corridorEnabled = corridorIndex != null
                 && !corridorIndex.isEmpty()
                 && getConfig().isCorridorPrioritizationEnabled();
-        
+
         list.sort((c1, c2) -> {
             int dist1 = Math.abs(c1[0] - cx) + Math.abs(c1[1] - cz);
             int dist2 = Math.abs(c2[0] - cx) + Math.abs(c2[1] - cz);
-      
+
             if (corridorEnabled) {
-                // Apply -1 effective distance to corridor chunks (make them sort earlier)
                 if (corridorIndex.isCorridor(c1[0], c1[1])) dist1 = Math.max(0, dist1 - 1);
                 if (corridorIndex.isCorridor(c2[0], c2[1])) dist2 = Math.max(0, dist2 - 1);
             }
-      
+
             return Integer.compare(dist1, dist2);
         });
-        
+
         return list;
+    }
+
+    private List<int[]> buildChunkListEnhanced(int cx, int cz, int radius) {
+        return buildChunkListEnhanced(cx, cz, radius, radius);
     }
 }

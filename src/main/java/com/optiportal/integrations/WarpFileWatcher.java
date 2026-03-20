@@ -19,6 +19,9 @@ import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.hypixel.hytale.builtin.teleport.TeleportPlugin;
+import com.hypixel.hytale.builtin.teleport.Warp;
+import com.hypixel.hytale.math.vector.Transform;
 import com.optiportal.config.PluginConfig;
 import com.optiportal.model.PortalEntry;
 import com.optiportal.model.WarmStrategy;
@@ -76,6 +79,13 @@ public class WarpFileWatcher {
 
     /** Force immediate re-read (called by /preload refresh warps). Returns count of warps synced. */
     public int forceRefresh() {
+        // Try native path first
+        int nativeSynced = syncNativeWarps();
+        if (nativeSynced >= 0) {
+            return nativeSynced;
+        }
+
+        // Fallback: file-based
         lastModified = -1; // force re-read even if file unchanged
         File warpsFile = new File(config.getWarpsSourcePath());
         if (!warpsFile.exists()) return 0;
@@ -89,7 +99,58 @@ public class WarpFileWatcher {
         }
     }
 
+    /**
+     * Sync warps from the native TeleportPlugin in-memory map.
+     * Called on startup and optionally on each poll interval.
+     * Returns the number of warps synced, or -1 if TeleportPlugin is not ready.
+     *
+     * Replaces parseWarpsFile/syncWarps for the native path. The file-based
+     * path remains as fallback for servers that don't use TeleportPlugin.
+     *
+     * IMPORTANT: TeleportPlugin.get() may return null if the plugin is not
+     * installed. isWarpsLoaded() may return false on first call at startup.
+     * We skip silently and let the next scheduled poll retry.
+     */
+    private int syncNativeWarps() {
+        TeleportPlugin tp = TeleportPlugin.get();
+        if (tp == null || !tp.isWarpsLoaded()) {
+            return -1; // not ready yet — will retry on next poll
+        }
+
+        java.util.Map<String, Warp> nativeWarps = tp.getWarps();
+        if (nativeWarps == null) return 0;
+
+        // Build list of PortalEntry from native Warp objects
+        List<PortalEntry> incoming = new ArrayList<>();
+        for (Warp warp : nativeWarps.values()) {
+            Transform transform = warp.getTransform();
+            if (transform == null || transform.getPosition() == null) continue;
+
+            com.hypixel.hytale.math.vector.Vector3d pos = transform.getPosition();
+            float yaw = 0.0f;  // Transform.getYaw() not available in this Hytale build; yaw not critical for preloading
+
+            String mappedWorld = config.remapWorldName(warp.getWorld());
+            PortalEntry entry = new PortalEntry(warp.getId(), mappedWorld, pos.x, pos.y, pos.z, yaw);
+            entry.setCreator(warp.getCreator() != null ? warp.getCreator() : "");
+            if (warp.getCreationDate() != null) {
+                entry.setCreationDate(warp.getCreationDate());
+            }
+            incoming.add(entry);
+        }
+
+        syncWarps(incoming);
+        return incoming.size();
+    }
+
     private void checkAndSync() {
+        // Try native TeleportPlugin map first — more accurate and zero file I/O
+        int nativeSynced = syncNativeWarps();
+        if (nativeSynced >= 0) {
+            // Native path succeeded — skip file-based sync
+            return;
+        }
+
+        // Fallback: file-based sync (for servers without TeleportPlugin or before it loads)
         File warpsFile = new File(config.getWarpsSourcePath());
         if (!warpsFile.exists()) return;
 
@@ -164,11 +225,16 @@ public class WarpFileWatcher {
             }
         }
     
-        // Remove warps that are in storage but no longer exist in file
+        // Remove warps that are in storage but no longer exist in file.
+        // Only delete PORTAL-type entries — MANUAL zones, death records, and respawn records
+        // share the same storage backend and must not be touched by warp sync.
         for (String existingId : existing.keySet()) {
             if (!incomingIds.contains(existingId)) {
-                storage.delete(existingId);
-                System.out.println("[OptiPortal] Warp removed: " + existingId);
+                PortalEntry ex = existing.get(existingId);
+                if (ex != null && ex.getType() == PortalEntry.EntryType.PORTAL) {
+                    storage.delete(existingId);
+                    System.out.println("[OptiPortal] Warp removed: " + existingId);
+                }
             }
         }
 

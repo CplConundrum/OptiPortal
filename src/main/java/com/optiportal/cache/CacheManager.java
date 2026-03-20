@@ -14,6 +14,7 @@ import java.util.logging.Logger;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import com.hypixel.hytale.math.util.ChunkUtil;
 import com.optiportal.config.PluginConfig;
 import com.optiportal.metrics.MetricsCollector;
 import com.optiportal.model.CacheTier;
@@ -55,6 +56,10 @@ public class CacheManager {
     // Earliest ms timestamp at which any zone is next due for decay.
     // Long.MAX_VALUE when no HOT/WARM zones exist. Used to skip decayTiers() early.
     private final AtomicLong earliestDecayMs = new AtomicLong(Long.MAX_VALUE);
+
+    // Zone IDs in this set are never subject to tier decay (e.g., zones in eternal worlds).
+    // CopyOnWriteArraySet: written rarely (zone registration), read on every decayTiers() call.
+    private final java.util.Set<String> noDecayZones = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     // Persistence fields for P11
     private final File registryFile;
@@ -129,6 +134,28 @@ public class CacheManager {
         } catch (Exception e) {
             LOG.warning("[OptiPortal] CacheManager: failed to load registry: " + e.getMessage());
         }
+    }
+
+    /**
+     * Mark a zone as exempt from tier decay. Call this for zones in eternal worlds
+     * (WorldConfig.canUnloadChunks() == false). Effect is immediate — the zone's
+     * current tier is preserved indefinitely until explicitly unmarked.
+     */
+    public void markNoDecay(String zoneId) {
+        noDecayZones.add(zoneId);
+    }
+
+    /**
+     * Remove the no-decay exemption for a zone. After calling this, the zone resumes
+     * normal HOT→WARM→COLD decay from the next decayTiers() cycle.
+     */
+    public void unmarkNoDecay(String zoneId) {
+        noDecayZones.remove(zoneId);
+    }
+
+    /** Returns true if the given zone is exempt from tier decay. */
+    public boolean isNoDecay(String zoneId) {
+        return noDecayZones.contains(zoneId);
     }
 
     public void saveRegistry() {
@@ -231,6 +258,8 @@ public class CacheManager {
         for (Map.Entry<String, CacheTier> entry : zoneTiers.entrySet()) {
             String zoneId = entry.getKey();
             CacheTier tier = entry.getValue();
+            // Skip no-decay zones — their chunks never unload, decay is meaningless
+            if (noDecayZones.contains(zoneId)) continue;
             Long ts = tierTimestamps.get(zoneId);
             if (ts == null) continue;
 
@@ -373,7 +402,10 @@ public class CacheManager {
                 Set<String> owners = worldMap.get(key);
                 if (owners != null) {
                     owners.remove(zoneId);
-                    if (owners.isEmpty()) worldMap.remove(key, owners);
+                    if (owners.isEmpty()) {
+                        worldMap.remove(key, owners);
+                        tryReleaseKeepLoaded(worldName, (int)(long) key, (int)(key >>> 32));
+                    }
                 }
             }
         });
@@ -511,11 +543,14 @@ public class CacheManager {
     private void tryReleaseKeepLoaded(String worldName, int cx, int cz) {
         com.hypixel.hytale.server.core.universe.world.World world = worldRegistry.getWorld(worldName);
         if (world == null) return; // world unloaded — engine already cleaned up chunks
+        // Use the engine's native index format, not CacheManager's pack format.
+        // Use getChunkIfInMemory so non-ticking (warm) chunks are also reached.
+        long engineIndex = ChunkUtil.indexChunk(cx, cz);
         com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk chunk =
-                world.getChunkIfLoaded(packChunkIndex(cx, cz));
+                world.getChunkIfInMemory(engineIndex);
         if (chunk != null) {
             chunk.removeKeepLoaded();
-            LOG.fine("[OptiPortal] removeKeepLoaded: " + worldName + ":" + cx + ":" + cz);
+            LOG.fine(() -> "[OptiPortal] removeKeepLoaded: " + worldName + ":" + cx + ":" + cz);
         }
     }
 

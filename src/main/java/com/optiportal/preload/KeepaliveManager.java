@@ -114,7 +114,7 @@ public class KeepaliveManager {
      * Uses warmLoad's underlying getNonTickingChunkAsync — chunks stay loaded
      * but don't tick, matching how they were originally loaded.
      */
-    private void pingTier(CacheTier tier, String label) {
+    protected void pingTier(CacheTier tier, String label) {
         List<PortalEntry> entries = storage.loadAll();
         int zoneCount = 0;
         int chunkCount = 0;
@@ -130,15 +130,15 @@ public class KeepaliveManager {
 
             int cx = ChunkPreloader.toChunkCoord(entry.getX());
             int cz = ChunkPreloader.toChunkCoord(entry.getZ());
-            int radius = resolveRadius(entry);
-            int diameter = 2 * radius + 1;
-            chunkCount += diameter * diameter;
+            int radiusX = resolveRadiusX(entry);
+            int radiusZ = resolveRadiusZ(entry);
+            chunkCount += (2 * radiusX + 1) * (2 * radiusZ + 1);
             zoneCount++;
 
             // Fire and forget — we only care that the chunk future is requested,
             // not when it completes. getNonTickingChunkAsync resets GC reachability.
-            for (int dx = -radius; dx <= radius; dx++) {
-                for (int dz = -radius; dz <= radius; dz++) {
+            for (int dx = -radiusX; dx <= radiusX; dx++) {
+                for (int dz = -radiusZ; dz <= radiusZ; dz++) {
                     world.getNonTickingChunkAsync(cx + dx, cz + dz);
                 }
             }
@@ -150,6 +150,31 @@ public class KeepaliveManager {
         }
     }
 
+    /**
+     * Resolve X-axis radius from entry, falling back to uniform radius then config default.
+     * Protected for subclass access.
+     */
+    protected int resolveRadiusX(PortalEntry entry) {
+        if (entry.getWarmRadiusX() != null) return entry.getWarmRadiusX();
+        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
+        return config.getDefaultWarmRadius();
+    }
+
+    /**
+     * Resolve Z-axis radius from entry, falling back to uniform radius then config default.
+     * Protected for subclass access.
+     */
+    protected int resolveRadiusZ(PortalEntry entry) {
+        if (entry.getWarmRadiusZ() != null) return entry.getWarmRadiusZ();
+        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
+        return config.getDefaultWarmRadius();
+    }
+
+    /**
+     * Resolve radius from entry, falling back to config default.
+     * Deprecated — use resolveRadiusX/resolveRadiusZ for asymmetric support.
+     */
+    @Deprecated
     private int resolveRadius(PortalEntry entry) {
         if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
         return config.getDefaultWarmRadius();

@@ -1,13 +1,15 @@
 package com.optiportal.cache;
 
-import java.util.Set;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
+import com.hypixel.hytale.math.util.ChunkUtil;
 import com.hypixel.hytale.server.core.universe.world.World;
 import com.optiportal.config.PluginConfig;
 import com.optiportal.preload.WorldRegistry;
+
+import it.unimi.dsi.fastutil.longs.LongSet;
 
 /**
  * Periodically audits the CacheManager chunk ownership map against what
@@ -96,9 +98,9 @@ public class ChunkOwnershipAuditor {
         // Fetch all loaded chunk indexes from the ChunkStore in one call.
         // getChunkIndexes() covers both ticking and non-ticking chunks, unlike
         // getChunkIfLoaded() which silently returns null for non-ticking chunks.
-        java.util.Set<Long> loadedIndexes;
+        LongSet loadedIndexes;
         try {
-            loadedIndexes = new java.util.HashSet<>(world.getChunkStore().getChunkIndexes());
+            loadedIndexes = world.getChunkStore().getChunkIndexes();
         } catch (Exception e) {
             LOG.warning("[OptiPortal] ChunkOwnershipAuditor: getChunkIndexes() failed for '"
                     + worldName + "': " + e.getMessage());
@@ -107,7 +109,7 @@ public class ChunkOwnershipAuditor {
 
         // Get only the packed chunk keys owned in this world — no prefix filtering needed.
         // Key encoding: cx = (int) key,  cz = (int)(key >>> 32)
-        Set<Long> ownedKeys = cacheManager.getOwnedChunkKeys(worldName);
+        java.util.Set<Long> ownedKeys = cacheManager.getOwnedChunkKeys(worldName);
         if (ownedKeys.isEmpty()) return;
 
         int checkedCount = 0;
@@ -118,10 +120,13 @@ public class ChunkOwnershipAuditor {
 
         for (Long packedKey : ownedKeys) {
             checkedCount++;
-            if (!loadedIndexes.contains(packedKey)) {
+            int cx = (int)(long) packedKey;
+            int cz = (int)(packedKey >>> 32);
+            // Convert to engine index format before lookup.
+            // CacheManager stores cx-low/cz-high; ChunkStore.getChunkIndexes() uses ChunkUtil.indexChunk.
+            long engineIndex = ChunkUtil.indexChunk(cx, cz);
+            if (!loadedIndexes.contains(engineIndex)) {
                 evictedCount++;
-                int cx = (int)(long) packedKey;
-                int cz = (int)(packedKey >>> 32);
                 evictions.add(new int[]{cx, cz});
             }
         }
@@ -130,14 +135,13 @@ public class ChunkOwnershipAuditor {
 
         double absentFraction = evictedCount / (double) checkedCount;
 
-        // 100% absent almost certainly means getChunkIndexes() uses a different index
-        // encoding than our pack formula, not genuine mass eviction. Log at INFO and
-        // skip callbacks — no ownership corruption risk, but nothing to clean up either.
+        // 100% eviction rate: world may be in the process of unloading.
+        // Skip callbacks to avoid corrupting ownership for zones that will reload.
         if (evictedCount == checkedCount) {
             final int fc = checkedCount;
             LOG.fine(() -> "[OptiPortal] ChunkOwnershipAuditor: all " + fc
-                    + " ownership entries absent from ChunkStore index for '" + worldName
-                    + "' — index encoding mismatch or API limitation, skipping.");
+                    + " owned chunks absent for '" + worldName
+                    + "' — possible world unload in progress, skipping.");
             return;
         }
 

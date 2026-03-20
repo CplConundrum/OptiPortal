@@ -59,7 +59,7 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
      * @param tier Cache tier to ping
      * @param label Label for logging
      */
-    // Remove @Override annotation since this method doesn't override anything in the parent class
+    @Override
     protected void pingTier(CacheTier tier, String label) {
         // Group operations by world to minimize context switching
         Map<String, List<ChunkCoordinate>> chunksByWorld = groupChunksByWorld(tier);
@@ -74,7 +74,7 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
         for (Map.Entry<String, List<ChunkCoordinate>> entry : chunksByWorld.entrySet()) {
             String worldName = entry.getKey();
             List<ChunkCoordinate> chunks = entry.getValue();
-            
+   
             CompletableFuture<Void> worldFuture = processWorldChunks(worldName, chunks, tier, label);
             worldFutures.add(worldFuture);
         }
@@ -104,7 +104,7 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
      * @return CompletableFuture that completes when processing is done
      */
     private CompletableFuture<Void> processWorldChunks(String worldName, List<ChunkCoordinate> chunks,
-                                                     CacheTier tier, String label) {
+                                                      CacheTier tier, String label) {
         // Calculate optimal batch size based on current load
         int batchSize = calculateOptimalBatchSize(chunks.size());
         
@@ -113,11 +113,11 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
         
         for (int i = 0; i < chunks.size(); i += batchSize) {
             List<ChunkCoordinate> batch = chunks.subList(i, Math.min(i + batchSize, chunks.size()));
-            
+  
             CompletableFuture<Void> batchFuture = loadBalancer.scheduleLoad(() -> {
                 return pingChunkBatch(worldName, batch, tier);
             }, AsyncMetrics.AsyncTaskPriority.NORMAL);
-            
+  
             batchFutures.add(batchFuture);
         }
         
@@ -136,20 +136,18 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
         List<CompletableFuture<Void>> chunkFutures = new ArrayList<>();
         
         for (ChunkCoordinate coord : batch) {
+            // WorldThreadBridge.getChunkAsync already records success/error metrics — do not double-count.
             CompletableFuture<Void> chunkFuture = worldBridge.getChunkAsync(
                 getChunkPreloader().getWorldRegistry().getWorld(worldName),
                 coord.cx, coord.cz, true) // Non-ticking for keepalive
                 .thenRun(() -> {
-                    // Chunk pinged successfully
-                    metrics.recordChunkLoadSuccess(coord.cx, coord.cz, 0);
+                    // Chunk pinged — metrics recorded by WorldThreadBridge
                 })
                 .exceptionally(ex -> {
-                    // Handle chunk ping error
-                    metrics.recordChunkLoadError(coord.cx, coord.cz, 0);
                     LOG.fine("Keepalive chunk ping failed: " + coord.cx + "," + coord.cz + ": " + ex.getMessage());
                     return null;
                 });
-            
+  
             chunkFutures.add(chunkFuture);
         }
         
@@ -158,7 +156,7 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
     
     /**
      * Group chunks by world for batched processing.
-     * 
+     *
      * @param tier Cache tier
      * @return Map of world name to chunk coordinates
      */
@@ -169,17 +167,18 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
         for (PortalEntry entry : entries) {
             if (entry.isInstanced()) continue;
             if (getCacheManager().getZoneTier(entry.getId()) != tier) continue;
-            
+
             String worldName = entry.getWorld();
             List<ChunkCoordinate> worldChunks = result.computeIfAbsent(worldName, k -> new ArrayList<>());
-            
+
             int cx = ChunkPreloader.toChunkCoord(entry.getX());
             int cz = ChunkPreloader.toChunkCoord(entry.getZ());
-            int radius = resolveRadius(entry);
-            
+            int radiusX = resolveRadiusX(entry);
+            int radiusZ = resolveRadiusZ(entry);
+
             // Add all chunks in the zone
-            for (int dx = -radius; dx <= radius; dx++) {
-                for (int dz = -radius; dz <= radius; dz++) {
+            for (int dx = -radiusX; dx <= radiusX; dx++) {
+                for (int dz = -radiusZ; dz <= radiusZ; dz++) {
                     worldChunks.add(new ChunkCoordinate(cx + dx, cz + dz));
                 }
             }
@@ -190,7 +189,7 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
     
     /**
      * Calculate optimal batch size based on current load.
-     * 
+     *
      * @param totalChunks Total number of chunks to process
      * @return Optimal batch size
      */
@@ -210,17 +209,6 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
         
         // Ensure we don't exceed total chunks
         return Math.min(batchSize, totalChunks);
-    }
-    
-    /**
-     * Resolve radius for a portal entry.
-     * 
-     * @param entry Portal entry
-     * @return Radius
-     */
-    private int resolveRadius(PortalEntry entry) {
-        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
-        return getConfig().getDefaultWarmRadius();
     }
     
     /**
