@@ -1,5 +1,114 @@
 # Changelog
 
+## [1.1.1] - 2026-03-21
+
+### Changed
+
+- **Event-driven chunk retention**: Chunks belonging to warm zones are now protected from eviction by an event subscription that fires synchronously before the engine removes a chunk, rather than relying on a periodic keepalive timer. The timer is retained as a belt-and-suspenders fallback at much longer intervals (30 / 60 / 120 minutes for HOT / WARM / COLD, down from 5 / 15 / 60). This eliminates the timing window where a chunk could be evicted between heartbeats.
+
+- **Portal device scanning uses live block components**: Portal block scanning now reads destination world data directly from the block component system rather than relying on indirect resource heuristics. Destination worlds discovered this way are registered as warm zones immediately, and the stored destination world identifier is kept up-to-date as chunks load.
+
+- **Portal destination world validation before preloading**: Before spending chunk budget on a predictive or warm load, the destination portal world is now checked to confirm it is live and has a valid spawn point. Worlds that are still being initialised, have been torn down, or have no spawn configured are skipped cleanly without logging noise. This applies to the approach-based trigger, the movement proximity path, and the startup warm load.
+
+- **Zone chunk coverage tracked across the full zone footprint**: The internal chunk-to-zone index now covers every chunk within a zone's radius, not just the centre chunk. When the server loads any chunk within a registered zone for any reason — player movement, NPC pathfinding, world generation — OptiPortal claims ownership immediately without waiting for a dedicated preload pass. This closes the window where engine-loaded chunks inside a zone boundary could be evicted before OptiPortal noticed them.
+
+- **Preload batch size and delay adapt to server TPS**: When the server is under load, preload batches are automatically halved in size and inter-batch pauses are doubled, reducing the additional pressure OptiPortal places on the world thread during busy periods. Batch sizing reverts to normal as soon as TPS recovers.
+
+- **Zone state cleaned up immediately when a world is removed**: When the server removes a world at runtime, all warm zones belonging to that world are evicted from the chunk ownership registry and tier tracking immediately. Previously, stale zone state could linger until the next server restart, producing misleading counts in status output and keeping references to freed memory alive.
+
+- **World resolution uses stable UUID lookup**: When resolving a destination world for preloading, the plugin now performs a direct UUID lookup via the engine's universe registry before falling back to name-based lookup. This is both faster and more correct when worlds have been recreated under the same name.
+
+### Fixed
+
+- **BUG FIX — Chunk eviction guard referenced incorrect engine API**: The component that prevents owned chunks from being removed from memory referenced several methods that do not exist in the current engine version.
+
+- **BUG FIX — Auto-registered portal zone only protected its centre chunk**: When a portal block was discovered at runtime and automatically registered as a zone, only the single chunk containing the portal was added to the chunk ownership index. Neighbouring chunks within the zone's radius were unprotected until the next server restart, when the full footprint was reconstructed from storage. The full footprint is now indexed immediately on auto-registration.
+
+- **BUG FIX — Warm load validity gate incorrectly blocked portal zones without a destination**: The check that skips preloading into dead or uninitialised portal worlds was applied to all portal-type zones, not just those with an explicit destination world configured. For portal zones with no destination UUID, the gate resolved and validated the zone's own world instead, silently skipping the zone if that world carried a portal resource that was not yet ready. The gate now only runs when a destination world UUID is explicitly set.
+
+- **BUG FIX — TPS-adaptive batch sizing had no effect under the enhanced preloader**: The logic that halves preload batch sizes under low TPS was added to the correct override point but was never reached at runtime, because the enhanced preloader routes all loads through its own internal path rather than the base class pipeline. The adaptive cap is now applied within the enhanced path and correctly reduces batch sizes when the server is under load.
+
+- **BUG FIX — MySQL backend served stale zone data after saves**: When using the MySQL storage backend, saving a zone did not refresh the in-memory zone list. The plugin continued to serve the pre-save state until the next restart, so changes made at runtime — including zone registrations and tier updates — were invisible to the rest of the plugin until it was restarted.
+
+- **BUG FIX — `/preload activation` with no value silently cleared the distance**: Running `/preload activation <id>` without a value argument did not print the usage hint. Instead it silently cleared the per-zone activation distance as if `reset` had been passed, discarding the existing override without any operator confirmation.
+
+- **BUG FIX — `/preload reload` crashed instead of reloading**: The reload command and the automatic config file watcher both crashed at runtime with an internal error rather than reloading `config.json`. No configuration changes took effect without a full server restart.
+
+- **BUG FIX — Plugin failed to start due to missing configuration accessors**: Several configuration values read by the plugin at runtime — including chunk pressure limits, ownership audit interval, per-tier keepalive settings, and portal link decay days — had no corresponding entries in the configuration layer. This caused a build failure preventing the plugin from loading at all.
+
+- **BUG FIX — Load balancer always reported as healthy in diagnostics**: The async infrastructure health check contained a condition that was unconditionally true regardless of actual load balancer state. The load balancer was therefore always shown as healthy in `/preload status` output even when it was not.
+
+- **BUG FIX — Zone load caused excessive storage writes**: Every chunk loaded during a zone preload triggered a separate storage write, producing up to 121 writes for a single zone. All measurements are now batched and written once when the zone finishes loading. Additionally, the actual RAM figure shown in the UI was only reflecting the last chunk loaded rather than the full zone total — this is now accumulated correctly.
+
+- **BUG FIX — Keepalive scanned all zones on every heartbeat**: The keepalive system was re-reading all zones from storage on every heartbeat tick rather than using the already-loaded in-memory list. On servers with many zones this caused unnecessary I/O every few minutes.
+
+- **BUG FIX — Deleting a zone left behind internal tracking state**: When a zone was removed, a stale reference remained in the chunk-tracking index. If the server later loaded a chunk at the old zone's position, the deleted zone would reappear in tier counts and diagnostics. Deleted zones are now fully cleaned up, and any remaining stale references are caught and pruned automatically.
+
+- **BUG FIX — Linked portal not preloaded during player approach**: When a player walked toward a portal with a known link, the destination portal was preloaded but the linked return portal was not. The linked preload was only missing from the movement-based detection path — the fix brings it in line with the rest of the preload logic.
+
+- **BUG FIX — Predictive preload radius was not configurable**: The radius used for death-location and respawn preloads was hardcoded and ignored the configured value. It now reads correctly from `config.json`.
+
+- **BUG FIX — Plugin log output bypassed server log level**: Some startup and configuration messages were written directly to stdout/stderr, bypassing the server's configured log level. All output now goes through the standard logging system.
+
+- **BUG FIX — API zone registration used wrong world**: When another plugin registered a warm zone via the OptiPortal API, the zone was always created in a world named "default" regardless of what world was intended. The API now requires the world name to be supplied explicitly. (**Breaking change** for API callers — add the world name argument.)
+
+- **BUG FIX — Chunk loading used incorrect API signature**: The async chunk loading methods expect a single packed `long` chunk index. Several call sites were passing two separate `int` coordinates, which is not a valid overload. All affected call sites now produce the correct packed index via the standard chunk utility.
+
+- **BUG FIX — CorridorIndex calculated chunk coordinates with wrong chunk size**: Waypoint world-space coordinates were divided by an incorrect chunk width constant, causing every corridor chunk boundary to be computed against the wrong grid. Corridor prioritisation was therefore targeting the wrong chunks entirely. The conversion now uses the engine-provided utility, which applies the correct chunk size.
+
+- **BUG FIX — Zone list loaded on the world thread when opening the admin UI**: Opening the admin UI panel triggered a storage query on the world thread, causing a measurable stall whenever the command was used. The query now runs before the world thread is involved, and the result is passed in directly.
+
+- **BUG FIX — Actual RAM column showed inconsistent values across zones**: Two code paths wrote the same field using different formulas and no guaranteed ordering, so whichever ran last would win. Values from previous server sessions also persisted in the database, meaning the column could reflect a measurement from an entirely different version of the plugin. The competing path has been removed; all zones now use a single consistent formula based on chunk count and the configurable bytes-per-chunk value.
+
+- **BUG FIX — Keepalive config used wrong structure**: The default config file used a flat layout for keepalive settings that did not match the nested object structure the parser expected, causing the plugin to crash on startup if the config had not been manually edited. The parser now accepts both layouts for compatibility with existing deployments.
+
+### Added
+
+- **Per-zone horizontal activation distance**: Zones can now have their own horizontal trigger radius, set with `/preload activation <id> <distance>`. Use `/preload activation <id> reset` to revert to the global default. Previously only the vertical distance supported per-zone overrides.
+
+- **/preload zone command**: New diagnostic subcommand that prints the full details for a single zone — tier, strategy, radius, activation distances, TTL, RAM estimates, linked portal, last-active time, and preload count. Useful for inspecting a zone without reading data files directly.
+
+- **/preload delete command**: Permanently removes a zone and cleans up all associated state — chunk ownership, cache tier, portal links, and the in-memory cache. Previously, auto-registered zones could only be removed by manually editing data files and restarting.
+
+- **/preload flush command**: Forces all zones to be re-evaluated and written to storage with freshly calculated RAM estimates. Useful after changing `bytesPerChunk` or upgrading from a version where stored RAM values were inaccurate.
+
+### Configuration
+
+New `config.json` fields (all optional, defaults apply if absent):
+
+- `bytesPerChunk` — estimated memory per loaded chunk in bytes, used to calculate the ACTUAL RAM column (default: `98304` = 96 KB)
+- `activation.predictiveRadius` — radius in chunks for predictive preloads (default: `7`)
+- `decay.hotDecaySeconds` — seconds before HOT zones decay to WARM (default: `30`)
+- `decay.warmDecayMinutes` — minutes before WARM zones decay to COLD (default: `45`)
+- `decay.pollIntervalSeconds` — interval for zone tier polling (default: `1`)
+- `portalLinks.confidenceThreshold` — observations required to confirm a portal link (default: `5`)
+
+---
+
+## [1.1.0] - 2026-03-20
+
+### Fixed
+
+- **BUG FIX — Death/respawn preload radius ignored config**: The preload radius for death and respawn locations was hardcoded to 7 chunks and did not reflect the configured value. All preload paths now use the same radius setting.
+
+- **BUG FIX — Per-zone vertical activation distance ignored during staggered updates**: Per-zone vertical override set via `/preload` was only respected on the synchronous proximity path. The async staggered-update path used the global value for all portals regardless of overrides.
+
+- **BUG FIX — Disconnected player tracking entries not fully cleaned up**: On disconnect, several internal player tracking entries were left behind and accumulated over time. All tracking state for a player is now cleared atomically on removal.
+
+### Added
+
+- **TTL eviction now works for all zone types**: Expiry settings were stored correctly but had no effect on portal zones or respawn entries because last-activity timestamps were never recorded for them. Activity is now stamped on each preload and warm load, so TTL eviction runs correctly across all entry types.
+
+- **Plugin log output respects server log level**: Internal messages were being written directly to stdout/stderr, bypassing the server's configured log level. All output now goes through the standard logging system and is consistently prefixed.
+
+- **/preload status**: New subcommand showing async infrastructure health at a glance — circuit breaker state, load balancer activity, TPS, loaded chunk count, and zone tier distribution. Useful for diagnosing preload suppression under server load.
+
+- **/preload links**: New subcommand listing all confirmed portal links and pending candidates with their observation counts. Supports `/preload links remove <id>` to delete a wrong link and `/preload links clear-pending` to discard all unconfirmed candidates. Previously, correcting wrong links required manual JSON editing and a server restart.
+
+- **/preload ttl**: New subcommand to set per-zone TTL overrides from the command line without editing portal-data.json. Accepts a day count, `-1` for never-expire, or `reset` to revert to the global default for that zone type.
+
+---
+
 ## [1.0.9] - 2026-03-20
 
 ### Added

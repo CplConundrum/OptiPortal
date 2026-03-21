@@ -114,6 +114,11 @@ $C.@Container {
 
     Label #CommandRef2 {
       Style: (FontSize: 11);
+      Anchor: (Horizontal: 12, Top: 4, Bottom: 4);
+    }
+
+    Label #CommandRef3 {
+      Style: (FontSize: 11);
       Anchor: (Horizontal: 12, Top: 4, Bottom: 8);
     }
 

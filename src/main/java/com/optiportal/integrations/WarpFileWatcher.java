@@ -13,6 +13,7 @@ import java.util.Set;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Logger;
 import java.util.stream.Collectors;
 
 import com.google.gson.Gson;
@@ -37,6 +38,8 @@ import com.optiportal.storage.StorageBackend;
  * Runs fully async - world thread is never touched.
  */
 public class WarpFileWatcher {
+
+    private static final Logger LOG = Logger.getLogger("OptiPortal");
 
     private final PluginConfig config;
     private final StorageBackend storage;
@@ -94,7 +97,7 @@ public class WarpFileWatcher {
             syncWarps(warps);
             return warps.size();
         } catch (Exception e) {
-            System.err.println("[OptiPortal] Failed to sync warps.json: " + e.getMessage());
+            LOG.warning("[OptiPortal] Failed to sync warps.json: " + e.getMessage());
             return 0;
         }
     }
@@ -162,7 +165,7 @@ public class WarpFileWatcher {
             List<PortalEntry> warps = parseWarpsFile(warpsFile);
             syncWarps(warps);
         } catch (Exception e) {
-            System.err.println("[OptiPortal] Failed to sync warps.json: " + e.getMessage());
+            LOG.warning("[OptiPortal] Failed to sync warps.json: " + e.getMessage());
         }
     }
 
@@ -209,7 +212,7 @@ public class WarpFileWatcher {
                 // New warp - register with default strategy
                 incoming.setStrategy(WarmStrategy.PREDICTIVE);
                 storage.save(incoming);
-                System.out.println("[OptiPortal] New warp registered: " + incoming.getId()
+                LOG.info("[OptiPortal] New warp registered: " + incoming.getId()
                         + " [" + incoming.getX() + ", " + incoming.getY() + ", " + incoming.getZ() + "] → PREDICTIVE");
             } else {
                 // Check if coordinates changed
@@ -220,7 +223,7 @@ public class WarpFileWatcher {
                     ex.setZ(incoming.getZ());
                     ex.setYaw(incoming.getYaw());
                     storage.save(ex);
-                    System.out.println("[OptiPortal] Warp moved, cache purged: " + incoming.getId());
+                    LOG.info("[OptiPortal] Warp moved, cache purged: " + incoming.getId());
                 }
             }
         }
@@ -233,7 +236,7 @@ public class WarpFileWatcher {
                 PortalEntry ex = existing.get(existingId);
                 if (ex != null && ex.getType() == PortalEntry.EntryType.PORTAL) {
                     storage.delete(existingId);
-                    System.out.println("[OptiPortal] Warp removed: " + existingId);
+                    LOG.info("[OptiPortal] Warp removed: " + existingId);
                 }
             }
         }

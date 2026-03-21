@@ -23,6 +23,8 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonPrimitive;
 import com.google.gson.JsonSerializer;
+import java.util.logging.Logger;
+
 import com.optiportal.config.PluginConfig;
 import com.optiportal.model.PortalEntry;
 
@@ -32,6 +34,8 @@ import com.optiportal.model.PortalEntry;
  * Uses WAL-safe write pattern: write to .tmp, rename atomically.
  */
 public class JsonStorageBackend implements StorageBackend {
+
+    private static final Logger LOG = Logger.getLogger("OptiPortal");
 
     private static final Gson GSON = new GsonBuilder()
             .setPrettyPrinting()
@@ -102,15 +106,15 @@ public class JsonStorageBackend implements StorageBackend {
                 }
             }
         } catch (Exception e) {
-            System.err.println("[OptiPortal] Failed to read portal-data.json: " + e.getMessage());
+            LOG.warning("[OptiPortal] Failed to read portal-data.json: " + e.getMessage());
             // Attempt bak recovery
             if (bakFile.exists()) {
-                System.err.println("[OptiPortal] Attempting recovery from backup...");
+                LOG.warning("[OptiPortal] Attempting recovery from backup...");
                 try {
                     Files.copy(bakFile.toPath(), dataFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
                     loadFromDisk();
                 } catch (Exception ex) {
-                    System.err.println("[OptiPortal] Backup recovery failed: " + ex.getMessage());
+                    LOG.warning("[OptiPortal] Backup recovery failed: " + ex.getMessage());
                 }
             }
         }
@@ -201,7 +205,7 @@ public class JsonStorageBackend implements StorageBackend {
             Files.move(tmpFile.toPath(), dataFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
 
         } catch (IOException e) {
-            System.err.println("[OptiPortal] Failed to flush portal-data.json: " + e.getMessage());
+            LOG.warning("[OptiPortal] Failed to flush portal-data.json: " + e.getMessage());
         }
     }
 }

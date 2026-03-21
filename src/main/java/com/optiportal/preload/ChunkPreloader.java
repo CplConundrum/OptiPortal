@@ -135,7 +135,8 @@ public class ChunkPreloader {
             return CompletableFuture.completedFuture(null);
         }
         // Dedup: register ownership for already-loaded chunks, only load new ones
-        List<int[]> allChunks = buildChunkList(cx, cz, radius);
+        // Use density-sorted list so resident chunks are claimed first at zero IO cost (H5)
+        List<int[]> allChunks = buildChunkListWithDensity(worldName, cx, cz, radius);
         List<int[]> toLoad = new ArrayList<>();
         for (int[] coord : allChunks) {
             if (cacheManager.isChunkOwned(worldName, coord[0], coord[1])) {
@@ -209,6 +210,33 @@ public class ChunkPreloader {
      */
     public CompletableFuture<Void> warmLoad(String zoneId, String worldName, int cx, int cz, int radius) {
         return warmLoad(zoneId, worldName, cx, cz, radius, radius);
+    }
+
+    /**
+     * WARM load resolving the world via UUID first (H7), then falling back to name.
+     * Use this overload when loading from a PortalEntry that may carry a destinationWorldUuid.
+     */
+    public CompletableFuture<Void> warmLoad(com.optiportal.model.PortalEntry entry,
+                                             int cx, int cz, int radiusX, int radiusZ) {
+        World world = worldRegistry.resolveWorld(entry.getDestinationWorldUuid(), entry.getWorld());
+        if (world == null) {
+            LOG.warning("[OptiPortal] warmLoad(PortalEntry): world not found for entry: " + entry.getId());
+            return CompletableFuture.completedFuture(null);
+        }
+        return warmLoad(entry.getId(), world.getName(), cx, cz, radiusX, radiusZ);
+    }
+
+    /**
+     * PREDICTIVE load resolving the world via UUID first (H7), then falling back to name.
+     */
+    public CompletableFuture<Void> predictiveLoad(com.optiportal.model.PortalEntry entry,
+                                                   int cx, int cz, int radius) {
+        World world = worldRegistry.resolveWorld(entry.getDestinationWorldUuid(), entry.getWorld());
+        if (world == null) {
+            LOG.warning("[OptiPortal] predictiveLoad(PortalEntry): world not found for entry: " + entry.getId());
+            return CompletableFuture.completedFuture(null);
+        }
+        return predictiveLoad(entry.getId(), world.getName(), cx, cz, radius);
     }
 
     /**
@@ -326,11 +354,15 @@ public class ChunkPreloader {
     }
 
     /**
-     * Builds chunk list sorted by density priority.
-     * This provides better prioritization than simple distance-based sorting.
+     * Builds a chunk list sorted by:
+     *   1. Chebyshev distance from centre (inner-first — unchanged)
+     *   2. Already-resident chunks first within the same ring (zero load cost)
+     *   3. Chunks on failure backoff last (will be skipped in loadChunks anyway)
+     *
+     * This replaces the placeholder that returned the same order as buildChunkList().
      */
     private List<int[]> buildChunkListWithDensity(String worldName, int cx, int cz, int radius) {
-        // Create list of all chunks in the area
+        World world = worldRegistry.getWorld(worldName);
         List<int[]> chunks = new ArrayList<>((2 * radius + 1) * (2 * radius + 1));
         for (int dx = -radius; dx <= radius; dx++) {
             for (int dz = -radius; dz <= radius; dz++) {
@@ -338,24 +370,45 @@ public class ChunkPreloader {
             }
         }
 
-        // Sort by density priority - this would normally use HytaleServer's density functions
-        // For now, we'll implement a basic version that demonstrates the concept
         chunks.sort((c1, c2) -> {
-            // Calculate distance from center (lower = closer)
-            int dist1 = Math.max(Math.abs(c1[0] - cx), Math.abs(c1[1] - cz));
-            int dist2 = Math.max(Math.abs(c2[0] - cx), Math.abs(c2[1] - cz));
-  
-            // Primary sort: distance from center (closer first)
-            if (dist1 != dist2) {
-                return Integer.compare(dist1, dist2);
-            }
+            // Primary: Chebyshev distance — inner chunks first
+            int d1 = Math.max(Math.abs(c1[0] - cx), Math.abs(c1[1] - cz));
+            int d2 = Math.max(Math.abs(c2[0] - cx), Math.abs(c2[1] - cz));
+            if (d1 != d2) return Integer.compare(d1, d2);
 
-            // Secondary sort: for chunks at same distance, prioritize based on some heuristic
-            // In a real implementation, this would use HytaleServer's density functions
-            return 0; // Placeholder - in reality this would be more complex
+            if (world != null) {
+                long idx1 = ChunkUtil.indexChunk(c1[0], c1[1]);
+                long idx2 = ChunkUtil.indexChunk(c2[0], c2[1]);
+
+                // Secondary: resident chunks first — claiming ownership costs zero IO
+                boolean bo1 = world.getChunkStore().isChunkOnBackoff(
+                        idx1, ChunkStore.MAX_FAILURE_BACKOFF_NANOS);
+                boolean bo2 = world.getChunkStore().isChunkOnBackoff(
+                        idx2, ChunkStore.MAX_FAILURE_BACKOFF_NANOS);
+
+                // Tertiary: backoff chunks last — they will be skipped in loadChunks
+                if (bo1 != bo2) return bo1 ? 1 : -1;
+            }
+            return 0;
         });
-        
+
         return chunks;
+    }
+
+    /**
+     * Returns the effective batch size for chunk loading.
+     * Overridden by {@link EnhancedChunkPreloader} to apply TPS-adaptive scaling.
+     */
+    protected int getEffectiveBatchSize(String worldName) {
+        return config.getWarmBatchSize();
+    }
+
+    /**
+     * Returns the effective inter-batch delay in milliseconds.
+     * Overridden by {@link EnhancedChunkPreloader} to apply TPS-adaptive scaling.
+     */
+    protected int getEffectiveBatchDelay(String worldName) {
+        return config.getWarmBatchDelayMs();
     }
 
     // -------------------------------------------------------------------------
@@ -367,6 +420,11 @@ public class ChunkPreloader {
 
     public static int toChunkCoord(double worldCoord) {
         return ChunkUtil.chunkCoordinate(worldCoord);
+    }
+
+    /** Pack (chunkX, chunkZ) into a single long for use as a map key. */
+    public static long packChunk(int cx, int cz) {
+        return ((long) cx << 32) | ((long) cz & 0xFFFFFFFFL);
     }
 
     // -------------------------------------------------------------------------
@@ -446,8 +504,8 @@ public class ChunkPreloader {
             }
         }
 
-        int batchSize  = config.getWarmBatchSize();   // default 4
-        int batchDelay = config.getWarmBatchDelayMs(); // default 250
+        int batchSize  = getEffectiveBatchSize(world.getName());
+        int batchDelay = getEffectiveBatchDelay(world.getName());
 
         // Build list of batches
         List<List<int[]>> batches = new java.util.ArrayList<>();
@@ -481,8 +539,8 @@ public class ChunkPreloader {
                         // for all chunks; the engine returns a completed future for already-
                         // resident chunks without a disk hop.
                         CompletableFuture<WorldChunk> base = nonTicking
-                                ? world.getNonTickingChunkAsync(cx, cz)
-                                : world.getChunkAsync(cx, cz);
+                                ? world.getNonTickingChunkAsync(ChunkUtil.indexChunk(cx, cz))
+                                : world.getChunkAsync(ChunkUtil.indexChunk(cx, cz));
                         futures[i] = base.thenApply(chunk -> {
                             if (chunk != null && finalZoneId != null) {
                                 cacheManager.registerOwnership(finalZoneId,

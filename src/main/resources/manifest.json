@@ -1,7 +1,7 @@
 {
   "Group": "Cpl",
   "Name": "OptiPortal",
-  "Version": "1.0.9",
+  "Version": "1.1.1",
   "Main": "com.optiportal.OptiPortal",
   "Description": "Optimizes server performance via intelligent warp zone pre-loading, chunk caching, and deduplication.",
   "Authors": [

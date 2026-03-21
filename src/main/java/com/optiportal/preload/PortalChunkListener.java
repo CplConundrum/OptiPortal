@@ -5,10 +5,12 @@ import java.util.logging.Logger;
 
 import com.hypixel.hytale.builtin.portals.PortalsPlugin;
 import com.hypixel.hytale.builtin.portals.components.PortalDevice;
+import com.hypixel.hytale.server.core.modules.block.BlockModule;
 import com.hypixel.hytale.server.core.universe.world.World;
 import com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk;
 import com.hypixel.hytale.server.core.universe.world.events.ChunkPreLoadProcessEvent;
 import com.optiportal.cache.CacheManager;
+import com.optiportal.config.PluginConfig;
 import com.optiportal.model.CacheTier;
 import com.optiportal.model.PortalEntry;
 import com.optiportal.model.WarmStrategy;
@@ -36,20 +38,22 @@ public class PortalChunkListener {
     private final StorageBackend storage;
     private final CacheManager cacheManager;
     private final WarmZoneManager warmZoneManager;
+    private final PluginConfig config;
 
     /**
      * Reverse index: worldName → (packed chunkIndex → zoneId).
-     * Built at construction from storage, updated when new portal devices are
-     * auto-registered. Replaces the O(n) full-scan in promoteColdZones().
+     * Covers the full zone footprint (all chunks within radius), not just the centre.
+     * Built at construction from storage, updated when new portal devices are auto-registered.
      */
     private final ConcurrentHashMap<String, ConcurrentHashMap<Long, String>> reverseIndex
             = new ConcurrentHashMap<>();
 
     public PortalChunkListener(StorageBackend storage, CacheManager cacheManager,
-                               WarmZoneManager warmZoneManager) {
+                               WarmZoneManager warmZoneManager, PluginConfig config) {
         this.storage = storage;
         this.cacheManager = cacheManager;
         this.warmZoneManager = warmZoneManager;
+        this.config = config;
         buildReverseIndex();
     }
 
@@ -58,19 +62,42 @@ public class PortalChunkListener {
         return ((long) cx << 32) | ((long) cz & 0xFFFFFFFFL);
     }
 
-    /** Build the reverse index from all entries currently in storage. */
+    /**
+     * Build the reverse index from all entries currently in storage.
+     * Indexes every chunk in each zone's full footprint (H4) so that ownership
+     * can be registered for any chunk the engine loads within a warm zone.
+     */
     private void buildReverseIndex() {
         int count = 0;
+        int defaultRadius = config.getDefaultWarmRadius();
         for (PortalEntry entry : storage.loadAll()) {
             if (entry.isInstanced()) continue;
             int cx = ChunkPreloader.toChunkCoord(entry.getX());
             int cz = ChunkPreloader.toChunkCoord(entry.getZ());
-            reverseIndex.computeIfAbsent(entry.getWorld(), k -> new ConcurrentHashMap<>())
-                        .put(packChunk(cx, cz), entry.getId());
+            int rx = entry.resolvedRadiusX(defaultRadius);
+            int rz = entry.resolvedRadiusZ(defaultRadius);
+            ConcurrentHashMap<Long, String> worldIndex =
+                    reverseIndex.computeIfAbsent(entry.getWorld(), k -> new ConcurrentHashMap<>());
+            for (int dx = -rx; dx <= rx; dx++) {
+                for (int dz = -rz; dz <= rz; dz++) {
+                    // putIfAbsent: smaller-radius zone that already owns a chunk takes priority
+                    worldIndex.putIfAbsent(packChunk(cx + dx, cz + dz), entry.getId());
+                }
+            }
             count++;
         }
         final int finalCount = count;
-        LOG.fine(() -> "[OptiPortal] PortalChunkListener: reverse index built with " + finalCount + " entries");
+        LOG.fine(() -> "[OptiPortal] PortalChunkListener: reverse index built for " + finalCount + " zones");
+    }
+
+    /**
+     * Resolve the zone ID that owns the given chunk, or null if none.
+     * O(1) lookup against the pre-built reverse index.
+     */
+    private String resolveZoneForChunk(String worldName, int cx, int cz) {
+        ConcurrentHashMap<Long, String> worldIndex = reverseIndex.get(worldName);
+        if (worldIndex == null) return null;
+        return worldIndex.get(packChunk(cx, cz));
     }
 
     /**
@@ -82,6 +109,9 @@ public class PortalChunkListener {
     public void register(World world) {
         world.getEventRegistry().<String, ChunkPreLoadProcessEvent>registerGlobal(
                 ChunkPreLoadProcessEvent.class, this::onChunkPreLoad);
+
+        // H1: register event-driven chunk unload guard for this world
+        new ChunkUnloadGuard(cacheManager, world).register();
     }
 
     // -------------------------------------------------------------------------
@@ -99,7 +129,20 @@ public class PortalChunkListener {
         autoRegisterPortalDevice(event, world, chunkX, chunkZ);
 
         // ── Task 2: COLD→WARM promotion for known zones ───────────────────────
-        promoteColdZones(world.getName(), chunkX, chunkZ);
+        promoteColdZones(world, chunkX, chunkZ);
+
+        // ── Task 3: event-driven ownership registration (H4) ─────────────────
+        // Covers chunks loaded by the engine outside of OptiPortal's explicit requests
+        // (player movement, NPC pathfinding, etc.) so ChunkUnloadGuard can protect them.
+        String worldName = world.getName();
+        if (!cacheManager.isChunkOwned(worldName, chunkX, chunkZ)) {
+            String owningZone = resolveZoneForChunk(worldName, chunkX, chunkZ);
+            if (owningZone != null) {
+                cacheManager.registerOwnership(owningZone, worldName, chunkX, chunkZ, chunk);
+                LOG.fine(() -> "[OptiPortal] Event-driven ownership: (" + chunkX + ", " + chunkZ
+                        + ") in " + worldName + " → zone " + owningZone);
+            }
+        }
     }
 
     /**
@@ -132,9 +175,17 @@ public class PortalChunkListener {
         entry.setType(PortalEntry.EntryType.MANUAL);
         storage.save(entry);
 
-        // Keep reverse index in sync with new auto-registered zone
-        reverseIndex.computeIfAbsent(world.getName(), k -> new ConcurrentHashMap<>())
-                    .put(packChunk(chunkX, chunkZ), zoneId);
+        // Keep reverse index in sync with new auto-registered zone (full footprint, not just centre)
+        int defaultRadius = config.getDefaultWarmRadius();
+        int rx = entry.resolvedRadiusX(defaultRadius);
+        int rz = entry.resolvedRadiusZ(defaultRadius);
+        ConcurrentHashMap<Long, String> worldIdx =
+                reverseIndex.computeIfAbsent(world.getName(), k -> new ConcurrentHashMap<>());
+        for (int dx = -rx; dx <= rx; dx++) {
+            for (int dz = -rz; dz <= rz; dz++) {
+                worldIdx.putIfAbsent(packChunk(chunkX + dx, chunkZ + dz), zoneId);
+            }
+        }
 
         // Exempt from decay if this portal's world is eternal
         if (!world.getWorldConfig().canUnloadChunks()) {
@@ -151,18 +202,53 @@ public class PortalChunkListener {
     }
 
     /**
-     * When any chunk loads, check if its position matches the centre chunk of a
-     * registered zone and promote COLD/UNVISITED zones to WARM.
-     *
-     * Uses the pre-built reverse index for O(1) lookup instead of scanning all
-     * stored portal entries on every chunk load event.
+     * When any chunk loads, check if its position matches a chunk in a registered
+     * zone and promote COLD/UNVISITED zones to WARM. Also reads the PortalDevice
+     * component to confirm/update the destination world UUID and auto-register the
+     * destination warm zone if not yet present.
      */
-    private void promoteColdZones(String worldName, int chunkX, int chunkZ) {
+    private void promoteColdZones(World world, int chunkX, int chunkZ) {
+        String worldName = world.getName();
         ConcurrentHashMap<Long, String> worldIndex = reverseIndex.get(worldName);
         if (worldIndex == null) return;
 
-        String zoneId = worldIndex.get(packChunk(chunkX, chunkZ));
+        long key = packChunk(chunkX, chunkZ);
+        String zoneId = worldIndex.get(key);
         if (zoneId == null) return;
+
+        // Guard against stale entries left by zones deleted without calling removeFromIndex
+        java.util.Optional<PortalEntry> entryOpt = storage.loadById(zoneId);
+        if (entryOpt.isEmpty()) {
+            worldIndex.remove(key);
+            return;
+        }
+        PortalEntry entry = entryOpt.get();
+
+        // H2: read PortalDevice component directly to confirm/update destination UUID
+        if (entry.getType() == PortalEntry.EntryType.PORTAL) {
+            try {
+                PortalDevice device = (PortalDevice) BlockModule.getComponent(
+                        PortalDevice.getComponentType(),
+                        world,
+                        (int) entry.getX(),
+                        (int) entry.getY(),
+                        (int) entry.getZ());
+                if (device != null) {
+                    java.util.UUID destUuid = device.getDestinationWorldUuid();
+                    if (destUuid != null && !destUuid.equals(entry.getDestinationWorldUuid())) {
+                        entry.setDestinationWorldUuid(destUuid);
+                        storage.save(entry);
+                        LOG.info("[OptiPortal] Updated destination UUID for zone " + zoneId + " → " + destUuid);
+                    }
+                    World destWorld = device.getDestinationWorld();
+                    if (destWorld != null && !warmZoneManager.hasDestinationZone(destWorld.getName())) {
+                        warmZoneManager.registerPortalDestination(destWorld);
+                    }
+                }
+            } catch (Exception ignored) {
+                // PortalDevice component not available — chunk may not carry the block
+            }
+        }
 
         CacheTier current = cacheManager.getZoneTier(zoneId);
         if (current == CacheTier.COLD || current == CacheTier.UNVISITED) {
@@ -170,5 +256,28 @@ public class PortalChunkListener {
             LOG.fine(() -> "[OptiPortal] PortalChunkListener: promoted zone "
                     + zoneId + " from " + current + " → WARM (server loaded chunk)");
         }
+    }
+
+    /**
+     * Remove a zone from the reverse index when it is deleted.
+     *
+     * @param zoneId Zone ID to remove
+     */
+    public void removeFromIndex(String zoneId) {
+        for (ConcurrentHashMap<Long, String> worldIndex : reverseIndex.values()) {
+            worldIndex.entrySet().removeIf(entry -> entry.getValue().equals(zoneId));
+        }
+        LOG.fine(() -> "[OptiPortal] PortalChunkListener: removed zone " + zoneId + " from reverse index");
+    }
+
+    /**
+     * Called when a world is destroyed (RemoveWorldEvent via H6).
+     * Clears the reverse index for that world so lookups don't reference dead chunks.
+     * The zone definitions remain in storage; the index is rebuilt when the world re-registers.
+     */
+    public void onWorldRemoved(com.hypixel.hytale.server.core.universe.world.World world) {
+        String worldName = world.getName();
+        reverseIndex.remove(worldName);
+        LOG.fine("[OptiPortal] PortalChunkListener: cleared reverseIndex for removed world: " + worldName);
     }
 }

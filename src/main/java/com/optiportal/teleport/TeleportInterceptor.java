@@ -77,7 +77,7 @@ public class TeleportInterceptor {
     private final Set<UUID> pendingRespawnCapture = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
     /** Separate cooldown for reverse preloads — independent of proximity cooldown. */
-    private final ConcurrentHashMap<String, Long> reversePreloadCooldowns = new ConcurrentHashMap<>();
+    protected final ConcurrentHashMap<String, Long> reversePreloadCooldowns = new ConcurrentHashMap<>();
 
     // Cooldown tracking: playerId → zoneId → last trigger time ms
     // Prevents re-triggering the same zone preload repeatedly
@@ -135,6 +135,16 @@ public class TeleportInterceptor {
     protected ChunkPreloader getChunkPreloader() {
         return chunkPreloader;
     }
+
+    protected com.optiportal.preload.PortalLinkRegistry getPortalLinkRegistry() {
+        return portalLinkRegistry;
+    }
+
+    /**
+     * Refreshes the in-memory portal cache from storage.
+     * No-op on the base class; overridden by AsyncTeleportInterceptor.
+     */
+    public void refreshPortalCache() {}
 
     /**
      * Returns all portal entries for proximity checks.
@@ -382,13 +392,15 @@ public class TeleportInterceptor {
      * Check proximity to all portals and trigger preload if within activation distance.
      */
     private void checkProximityAndPreload(UUID playerUuid, String worldName, double px, double py, double pz) {
-        double maxDist = config.getActivationDistance();
-
         for (com.optiportal.model.PortalEntry entry : getAllPortalEntries()) {
             if (entry.isInstanced()) continue;
             if (!entry.getWorld().equals(worldName)) continue;
             if (entry.getId().contains(":")) continue; // skip death:, respawn:, etc.
 
+            // Per-zone horizontal override; falls back to global config
+            double maxDist = (entry.getActivationDistanceHorizontal() != null)
+                    ? entry.getActivationDistanceHorizontal()
+                    : config.getActivationDistance();
             // Vertical bound with per-zone override support
             double vertBound = (entry.getActivationDistanceVertical() != null)
                     ? entry.getActivationDistanceVertical()
@@ -418,6 +430,10 @@ public class TeleportInterceptor {
             } else {
                 // PREDICTIVE: cooldown guards chunk load
                 if (isOnCooldown(null, id)) continue;
+                // H3: skip if destination portal world is dead or has no spawn
+                World destWorld = chunkPreloader.getWorldRegistry()
+                        .resolveWorld(entry.getDestinationWorldUuid(), worldName);
+                if (!com.optiportal.preload.WarmZoneManager.isPortalWorldUsable(destWorld)) continue;
                 recordCooldown(null, id);
                 LOG.fine("[OptiPortal] Proximity PREDICTIVE: " + id
                     + " dist=" + String.format("%.1f", horizDist) + " → load cx=" + cx + " cz=" + cz);
@@ -837,6 +853,7 @@ public class TeleportInterceptor {
                     if (opt.isPresent()) {
                         com.optiportal.model.PortalEntry e = opt.get();
                         e.setRamEstimatedMB(estimatedMB);
+                        e.setLastActive(java.time.Instant.now());
                         // updateEntryStats sets ramMarginalMB from config.getBytesPerChunk() too
                         chunkPreloader.updateEntryStats(e, chunkCount);
                         storage.save(e);

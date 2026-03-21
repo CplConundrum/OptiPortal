@@ -10,6 +10,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
+import com.hypixel.hytale.builtin.portals.resources.PortalWorld;
 import com.hypixel.hytale.server.core.universe.PlayerRef;
 import com.hypixel.hytale.server.core.universe.world.World;
 import com.optiportal.OptiPortal;
@@ -151,7 +152,7 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
     /**
      * Get the current portal cache (thread-safe read).
      */
-    private List<PortalEntry> getPortalCache() {
+    public List<PortalEntry> getPortalCache() {
         return portalCache;
     }
     
@@ -286,11 +287,35 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
                 if (tier != CacheTier.HOT) {
                     getPlugin().getCacheManager().setZoneTier(portal.getId(), CacheTier.HOT);
                 }
-                continue;
+            } else {
+                // COLD or UNVISITED — chunks absent, trigger load
+                if (!isOnCooldown(playerId, portal.getId())) {
+                    triggerAsyncPreload(portal, playerId);
+                }
             }
-            // COLD or UNVISITED — chunks absent, trigger load
-            if (!isOnCooldown(playerId, portal.getId())) {
-                triggerAsyncPreload(portal, playerId);
+
+            // Also preload the portal linked to this one (e.g. the return trip)
+            String linkedId = getPortalLinkRegistry().getLinkedPortal(portal.getId());
+            if (linkedId != null) {
+                long now = System.currentTimeMillis();
+                boolean shouldFire = reversePreloadCooldowns.compute(linkedId, (k, last) ->
+                        (last == null || now - last >= 30_000L) ? now : last) == now;
+                if (shouldFire) {
+                    getStorage().loadById(linkedId).ifPresent(linked -> {
+                        loadBalancer.scheduleLoad(() ->
+                            getChunkPreloader().predictiveLoad(
+                                linkedId, linked.getWorld(),
+                                ChunkPreloader.toChunkCoord(linked.getX()),
+                                ChunkPreloader.toChunkCoord(linked.getZ()),
+                                resolveRadius(linked)),
+                            AsyncMetrics.AsyncTaskPriority.HIGH)
+                        .whenComplete((r, ex) -> {
+                            if (ex != null)
+                                LOG.warning("[OptiPortal] Linked async preload failed for "
+                                        + linkedId + ": " + ex.getMessage());
+                        });
+                    });
+                }
             }
         }
     }
@@ -305,8 +330,7 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
      */
     private List<PortalEntry> getNearbyPortals(String worldName, double x, double y, double z) {
         List<PortalEntry> nearby = new ArrayList<>();
-        double rH = getPluginConfig().getActivationDistance();
-        double rV = getPluginConfig().getActivationDistanceVertical();
+        double globalR = getPluginConfig().getActivationDistance();
         String globalShape = getPluginConfig().getActivationShape();
         List<PortalEntry> cache = getPortalCache();
 
@@ -315,6 +339,14 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
             if (!entry.getWorld().equals(worldName)) continue;
             if (entry.getId().contains(":")) continue;
 
+            // Per-zone horizontal activation distance override (F1)
+            double rH = (entry.getActivationDistanceHorizontal() != null)
+                    ? entry.getActivationDistanceHorizontal()
+                    : globalR;
+            
+            double rV = (entry.getActivationDistanceVertical() != null)
+                    ? entry.getActivationDistanceVertical()
+                    : getPluginConfig().getActivationDistanceVertical();
             double dx = entry.getX() - x;
             double dy = entry.getY() - y;
             double dz = entry.getZ() - z;
@@ -340,22 +372,48 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
      * @param playerId Player ID
      */
     private void triggerAsyncPreload(PortalEntry portal, UUID playerId) {
+        // H3: resolve destination world and validate it before wasting chunk budget
+        World destWorld = getChunkPreloader().getWorldRegistry()
+                .resolveWorld(portal.getDestinationWorldUuid(), portal.getWorld());
+
+        if (!WarmZoneManager.isPortalWorldUsable(destWorld)) {
+            LOG.fine("[OptiPortal] triggerAsyncPreload: skipping invalid portal world for zone "
+                    + portal.getId());
+            return;
+        }
+
+        // H3: skip if the player has already died in this portal world (they will see death UI)
+        if (destWorld != null && playerId != null) {
+            try {
+                PortalWorld pw = destWorld.getEntityStore()
+                        .getStore().getResource(PortalWorld.getResourceType());
+                if (pw != null && pw.getDiedInWorld().contains(playerId)) {
+                    LOG.fine("[OptiPortal] triggerAsyncPreload: player " + playerId
+                            + " died in portal world — skipping predictive load for " + portal.getId());
+                    return;
+                }
+            } catch (Exception ignored) {
+                // Not a portal world resource — proceed normally
+            }
+        }
+
         // Record cooldown
         recordCooldown(playerId, portal.getId());
-        
+
         // Schedule preload with proper priority and error handling
-        loadBalancer.scheduleLoad(() -> {
-            return getChunkPreloader().predictiveLoad(
-                portal.getId(), portal.getWorld(), 
+        // Uses PortalEntry overload for UUID-keyed world resolution (H7)
+        loadBalancer.scheduleLoad(() ->
+            getChunkPreloader().predictiveLoad(
+                portal,
                 ChunkPreloader.toChunkCoord(portal.getX()),
                 ChunkPreloader.toChunkCoord(portal.getZ()),
-                resolveRadius(portal));
-        }, AsyncMetrics.AsyncTaskPriority.HIGH)
+                resolveRadius(portal)),
+        AsyncMetrics.AsyncTaskPriority.HIGH)
         .whenComplete((result, ex) -> {
             if (ex != null) {
-                LOG.warning("Async preload failed for " + portal.getId() + ": " + ex.getMessage());
+                LOG.warning("[OptiPortal] Async preload failed for " + portal.getId() + ": " + ex.getMessage());
             } else {
-                LOG.info(() -> "Async preload completed for " + portal.getId());
+                LOG.fine(() -> "[OptiPortal] Async preload completed for " + portal.getId());
             }
         });
     }
@@ -390,8 +448,7 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
         com.hypixel.hytale.server.core.universe.world.World world =
                 getChunkPreloader().getWorldRegistry().getWorldForPlayer(playerRef);
         if (world == null) {
-            getPlayerRefs().remove(playerId);
-            positionCaches.remove(playerId);
+            removePlayerRef(playerId);
             return java.util.concurrent.CompletableFuture.completedFuture(null);
         }
         return worldBridge.getTeleportRecordAsync(world, playerRef)

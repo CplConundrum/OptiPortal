@@ -15,9 +15,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 
 import com.hypixel.hytale.builtin.portals.PortalsPlugin;
+import com.hypixel.hytale.builtin.portals.components.PortalDevice;
 import com.hypixel.hytale.builtin.portals.resources.PortalWorld;
 import com.hypixel.hytale.event.EventRegistry;
-import com.hypixel.hytale.math.vector.Transform;
+import com.hypixel.hytale.server.core.modules.block.BlockModule;
 import com.hypixel.hytale.server.core.universe.Universe;
 import com.hypixel.hytale.server.core.universe.world.World;
 import com.hypixel.hytale.server.core.universe.world.events.AllWorldsLoadedEvent;
@@ -241,11 +242,45 @@ public class WarmZoneManager {
     }
 
     /**
+     * Returns true if the given world is suitable for preloading.
+     * A world with a PortalWorld resource must have exists()==true and a non-null spawn.
+     * Regular (non-portal) worlds always return true.
+     * Null or dead worlds return false.
+     */
+    public static boolean isPortalWorldUsable(World world) {
+        if (world == null) return false;
+        try {
+            PortalWorld portalWorld = world.getEntityStore()
+                    .getStore().getResource(PortalWorld.getResourceType());
+            if (portalWorld == null) return true; // not a portal world — allow preload
+            return portalWorld.exists() && portalWorld.getSpawnPoint() != null;
+        } catch (Exception e) {
+            // Resource not registered on this world — it is a regular world
+            return true;
+        }
+    }
+
+    /**
      * Load a warm zone's chunks (non-ticking geometry only, no entity simulation).
      * Uses getNonTickingChunkAsync — safe to call from any thread.
      * Returns a future that completes when the inner ring is loaded.
      */
     public CompletableFuture<Void> loadWarmZone(PortalEntry entry) {
+        // H3: skip if the destination portal world is dead or has no spawn.
+        // Only validate destination when a UUID is known or entry is a PORTAL type —
+        // BED/DEATH/MANUAL entries have no separate destination world to gate on.
+        if (entry.getDestinationWorldUuid() != null) {
+            World zoneWorldCheck = chunkPreloader != null
+                    ? chunkPreloader.getWorldRegistry().resolveWorld(
+                            entry.getDestinationWorldUuid(), entry.getWorld())
+                    : null;
+            if (!isPortalWorldUsable(zoneWorldCheck)) {
+                LOG.info("[OptiPortal] loadWarmZone: skipping dead/invalid portal world: "
+                        + entry.getWorld() + " (zone=" + entry.getId() + ")");
+                return CompletableFuture.completedFuture(null);
+            }
+        }
+
         int cx     = ChunkPreloader.toChunkCoord(entry.getX());
         int cz     = ChunkPreloader.toChunkCoord(entry.getZ());
         int radiusX = resolveRadiusX(entry);
@@ -259,7 +294,7 @@ public class WarmZoneManager {
         int chunkCount = (2 * radiusX + 1) * (2 * radiusZ + 1);
         double estimatedMB = (chunkCount * 65536.0 * 1.5) / (1024.0 * 1024.0);
 
-        return chunkPreloader.warmLoad(entry.getId(), entry.getWorld(), cx, cz, radiusX, radiusZ)
+        return chunkPreloader.warmLoad(entry, cx, cz, radiusX, radiusZ)
                 .thenRun(() -> {
                     cacheManager.setZoneTier(entry.getId(), CacheTier.HOT);
                     // Exempt eternal-world zones from cache decay
@@ -274,7 +309,7 @@ public class WarmZoneManager {
                     // Use estimate for both fields; TODO: instrument via chunk object sizing.
                     storage.loadById(entry.getId()).ifPresent(loaded -> {
                         loaded.setRamEstimatedMB(estimatedMB);
-                        loaded.setRamMarginalMB(estimatedMB); // Also update marginal RAM
+                        loaded.setLastActive(java.time.Instant.now());
                         chunkPreloader.updateEntryStats(loaded, chunkCount);
                         storage.save(loaded);
                     });
@@ -291,8 +326,8 @@ public class WarmZoneManager {
     /**
      * Register a warm zone programmatically (API for other plugins / /preload setwarm).
      */
-    public void registerWarmZone(String id, double x, double y, double z, int radius) {
-        PortalEntry entry = new PortalEntry(id, "default", x, y, z, 0);
+    public void registerWarmZone(String id, String worldName, double x, double y, double z, int radius) {
+        PortalEntry entry = new PortalEntry(id, worldName, x, y, z, 0);
         entry.setStrategy(WarmStrategy.WARM);
         entry.setWarmRadius(radius);
         entry.setType(PortalEntry.EntryType.MANUAL);
@@ -306,49 +341,102 @@ public class WarmZoneManager {
     }
 
     /**
-     * Checks whether the given world is a portal destination (has a PortalWorld
-     * resource with a valid spawn point). If so, auto-registers the spawn point
-     * as a PREDICTIVE preload zone named "portaldest:<worldName>".
+     * Scans a source world for PortalDevice blocks pointing to destination worlds.
+     * For each loaded chunk whose storage entry has a block position, reads the
+     * PortalDevice component directly via BlockModule and auto-registers the
+     * destination world's spawn as a PREDICTIVE zone.
      *
-     * Safe to call from any thread — storage.save() and executor.submit() are
-     * thread-safe; the zone is only loaded if worlds are already ready.
-     *
+     * Replaces the old PortalWorld-resource heuristic with a definitive component lookup.
      * Does nothing if PortalsPlugin is not installed.
      */
     public void scanWorldForPortalDestination(World world) {
-        // Guard: PortalsPlugin may not be installed
         if (PortalsPlugin.getInstance() == null) return;
 
-        PortalWorld portalWorld;
+        java.util.List<PortalEntry> worldEntries = storage.loadAll().stream()
+                .filter(e -> e.getWorld().equals(world.getName()))
+                .filter(e -> !e.isInstanced())
+                .filter(e -> e.getType() == PortalEntry.EntryType.PORTAL)
+                .collect(java.util.stream.Collectors.toList());
+
+        for (PortalEntry entry : worldEntries) {
+            // Unloaded chunks return null from BlockModule; ChunkPreLoadProcessEvent
+            // will handle them when they arrive in memory.
+            PortalDevice device;
+            try {
+                device = (PortalDevice) BlockModule.getComponent(
+                        PortalDevice.getComponentType(),
+                        world,
+                        (int) entry.getX(),
+                        (int) entry.getY(),
+                        (int) entry.getZ());
+            } catch (Exception e) {
+                continue;
+            }
+            if (device == null) continue;
+
+            World destWorld = device.getDestinationWorld();
+            if (destWorld != null) {
+                registerPortalDestination(destWorld);
+            }
+        }
+    }
+
+    /**
+     * Returns true if a WARM/PREDICTIVE zone is already registered for the given world.
+     */
+    public boolean hasDestinationZone(String worldName) {
+        String zoneId = "portaldest:" + worldName;
+        return managedZones.containsKey(zoneId) || storage.loadById(zoneId).isPresent();
+    }
+
+    /**
+     * Auto-registers a WARM zone centred on the destination world's spawn point
+     * (falls back to origin if no PortalWorld resource is present).
+     * Named "portaldest:<worldName>". Safe to call redundantly — skips if already registered.
+     */
+    public void registerPortalDestination(World destWorld) {
+        String zoneId = "portaldest:" + destWorld.getName();
+        if (hasDestinationZone(destWorld.getName())) return;
+
+        double x = 0, y = 64, z = 0;
         try {
-            portalWorld = world.getEntityStore().getStore()
-                    .getResource(PortalWorld.getResourceType());
-        } catch (Exception e) {
-            // Resource not registered on this world — not a portal world
-            return;
+            PortalWorld portalWorld = destWorld.getEntityStore()
+                    .getStore().getResource(PortalWorld.getResourceType());
+            if (portalWorld != null && portalWorld.getSpawnPoint() != null) {
+                com.hypixel.hytale.math.vector.Vector3d pos =
+                        portalWorld.getSpawnPoint().getPosition();
+                if (pos != null) { x = pos.x; y = pos.y; z = pos.z; }
+            }
+        } catch (Exception ignored) {
+            // Not a portal world or resource not registered — use origin fallback
         }
 
-        if (portalWorld == null || !portalWorld.exists()) return;
+        registerWarmZone(zoneId, destWorld.getName(), x, y, z, config.getDefaultWarmRadius());
+        LOG.info("[OptiPortal] Auto-registered portal destination warm zone: "
+                + zoneId + " in " + destWorld.getName());
+    }
 
-        Transform spawnPoint = portalWorld.getSpawnPoint();
-        if (spawnPoint == null) return; // spawn point not yet configured
+    /**
+     * Called when a world is destroyed (RemoveWorldEvent).
+     * Evicts all warm zones for that world from CacheManager and managedZones so
+     * that keepalive and status counters stay accurate. Zone definitions are kept in
+     * storage so they re-warm automatically when the world is re-created.
+     */
+    public void onWorldRemoved(com.hypixel.hytale.server.core.universe.world.World world) {
+        String worldName = world.getName();
+        LOG.info("[OptiPortal] World removed: " + worldName + " — evicting warm zones.");
 
-        com.hypixel.hytale.math.vector.Vector3d pos = spawnPoint.getPosition();
-        if (pos == null) return;
+        java.util.List<String> toEvict = storage.loadAll().stream()
+                .filter(e -> e.getWorld().equals(worldName))
+                .map(PortalEntry::getId)
+                .collect(java.util.stream.Collectors.toList());
 
-        String zoneId = "portaldest:" + world.getName();
-
-        // Skip if already registered
-        if (storage.loadById(zoneId).isPresent()) return;
-
-        PortalEntry entry = new PortalEntry(zoneId, world.getName(), pos.x, pos.y, pos.z, 0);
-        entry.setStrategy(com.optiportal.model.WarmStrategy.PREDICTIVE);
-        entry.setType(PortalEntry.EntryType.MANUAL);
-
-        storage.save(entry);
-        LOG.info(() -> "[OptiPortal] Auto-registered portal destination zone: "
-                + zoneId + " at " + world.getName()
-                + " (" + pos.x + ", " + pos.y + ", " + pos.z + ")");
+        for (String zoneId : toEvict) {
+            cacheManager.releaseZoneChunks(zoneId);
+            cacheManager.removeTierEntry(zoneId);
+            managedZones.remove(zoneId);
+            LOG.fine("[OptiPortal] Evicted zone " + zoneId + " from removed world " + worldName);
+        }
     }
 
     /**

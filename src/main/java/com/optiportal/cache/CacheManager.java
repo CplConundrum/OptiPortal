@@ -242,6 +242,53 @@ public class CacheManager {
         return zoneTiers.getOrDefault(zoneId, CacheTier.UNVISITED);
     }
 
+    /** Returns a count of tracked zones per cache tier. */
+    public java.util.Map<CacheTier, Integer> getTierCounts() {
+        java.util.Map<CacheTier, Integer> counts = new java.util.EnumMap<>(CacheTier.class);
+        for (CacheTier t : CacheTier.values()) counts.put(t, 0);
+        for (CacheTier t : zoneTiers.values()) counts.merge(t, 1, (a, b) -> a + b);
+        return counts;
+    }
+
+    /**
+     * Remove a zone from its cache tier and update tier counts.
+     * Used by zone deletion to fully clean up cache state.
+     */
+    public void removeTierEntry(String zoneId) {
+        CacheTier oldTier = zoneTiers.remove(zoneId);
+        if (oldTier != null) {
+            tierTimestamps.remove(zoneId);
+            noDecayZones.remove(zoneId);
+            LOG.fine(() -> "[OptiPortal] Removed tier entry: " + zoneId + " (was " + oldTier + ")");
+        }
+    }
+
+    /**
+     * Get the age in milliseconds of a zone's current tier.
+     * Returns 0 if the zone is not tracked or has no timestamp.
+     */
+    public long getZoneTierAgeMs(String zoneId) {
+        Long ts = tierTimestamps.get(zoneId);
+        if (ts == null) return 0;
+        return System.currentTimeMillis() - ts;
+    }
+
+    /**
+     * Get the number of owned chunks for a specific zone.
+     *
+     * @param zoneId Zone ID
+     * @return Number of owned chunks
+     */
+    public int getOwnedChunkCount(String zoneId) {
+        ConcurrentHashMap<String, Set<Long>> worldChunks = zoneToChunks.get(zoneId);
+        if (worldChunks == null) return 0;
+        int count = 0;
+        for (Set<Long> chunks : worldChunks.values()) {
+            count += chunks.size();
+        }
+        return count;
+    }
+
     /**
      * Periodic decay: HOT → WARM after 30s, WARM → COLD after 30min.
      */

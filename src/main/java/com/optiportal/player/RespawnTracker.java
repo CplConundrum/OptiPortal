@@ -7,6 +7,7 @@ import com.optiportal.preload.ChunkPreloader;
 import com.optiportal.storage.StorageBackend;
 
 import java.util.UUID;
+import java.util.logging.Logger;
 
 /**
  * Records player respawn locations after death and pre-loads those chunks.
@@ -22,6 +23,8 @@ import java.util.UUID;
  * TTL: configured via ttl.bed in config.json (reusing the bed TTL setting).
  */
 public class RespawnTracker {
+
+    private static final Logger LOG = Logger.getLogger("OptiPortal");
 
     private final PluginConfig config;
     private final StorageBackend storage;
@@ -50,9 +53,10 @@ public class RespawnTracker {
         PortalEntry entry = new PortalEntry(id, world, x, y, z, 0);
         entry.setType(PortalEntry.EntryType.BED); // player-data type, excluded from zone list
         entry.setCacheTTLDays(config.getTtlBed());
+        entry.setLastActive(java.time.Instant.now());
         storage.save(entry);
 
-        System.out.println("[OptiPortal] Respawn location recorded for " + playerId
+        LOG.info("[OptiPortal] Respawn location recorded for " + playerId
                 + " at " + world + " " + x + "," + y + "," + z);
     }
 
@@ -66,8 +70,8 @@ public class RespawnTracker {
         storage.loadById(id).ifPresent(entry -> {
             int cx = ChunkPreloader.toChunkCoord(entry.getX());
             int cz = ChunkPreloader.toChunkCoord(entry.getZ());
-            preloader.predictiveLoad(id, entry.getWorld(), cx, cz, 7);
-            System.out.println("[OptiPortal] Respawn preload: " + playerId
+            preloader.predictiveLoad(id, entry.getWorld(), cx, cz, config.getPredictiveRadius());
+            LOG.fine("[OptiPortal] Respawn preload: " + playerId
                     + " cx=" + cx + " cz=" + cz);
         });
     }

@@ -11,6 +11,7 @@ import java.util.Collections;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.logging.Logger;
 
 /**
  * Integration with Zurku's Gravestones plugin (1.1.0+).
@@ -24,6 +25,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * GravestoneBrokenEvent   — gravestone block broken (admin/other) → release death location cache
  */
 public class GravestoneIntegration {
+
+    private static final Logger LOG = Logger.getLogger("OptiPortal");
 
     private final PluginConfig config;
     private final DeathLocationTracker deathTracker;
@@ -58,7 +61,7 @@ public class GravestoneIntegration {
 
     public void init(EventRegistry events) {
         if (!config.isGravestoneIntegrationEnabled()) {
-            System.out.println("[OptiPortal] Gravestone integration disabled.");
+            LOG.info("[OptiPortal] Gravestone integration disabled.");
             return;
         }
 
@@ -87,6 +90,6 @@ public class GravestoneIntegration {
             }
         });
 
-        System.out.println("[OptiPortal] Gravestone integration active — listening for Created/Collected/Broken events.");
+        LOG.info("[OptiPortal] Gravestone integration active — listening for Created/Collected/Broken events.");
     }
 }

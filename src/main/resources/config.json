@@ -5,6 +5,9 @@
   "_backend_info": "Where zone/cache data is saved. Options: JSON (flat files, easiest setup), SQLITE (single file DB, faster), MYSQL (requires separate DB server)",
   "backend": "JSON",
 
+  "_bytesPerChunk_info": "Estimated memory per loaded chunk in bytes. Used to calculate ACTUAL RAM in the zone table. Default 98304 = 96 KB (64 KB base × 1.5 overhead).",
+  "bytesPerChunk": 98304,
+
   "_section_startup": "=== STARTUP BEHAVIOUR ===",
   "_startupLoadStrategy_info": "How zones are loaded when the server boots. STAGED = load gradually to reduce lag spike. IMMEDIATE = load everything at once.",
   "startupLoadStrategy": "STAGED",
@@ -68,7 +71,10 @@
     "cooldownSeconds": 30,
 
     "_commitWindowSeconds_info": "A player must be within range for this many seconds continuously before the pre-load actually starts. Filters brief walk-bys.",
-    "commitWindowSeconds": 3
+    "commitWindowSeconds": 3,
+
+    "_predictiveRadius_info": "Radius (in chunks) for predictive pre-loading when a player approaches a portal. Matches Hytale's simulation distance max (7).",
+    "predictiveRadius": 7
   },
 
   "_section_ttl": "=== CACHE EXPIRY (TTL) ===",
@@ -128,15 +134,20 @@
   "_keepalive_info": "Periodically 'pings' zones to prevent them dropping to a lower tier. Useful for warps or hubs you want always-ready.",
   "keepalive": {
     "_hot_info": "Keep HOT zones hot (re-ping before they cool down).",
-    "hot": true,
+    "hot": {
+      "enabled": true,
+      "intervalMinutes": 5
+    },
     "_warm_info": "Keep WARM zones warm.",
-    "warm": true,
+    "warm": {
+      "enabled": true,
+      "intervalMinutes": 15
+    },
     "_cold_info": "Bring COLD zones back to WARM proactively. Disabled by default — enable for critical always-on zones.",
-    "cold": false,
-
-    "hotIntervalMinutes": 5,
-    "warmIntervalMinutes": 15,
-    "coldIntervalMinutes": 60
+    "cold": {
+      "enabled": false,
+      "intervalMinutes": 60
+    }
   },
 
   "_section_decay": "=== DECAY (HOW FAST ZONES COOL DOWN) ===",
@@ -242,5 +253,11 @@
   "updateChecker": {
     "_enabled_info": "Check for new OptiPortal versions on startup and notify in the console.",
     "enabled": true
+  },
+
+  "_section_portalLinks": "=== PORTAL LINKS ===",
+  "portalLinks": {
+    "_confidenceThreshold_info": "Number of observations required before a portal link is considered confirmed.",
+    "confidenceThreshold": 5
   }
 }

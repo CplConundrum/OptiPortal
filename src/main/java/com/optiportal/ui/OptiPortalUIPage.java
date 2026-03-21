@@ -25,10 +25,12 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.D
     private static final String UI_FILE = "OptiPortalUI.ui";
 
     private final OptiPortal plugin;
+    private final List<PortalEntry> zones;
 
-    public OptiPortalUIPage(PlayerRef playerRef, OptiPortal plugin) {
+    public OptiPortalUIPage(PlayerRef playerRef, OptiPortal plugin, List<PortalEntry> zones) {
         super(playerRef, CustomPageLifetime.CanDismiss, Data.CODEC);
         this.plugin = plugin;
+        this.zones = zones;
     }
 
     public static class Data {
@@ -52,8 +54,6 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.D
     private void render(UICommandBuilder cmd) {
         CacheManager      cache = plugin.getCacheManager();
         PluginConfig      cfg   = plugin.getPluginConfig();
-        List<PortalEntry> zones = plugin.getStorage().loadAll();
-
         int hot = 0, warm = 0, cold = 0, unvisited = 0;
         double totalRam = 0;
         double totalActualRam = 0;
@@ -129,7 +129,7 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.D
 
             // RAM marginal info
             String ramMarginal = z.getRamMarginalMB() > 0
-                    ? String.format("+%.2f MB", z.getRamMarginalMB()) : "--";
+                    ? String.format("%.2f MB", z.getRamMarginalMB()) : "--";
 
             // Preload count
             String preload = z.getPreloadCount() > 0 ? String.valueOf(z.getPreloadCount()) : "--";
@@ -168,9 +168,12 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.D
 
         cmd.set("#CommandRef1.Text",
                 "/preload list   /preload strategy <id> <WARM|PRED>   /preload shape <id> <ELLIPSOID|CYLINDER|BOX>   " +
-                "/preload radius <id> <n>   /preload radiusxz <id> <rx> <rz>   /preload setwarm <id> [r]   /preload unsetwarm <id>");
+                "/preload radius <id> <n>   /preload radiusxz <id> <rx> <rz>");
         cmd.set("#CommandRef2.Text",
-                "/preload ram   /preload refresh warps   /preload reload   " +
+                "/preload setwarm <id> [r]   /preload unsetwarm <id>   /preload activation <id> <dist>   " +
+                "/preload ttl <id> <days>   /preload zone <id>   /preload delete <id>");
+        cmd.set("#CommandRef3.Text",
+                "/preload ram   /preload refresh warps   /preload reload   /preload flush   /preload links   " +
                 "/preload migrate <backend>   /preload backup <list|restore <date>>   /preload help");
 
         cmd.set("#WarpStats.Text", String.format(
@@ -179,11 +182,12 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.D
         cmd.set("#StorageBackend.Text", "Storage: " + cfg.getBackend().toUpperCase());
     }
 
-    public static void openFor(Player player, PlayerRef playerRef, OptiPortal plugin) {
+    public static void openFor(Player player, PlayerRef playerRef, OptiPortal plugin,
+                               List<PortalEntry> zones) {
         World world = plugin.getChunkPreloader().getWorldRegistry().getAnyWorld();
         if (world == null) return;
         Ref<EntityStore>   ref   = playerRef.getReference();
         Store<EntityStore> store = world.getEntityStore().getStore();
-        player.getPageManager().openCustomPage(ref, store, new OptiPortalUIPage(playerRef, plugin));
+        player.getPageManager().openCustomPage(ref, store, new OptiPortalUIPage(playerRef, plugin, zones));
     }
 }

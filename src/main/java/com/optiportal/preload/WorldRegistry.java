@@ -28,6 +28,7 @@ public class WorldRegistry {
     private final ConcurrentHashMap<String, World> worlds = new ConcurrentHashMap<>();
     private final List<Consumer<String>> worldUnloadCallbacks = new CopyOnWriteArrayList<>();
     private final List<Consumer<World>> worldLoadCallbacks = new CopyOnWriteArrayList<>();
+    private final List<Consumer<World>> worldRemoveCallbacks = new CopyOnWriteArrayList<>();
 
     /**
      * Tracks worlds whose load callbacks have already been fired.
@@ -60,6 +61,7 @@ public class WorldRegistry {
             worlds.remove(name);
             initializedWorlds.remove(name); // allow re-init if the world is re-added
             worldUnloadCallbacks.forEach(cb -> cb.accept(name));
+            worldRemoveCallbacks.forEach(cb -> cb.accept(world));
         });
     }
 
@@ -81,8 +83,32 @@ public class WorldRegistry {
         worldLoadCallbacks.add(callback);
     }
 
+    /** Register a callback to be invoked (with the World object) on RemoveWorldEvent. */
+    public void addWorldRemoveCallback(Consumer<World> callback) {
+        worldRemoveCallbacks.add(callback);
+    }
+
     public World getWorld(String name) {
         return worlds.get(name);
+    }
+
+    /**
+     * Resolves a world by UUID (O(1) via Universe) if available, falling back to
+     * name-based lookup. UUID resolution is canonical and robust against world name reuse.
+     *
+     * @param uuid         destination world UUID, or null to skip UUID lookup
+     * @param fallbackName world name to use when UUID lookup fails or uuid is null
+     * @return live World, or null if not found
+     */
+    public World resolveWorld(java.util.UUID uuid, String fallbackName) {
+        if (uuid != null) {
+            Universe universe = Universe.get();
+            if (universe != null) {
+                World byUuid = universe.getWorld(uuid);
+                if (byUuid != null) return byUuid;
+            }
+        }
+        return getWorld(fallbackName);
     }
 
     /**

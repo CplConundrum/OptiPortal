@@ -1,58 +1,64 @@
 package com.optiportal.config;
 
 import java.io.File;
-import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.Reader;
-import java.io.Writer;
-import java.nio.file.Files;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 
 /**
- * Loads and holds all plugin configuration.
- * Falls back to hardcoded defaults if fields are missing or config is malformed.
+ * Plugin configuration loader and accessor.
+ * Loads config.json from the plugin data folder and provides typed accessors.
+ * Supports migration of legacy config fields.
  */
 public class PluginConfig {
+    private static final Logger LOG = Logger.getLogger(PluginConfig.class.getName());
 
-    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
+    // Data folder (set by load())
+    private File dataFolder;
 
     // Backend
-    private String backend = "JSON";
-
-    // Startup
-    private String startupLoadStrategy = "STAGED";
-    private int snapshotIntervalMinutes = 10;
-    private boolean rebuildFromChunksOnCorruption = true;
-    private int scheduledRebuildIntervalHours = 24;
+    private String backend = "rocksdb";
+    private int bytesPerChunk = 98304; // 96 KB = 64 KB base × 1.5 overhead
+    private String startupLoadStrategy = "sequential";
+    private int snapshotIntervalMinutes = 60;
     private boolean suppressRamWarnings = false;
-    private int lowTrafficThreshold = 5;
-    private boolean immuneToSimulationReduction = true;
+    private int lowTrafficThreshold = 10;
+    private boolean immuneToSimulationReduction = false;
+    private int stagedLoadConcurrency = 5;
 
     // Defaults
-    private int defaultWarmRadius = 4;
-    // Chunk batch size for warm loading — number of chunks requested simultaneously.
-    // Lower = less TICK_STEP pressure on FluidPlugin/BlockModule pre-load hooks. Default: 4.
-    private int warmBatchSize = 4;
-    // Delay in ms between warm load batches. 0 = no delay (fire all at once). Default: 250.
-    private int warmBatchDelayMs = 250;
-    private String defaultStrategy = "PREDICTIVE";
-    private int defaultTimeoutSeconds = 5;
+    private int defaultWarmRadius = 5;
+    private int warmBatchSize = 10;
+    private int warmBatchDelayMs = 50;
+    private String defaultStrategy = "radius";
+    private int defaultTimeoutSeconds = 30;
     private int defaultBufferSecondsWarm = 60;
-    private int defaultBufferSecondsPredictive = 20;
+    private int defaultBufferSecondsPredictive = 30;
 
     // Activation
-    private double activationDistance = 10;
-    private double activationDistanceVertical = 3;
-    private String activationShape = "ELLIPSOID";
+    private double activationDistance = 48.0;
+    private double activationDistanceVertical = 64.0;
+    private String activationShape = "cylinder";
     private boolean floorCeilingCheck = true;
-    private boolean facingCheck = true;
+    private boolean facingCheck = false;
     private int activationCooldownSeconds = 30;
     private int activationCommitWindowSeconds = 3;
+    // Velocity-aware activation (Phase 4)
+    private boolean velocityAwareActivation = false;
+    private double velocityRadiusBoostThreshold = 0.3;
+    private int predictiveRadius = 7;
+
+    // Decay (how fast zones cool down)
+    private int hotDecaySeconds = 30;
+    private int warmDecayMinutes = 45;
+    private int pollIntervalSeconds = 1;
 
     // TTL (days, -1 = never)
     private int ttlWarm = -1;
@@ -80,7 +86,7 @@ public class PluginConfig {
     private String warpsYawField = "Yaw";
     // Maps world names as stored in warps.json to actual Hytale world registry names.
     // e.g. {"default": "Orbis"} — populated via config.json worldNameRemap object.
-    private java.util.Map<String, String> worldNameRemap = new java.util.HashMap<>();
+    private Map<String, String> worldNameRemap = new HashMap<>();
 
     // Gravestones
     private String gravestonesSourcePath = "plugins/Gravestones/gravestones.json";
@@ -102,114 +108,68 @@ public class PluginConfig {
     private String mysqlTablePrefix = "pre_";
 
     // UI
-    private boolean showInstancedPortals = false;
-    private boolean showBedSpawns = true;
-    private boolean showDeathLocations = true;
+    private boolean uiEnabled = true;
+    private String uiPagePath = "Common/UI/Custom/OptiPortalUI.ui";
 
     // Metrics
-    private boolean metricsEnabled = true;
-    private int bstatsPluginId = 0;
+    private boolean metricsEnabled = false;
+    private String metricsEndpoint = "";
+    private int metricsIntervalSeconds = 60;
 
-    // Update checker
+    // Update Checker
     private boolean updateCheckerEnabled = true;
+    private String updateCheckerUrl = "";
 
-    // Keepalive
-    private boolean keepaliveHot  = true;
-    private boolean keepaliveWarm = true;
-    private boolean keepaliveCold = false;
-    private int keepaliveHotIntervalMinutes  = 5;
-    private int keepaliveWarmIntervalMinutes = 15;
-    private int keepaliveColdIntervalMinutes = 60;
+    // Rebuild from chunks
+    private boolean rebuildFromChunksOnCorruption = false;
+    private int scheduledRebuildIntervalHours = 24;
 
-    // Tier decay
-    private int hotDecaySeconds = 30;
-    private int warmDecayMinutes = 30;
-    private int pollIntervalSeconds = 1;
-
-    // Server load sensing
-    /** Whether TPS monitoring is active. Default: true. */
+    // Async TPS monitor
     private boolean tpsMonitorEnabled = true;
 
-    /** TPS below which batch size is capped at its minimum. Default: 15.0. */
-    private double tpsLowThreshold = 15.0;
-
-    /** TPS below which all new non-critical operations are queued. Default: 12.0. */
-    private double tpsCriticalThreshold = 12.0;
-
-    /**
-     * If ChunkStore.getLoadedChunksCount() exceeds this across any world,
-     * batch size is reduced proportionally. Default: 2000. -1 = disabled.
-     */
-    private int maxLoadedChunksPressureThreshold = 2000;
-
-    // Ownership drift detection
-    /** How often to audit chunk ownership for drift, in minutes. Default: 5. */
-    private int ownershipAuditIntervalMinutes = 5;
-
-    /** Staged load concurrency — number of concurrent warm zone loads at startup. Default: 3. */
-    private int stagedLoadConcurrency = 3;
-
     // Corridor prioritization (Phase 4)
-    /** Whether CorridorIndex path-proximity prioritization is active. Default: true. */
     private boolean corridorPrioritizationEnabled = true;
-
-    /** Chunk radius around each WorldPath waypoint to include as corridor. Default: 3. */
     private int corridorRadiusChunks = 3;
 
-    // Velocity-aware activation (Phase 4)
-    /** Whether velocity-based radius boost is enabled. Default: true. */
-    private boolean velocityAwareActivation = true;
-
-    /** Player speed (blocks/tick) above which radius is boosted by 1. Default: 0.5. */
-    private double velocityRadiusBoostThreshold = 0.5;
-
-    // Portal link learning (Feature 3)
-    /** Observations required before a pending link is promoted to confirmed. Default: 3. */
-    private int portalLinksConfidenceThreshold = 3;
-
-    /** Days a pending link can be idle before it is decayed and removed. Default: 7. */
+    // Portal links
+    private int portalLinksConfidenceThreshold = 5;
     private int portalLinksPendingDecayDays = 7;
 
-    // Data folder reference
-    private File dataFolder;
+    // Keepalive per-tier schedule
+    // Defaults are set high (30/60/120 min) because ChunkUnloadGuard (H1) is now the
+    // primary retention mechanism. The heartbeat is a belt-and-suspenders fallback only.
+    private boolean keepaliveHot = true;
+    private int keepaliveHotIntervalMinutes = 30;
+    private boolean keepaliveWarm = true;
+    private int keepaliveWarmIntervalMinutes = 60;
+    private boolean keepaliveCold = false;
+    private int keepaliveColdIntervalMinutes = 120;
 
-    private PluginConfig() {}
+    // Chunk pressure / auditing
+    private int maxLoadedChunksPressureThreshold = 512;
+    private int ownershipAuditIntervalMinutes = 60;
 
+    /**
+     * Load configuration from the given data folder.
+     * If config.json does not exist, creates a default one.
+     */
     public static PluginConfig load(File dataFolder) {
-        PluginConfig config = new PluginConfig();
-        config.dataFolder = dataFolder;
-
         File configFile = new File(dataFolder, "config.json");
-
-        // Copy default config if not present
         if (!configFile.exists()) {
-            try {
-                dataFolder.mkdirs();
-                InputStream defaultConfig = PluginConfig.class.getResourceAsStream("/config.json");
-                if (defaultConfig != null) {
-                    Files.copy(defaultConfig, configFile.toPath());
-                }
-            } catch (IOException e) {
-                System.err.println("[OptiPortal] Could not save default config: " + e.getMessage());
-                return config; // Return defaults
-            }
+            migrateConfig(configFile);
         }
-
-        // Merge any missing keys from the bundled default config into the user's file
-        migrateConfig(configFile);
-
-        // Parse config
-        try (Reader reader = new FileReader(configFile)) {
-            JsonObject json = GSON.fromJson(reader, JsonObject.class);
-            config.parseJson(json);
-        } catch (Exception e) {
-            System.err.println("[OptiPortal] Failed to parse config.json, using defaults: " + e.getMessage());
+        try {
+            String json = new String(java.nio.file.Files.readAllBytes(configFile.toPath()));
+            JsonObject root = JsonParser.parseString(json).getAsJsonObject();
+            PluginConfig config = new PluginConfig();
+            config.dataFolder = dataFolder;
+            config.parseJson(root);
+            config.runPathDiscoveryIfNeeded(configFile);
+            return config;
+        } catch (IOException e) {
+            LOG.log(Level.SEVERE, "Failed to load config.json", e);
+            throw new RuntimeException(e);
         }
-
-        // Auto-discover file paths if they look like defaults or the files don't exist on disk
-        config.runPathDiscoveryIfNeeded(configFile);
-
-        return config;
     }
 
     private void parseJson(JsonObject json) {
@@ -222,6 +182,7 @@ public class PluginConfig {
         if (json.has("suppressRamWarnings")) suppressRamWarnings = json.get("suppressRamWarnings").getAsBoolean();
         if (json.has("lowTrafficThreshold")) lowTrafficThreshold = json.get("lowTrafficThreshold").getAsInt();
         if (json.has("immuneToSimulationReduction")) immuneToSimulationReduction = json.get("immuneToSimulationReduction").getAsBoolean();
+        if (json.has("stagedLoadConcurrency")) stagedLoadConcurrency = json.get("stagedLoadConcurrency").getAsInt();
 
         if (json.has("defaults")) {
             JsonObject defaults = json.getAsJsonObject("defaults");
@@ -251,6 +212,15 @@ public class PluginConfig {
                 velocityAwareActivation = activation.get("velocityAwareActivation").getAsBoolean();
             if (activation.has("velocityRadiusBoostThreshold"))
                 velocityRadiusBoostThreshold = activation.get("velocityRadiusBoostThreshold").getAsDouble();
+            if (activation.has("predictiveRadius"))
+                predictiveRadius = activation.get("predictiveRadius").getAsInt();
+        }
+
+        if (json.has("decay")) {
+            JsonObject decay = json.getAsJsonObject("decay");
+            if (decay.has("hotDecaySeconds")) hotDecaySeconds = decay.get("hotDecaySeconds").getAsInt();
+            if (decay.has("warmDecayMinutes")) warmDecayMinutes = decay.get("warmDecayMinutes").getAsInt();
+            if (decay.has("pollIntervalSeconds")) pollIntervalSeconds = decay.get("pollIntervalSeconds").getAsInt();
         }
 
         if (json.has("ttl")) {
@@ -278,7 +248,7 @@ public class PluginConfig {
         }
         if (json.has("worldNameRemap")) {
             JsonObject remap = json.getAsJsonObject("worldNameRemap");
-            worldNameRemap = new java.util.HashMap<>();
+            worldNameRemap = new HashMap<>();
             for (var entry : remap.entrySet()) {
                 worldNameRemap.put(entry.getKey(), entry.getValue().getAsString());
             }
@@ -314,264 +284,284 @@ public class PluginConfig {
 
         if (json.has("ui")) {
             JsonObject ui = json.getAsJsonObject("ui");
-            if (ui.has("showInstancedPortals")) showInstancedPortals = ui.get("showInstancedPortals").getAsBoolean();
-            if (ui.has("showBedSpawns")) showBedSpawns = ui.get("showBedSpawns").getAsBoolean();
-            if (ui.has("showDeathLocations")) showDeathLocations = ui.get("showDeathLocations").getAsBoolean();
+            if (ui.has("enabled")) uiEnabled = ui.get("enabled").getAsBoolean();
+            if (ui.has("pagePath")) uiPagePath = ui.get("pagePath").getAsString();
         }
 
         if (json.has("metrics")) {
             JsonObject metrics = json.getAsJsonObject("metrics");
-            if (metrics.has("bstatsEnabled")) metricsEnabled = metrics.get("bstatsEnabled").getAsBoolean();
-            if (metrics.has("bstatsPluginId")) bstatsPluginId = metrics.get("bstatsPluginId").getAsInt();
+            if (metrics.has("enabled")) metricsEnabled = metrics.get("enabled").getAsBoolean();
+            if (metrics.has("endpoint")) metricsEndpoint = metrics.get("endpoint").getAsString();
+            if (metrics.has("intervalSeconds")) metricsIntervalSeconds = metrics.get("intervalSeconds").getAsInt();
         }
 
         if (json.has("updateChecker")) {
-            JsonObject uc = json.getAsJsonObject("updateChecker");
-            if (uc.has("enabled")) updateCheckerEnabled = uc.get("enabled").getAsBoolean();
+            JsonObject updateChecker = json.getAsJsonObject("updateChecker");
+            if (updateChecker.has("enabled")) updateCheckerEnabled = updateChecker.get("enabled").getAsBoolean();
+            if (updateChecker.has("url")) updateCheckerUrl = updateChecker.get("url").getAsString();
+        }
+
+        if (json.has("portalLinks")) {
+            JsonObject portalLinks = json.getAsJsonObject("portalLinks");
+            if (portalLinks.has("confidenceThreshold")) portalLinksConfidenceThreshold = portalLinks.get("confidenceThreshold").getAsInt();
+            if (portalLinks.has("pendingDecayDays")) portalLinksPendingDecayDays = portalLinks.get("pendingDecayDays").getAsInt();
         }
 
         if (json.has("keepalive")) {
             JsonObject ka = json.getAsJsonObject("keepalive");
-            if (ka.has("hot"))  keepaliveHot  = ka.get("hot").getAsBoolean();
-            if (ka.has("warm")) keepaliveWarm = ka.get("warm").getAsBoolean();
-            if (ka.has("cold")) keepaliveCold = ka.get("cold").getAsBoolean();
-            if (ka.has("hotIntervalMinutes"))  keepaliveHotIntervalMinutes  = ka.get("hotIntervalMinutes").getAsInt();
+            if (ka.has("hot")) {
+                JsonElement hotEl = ka.get("hot");
+                if (hotEl.isJsonObject()) {
+                    JsonObject hot = hotEl.getAsJsonObject();
+                    if (hot.has("enabled")) keepaliveHot = hot.get("enabled").getAsBoolean();
+                    if (hot.has("intervalMinutes")) keepaliveHotIntervalMinutes = hot.get("intervalMinutes").getAsInt();
+                } else {
+                    keepaliveHot = hotEl.getAsBoolean();
+                }
+            }
+            if (ka.has("warm")) {
+                JsonElement warmEl = ka.get("warm");
+                if (warmEl.isJsonObject()) {
+                    JsonObject warm = warmEl.getAsJsonObject();
+                    if (warm.has("enabled")) keepaliveWarm = warm.get("enabled").getAsBoolean();
+                    if (warm.has("intervalMinutes")) keepaliveWarmIntervalMinutes = warm.get("intervalMinutes").getAsInt();
+                } else {
+                    keepaliveWarm = warmEl.getAsBoolean();
+                }
+            }
+            if (ka.has("cold")) {
+                JsonElement coldEl = ka.get("cold");
+                if (coldEl.isJsonObject()) {
+                    JsonObject cold = coldEl.getAsJsonObject();
+                    if (cold.has("enabled")) keepaliveCold = cold.get("enabled").getAsBoolean();
+                    if (cold.has("intervalMinutes")) keepaliveColdIntervalMinutes = cold.get("intervalMinutes").getAsInt();
+                } else {
+                    keepaliveCold = coldEl.getAsBoolean();
+                }
+            }
+            // Legacy flat keys (old config format)
+            if (ka.has("hotIntervalMinutes")) keepaliveHotIntervalMinutes = ka.get("hotIntervalMinutes").getAsInt();
             if (ka.has("warmIntervalMinutes")) keepaliveWarmIntervalMinutes = ka.get("warmIntervalMinutes").getAsInt();
             if (ka.has("coldIntervalMinutes")) keepaliveColdIntervalMinutes = ka.get("coldIntervalMinutes").getAsInt();
         }
 
-        if (json.has("decay")) {
-            JsonObject decay = json.getAsJsonObject("decay");
-            if (decay.has("hotDecaySeconds"))    hotDecaySeconds    = decay.get("hotDecaySeconds").getAsInt();
-            if (decay.has("warmDecayMinutes"))   warmDecayMinutes   = decay.get("warmDecayMinutes").getAsInt();
-            if (decay.has("pollIntervalSeconds")) pollIntervalSeconds = decay.get("pollIntervalSeconds").getAsInt();
-        }
-
-        if (json.has("async")) {
-            JsonObject async = json.getAsJsonObject("async");
-            if (async.has("tpsMonitorEnabled"))
-                tpsMonitorEnabled = async.get("tpsMonitorEnabled").getAsBoolean();
-            if (async.has("tpsLowThreshold"))
-                tpsLowThreshold = async.get("tpsLowThreshold").getAsDouble();
-            if (async.has("tpsCriticalThreshold"))
-                tpsCriticalThreshold = async.get("tpsCriticalThreshold").getAsDouble();
-            if (async.has("maxLoadedChunksPressureThreshold"))
-                maxLoadedChunksPressureThreshold = async.get("maxLoadedChunksPressureThreshold").getAsInt();
+        if (json.has("chunkPressure")) {
+            JsonObject cp = json.getAsJsonObject("chunkPressure");
+            if (cp.has("maxLoadedThreshold")) maxLoadedChunksPressureThreshold = cp.get("maxLoadedThreshold").getAsInt();
+            if (cp.has("ownershipAuditIntervalMinutes")) ownershipAuditIntervalMinutes = cp.get("ownershipAuditIntervalMinutes").getAsInt();
         }
 
         if (json.has("cache")) {
             JsonObject cache = json.getAsJsonObject("cache");
-            if (cache.has("ownershipAuditIntervalMinutes"))
-                ownershipAuditIntervalMinutes = cache.get("ownershipAuditIntervalMinutes").getAsInt();
+            if (cache.has("persistColdCache")) persistColdCache = cache.get("persistColdCache").getAsBoolean();
+            if (cache.has("cacheDirectory")) cacheDirectory = cache.get("cacheDirectory").getAsString();
+            if (cache.has("maxCacheAgeDays")) maxCacheAgeDays = cache.get("maxCacheAgeDays").getAsInt();
         }
 
-        if (json.has("stagedLoadConcurrency")) {
-            stagedLoadConcurrency = json.get("stagedLoadConcurrency").getAsInt();
-        }
-
-        // Corridor prioritization (Phase 4)
-        if (json.has("densityBased")) {
-            JsonObject db = json.getAsJsonObject("densityBased");
-            if (db.has("corridor")) {
-                JsonObject corridor = db.getAsJsonObject("corridor");
-                if (corridor.has("enabled"))
-                    corridorPrioritizationEnabled = corridor.get("enabled").getAsBoolean();
-                if (corridor.has("radiusChunks"))
-                    corridorRadiusChunks = corridor.get("radiusChunks").getAsInt();
-            }
-        }
-
-        // Portal link learning (Feature 3)
-        if (json.has("portalLinks")) {
-            JsonObject pl = json.getAsJsonObject("portalLinks");
-            if (pl.has("confidenceThreshold"))
-                portalLinksConfidenceThreshold = pl.get("confidenceThreshold").getAsInt();
-            if (pl.has("pendingDecayDays"))
-                portalLinksPendingDecayDays = pl.get("pendingDecayDays").getAsInt();
+        if (json.has("rebuildFromChunks")) {
+            JsonObject rebuild = json.getAsJsonObject("rebuildFromChunks");
+            if (rebuild.has("enabled")) rebuildFromChunksOnCorruption = rebuild.get("enabled").getAsBoolean();
+            if (rebuild.has("intervalHours")) scheduledRebuildIntervalHours = rebuild.get("intervalHours").getAsInt();
         }
     }
 
-    // --- Getters ---
-
-    public File getDataFolder() { return dataFolder; }
-
-    /**
-     * Deep-merges missing keys from the bundled default config.json into the
-     * server's existing config.json on disk. Existing values are never overwritten —
-     * only absent keys are added. This ensures new config sections introduced in
-     * plugin updates are visible to server operators without resetting their settings.
-     *
-     * <p>The merge is recursive for JsonObject values. Scalar values and arrays are
-     * copied as-is when absent. {@code _comment} keys from defaults are copied only
-     * when the containing object itself is new; existing objects keep their own comments.
-     */
     private static void migrateConfig(File configFile) {
-        // Load bundled defaults
-        JsonObject defaults;
-        try (InputStream in = PluginConfig.class.getResourceAsStream("/config.json")) {
-            if (in == null) return; // no bundled resource — nothing to migrate
-            defaults = GSON.fromJson(new java.io.InputStreamReader(in, java.nio.charset.StandardCharsets.UTF_8),
-                    JsonObject.class);
-        } catch (Exception e) {
-            System.err.println("[OptiPortal] Could not read bundled config.json for migration: " + e.getMessage());
-            return;
-        }
-        if (defaults == null) return;
+        LOG.log(Level.INFO, "Creating default config.json");
+        JsonObject defaults = new JsonObject();
+        defaults.addProperty("warmRadius", 5);
+        defaults.addProperty("warmBatchSize", 10);
+        defaults.addProperty("warmBatchDelayMs", 50);
+        defaults.addProperty("strategy", "radius");
+        defaults.addProperty("timeoutSeconds", 30);
+        JsonObject buffer = new JsonObject();
+        buffer.addProperty("WARM", 60);
+        buffer.addProperty("PREDICTIVE", 30);
+        defaults.add("bufferSeconds", buffer);
 
-        // Load user's file
-        JsonObject user;
-        try (Reader reader = new FileReader(configFile)) {
-            user = GSON.fromJson(reader, JsonObject.class);
-        } catch (Exception e) {
-            System.err.println("[OptiPortal] Could not read config.json for migration: " + e.getMessage());
-            return;
-        }
-        if (user == null) user = new JsonObject();
+        JsonObject activation = new JsonObject();
+        activation.addProperty("distance", 48.0);
+        activation.addProperty("distanceVertical", 64.0);
+        activation.addProperty("shape", "cylinder");
+        activation.addProperty("floorCeilingCheck", true);
+        activation.addProperty("facingCheck", false);
+        activation.addProperty("cooldownSeconds", 30);
+        activation.addProperty("commitWindowSeconds", 3);
+        activation.addProperty("predictiveRadius", 7);
 
-        boolean changed = deepMergeDefaults(user, defaults);
+        JsonObject ttl = new JsonObject();
+        ttl.addProperty("warm", -1);
+        ttl.addProperty("recentHot", 7);
+        ttl.addProperty("predictive", 2);
+        ttl.addProperty("lowTraffic", 1);
+        ttl.addProperty("bed", 3);
+        ttl.addProperty("deathLocation", 1);
+        ttl.addProperty("cleanupIntervalHours", 24);
 
-        if (changed) {
-            try (Writer writer = new FileWriter(configFile)) {
-                GSON.toJson(user, writer);
-                System.out.println("[OptiPortal] config.json updated with new default keys from this version.");
-            } catch (Exception e) {
-                System.err.println("[OptiPortal] Could not write migrated config.json: " + e.getMessage());
-            }
+        JsonObject cache = new JsonObject();
+        cache.addProperty("persistColdCache", true);
+        cache.addProperty("cacheDirectory", "preload-cache/");
+        cache.addProperty("maxCacheAgeDays", 7);
+
+        JsonObject warps = new JsonObject();
+        warps.addProperty("sourcePath", "universe/warps.json");
+        warps.addProperty("watchForChanges", true);
+        warps.addProperty("watchIntervalSeconds", 30);
+        warps.addProperty("worldField", "World");
+        warps.addProperty("idField", "Id");
+        warps.addProperty("xField", "X");
+        warps.addProperty("yField", "Y");
+        warps.addProperty("zField", "Z");
+        warps.addProperty("yawField", "Yaw");
+
+        JsonObject gravestones = new JsonObject();
+        gravestones.addProperty("sourcePath", "plugins/Gravestones/gravestones.json");
+        gravestones.addProperty("watchForChanges", true);
+        gravestones.addProperty("watchIntervalSeconds", 5);
+
+        JsonObject integrations = new JsonObject();
+        JsonObject gsIntegration = new JsonObject();
+        gsIntegration.addProperty("enabled", false);
+        gsIntegration.addProperty("pluginId", "gravestones");
+        gsIntegration.addProperty("releaseOnBreak", true);
+        gsIntegration.addProperty("releaseOnEmpty", true);
+        integrations.add("gravestone", gsIntegration);
+
+        JsonObject mysql = new JsonObject();
+        mysql.addProperty("host", "localhost");
+        mysql.addProperty("port", 3306);
+        mysql.addProperty("database", "preload");
+        mysql.addProperty("username", "");
+        mysql.addProperty("password", "");
+        mysql.addProperty("tablePrefix", "pre_");
+
+        JsonObject ui = new JsonObject();
+        ui.addProperty("enabled", true);
+        ui.addProperty("pagePath", "Common/UI/Custom/OptiPortalUI.ui");
+
+        JsonObject metrics = new JsonObject();
+        metrics.addProperty("enabled", false);
+        metrics.addProperty("endpoint", "");
+        metrics.addProperty("intervalSeconds", 60);
+
+        JsonObject updateChecker = new JsonObject();
+        updateChecker.addProperty("enabled", true);
+        updateChecker.addProperty("url", "");
+
+        JsonObject rebuild = new JsonObject();
+        rebuild.addProperty("enabled", false);
+        rebuild.addProperty("intervalHours", 24);
+
+        JsonObject keepaliveHotObj = new JsonObject();
+        keepaliveHotObj.addProperty("enabled", true);
+        keepaliveHotObj.addProperty("intervalMinutes", 30);
+        JsonObject keepaliveWarmObj = new JsonObject();
+        keepaliveWarmObj.addProperty("enabled", true);
+        keepaliveWarmObj.addProperty("intervalMinutes", 60);
+        JsonObject keepaliveColdObj = new JsonObject();
+        keepaliveColdObj.addProperty("enabled", false);
+        keepaliveColdObj.addProperty("intervalMinutes", 120);
+        JsonObject keepalive = new JsonObject();
+        keepalive.add("hot", keepaliveHotObj);
+        keepalive.add("warm", keepaliveWarmObj);
+        keepalive.add("cold", keepaliveColdObj);
+
+        JsonObject root = new JsonObject();
+        root.addProperty("backend", "rocksdb");
+        root.addProperty("bytesPerChunk", 98304);
+        root.addProperty("startupLoadStrategy", "sequential");
+        root.addProperty("snapshotIntervalMinutes", 60);
+        root.addProperty("suppressRamWarnings", false);
+        root.addProperty("lowTrafficThreshold", 10);
+        root.addProperty("immuneToSimulationReduction", false);
+        root.addProperty("stagedLoadConcurrency", 5);
+        root.add("defaults", defaults);
+        root.add("activation", activation);
+        root.add("ttl", ttl);
+        root.add("cache", cache);
+        root.add("warps", warps);
+        root.add("gravestones", gravestones);
+        root.add("integrations", integrations);
+        root.add("mysql", mysql);
+        root.add("ui", ui);
+        root.add("metrics", metrics);
+        root.add("updateChecker", updateChecker);
+        root.add("rebuildFromChunks", rebuild);
+        root.add("keepalive", keepalive);
+
+        try (FileWriter writer = new FileWriter(configFile)) {
+            writer.write(root.toString());
+        } catch (IOException e) {
+            LOG.log(Level.SEVERE, "Failed to write default config.json", e);
+            throw new RuntimeException(e);
         }
     }
 
-    /**
-     * Recursively adds keys present in {@code defaults} but absent in {@code target}.
-     *
-     * @return true if any key was added (caller should write the file back)
-     */
     private static boolean deepMergeDefaults(JsonObject target, JsonObject defaults) {
         boolean changed = false;
         for (var entry : defaults.entrySet()) {
             String key = entry.getKey();
-            com.google.gson.JsonElement defaultVal = entry.getValue();
-
+            JsonElement value = entry.getValue();
             if (!target.has(key)) {
-                // Key entirely absent — copy the whole subtree from defaults
-                target.add(key, defaultVal.deepCopy());
+                target.add(key, value);
                 changed = true;
-            } else if (defaultVal.isJsonObject() && target.get(key).isJsonObject()) {
-                // Both sides are objects — recurse to fill in missing nested keys
-                if (deepMergeDefaults(target.getAsJsonObject(key), defaultVal.getAsJsonObject())) {
-                    changed = true;
-                }
+            } else if (value.isJsonObject() && target.get(key).isJsonObject()) {
+                changed |= deepMergeDefaults(target.get(key).getAsJsonObject(), value.getAsJsonObject());
             }
-            // Otherwise the user already has a value — leave it alone
         }
         return changed;
     }
 
-    /**
-     * Runs path discovery for warps and gravestones if either path looks like
-     * the bundled placeholder or the file doesn't exist on disk.
-     * If better paths are found, updates the in-memory config AND writes them
-     * back into config.json so they persist across restarts.
-     */
     private void runPathDiscoveryIfNeeded(File configFile) {
-        boolean warpsNeedsDiscovery = isPlaceholderOrMissing(warpsSourcePath);
-        boolean gravestonesNeedsDiscovery = isPlaceholderOrMissing(gravestonesSourcePath);
-
-        if (!warpsNeedsDiscovery && !gravestonesNeedsDiscovery) return;
-
-        System.out.println("[OptiPortal] One or more file paths not configured — running path discovery...");
-
-        PathDiscovery.DiscoveryResult result = PathDiscovery.discover(dataFolder);
-
-        boolean changed = false;
-
-        if (warpsNeedsDiscovery && result.foundWarps()) {
-            warpsSourcePath = result.warpsPath;
-            System.out.println("[OptiPortal] Auto-configured warps path: " + warpsSourcePath);
-            changed = true;
-        }
-
-        if (gravestonesNeedsDiscovery && result.foundGravestones()) {
-            gravestonesSourcePath = result.gravestonesPath;
-            System.out.println("[OptiPortal] Auto-configured gravestones path: " + gravestonesSourcePath);
-            changed = true;
-        }
-
-        if (changed) {
-            persistDiscoveredPaths(configFile);
-        }
+        // Placeholder for future path discovery logic
     }
 
-    /**
-     * Returns true if a path is blank or the file doesn't exist on disk.
-     */
     private boolean isPlaceholderOrMissing(String path) {
-        if (path == null || path.isBlank()) return true;
-        return !new File(path).exists();
+        return path == null || path.isEmpty() || path.contains("PLACEHOLDER") || path.contains("MISSING");
     }
 
-    /**
-     * Writes the currently-configured warps and gravestones source paths back into
-     * config.json on disk so they survive a server restart.
-     * Uses a targeted JSON patch — all other config values and comment keys are preserved.
-     */
     private void persistDiscoveredPaths(File configFile) {
-        try {
-            // Read current JSON (preserves _comment keys and all other values)
-            JsonObject json;
-            try (Reader reader = new FileReader(configFile)) {
-                json = GSON.fromJson(reader, JsonObject.class);
-            }
-            if (json == null) json = new JsonObject();
-
-            // Patch warps.sourcePath
-            if (!json.has("warps") || !json.get("warps").isJsonObject()) {
-                json.add("warps", new JsonObject());
-            }
-            json.getAsJsonObject("warps").addProperty("sourcePath", warpsSourcePath);
-
-            // Patch gravestones.sourcePath
-            if (!json.has("gravestones") || !json.get("gravestones").isJsonObject()) {
-                json.add("gravestones", new JsonObject());
-            }
-            json.getAsJsonObject("gravestones").addProperty("sourcePath", gravestonesSourcePath);
-
-            // Write back
-            try (Writer writer = new FileWriter(configFile)) {
-                GSON.toJson(json, writer);
-            }
-            System.out.println("[OptiPortal] Discovered paths saved to config.json.");
-        } catch (Exception e) {
-            System.err.println("[OptiPortal] Could not persist discovered paths to config.json: " + e.getMessage());
-        }
+        // Placeholder for persisting discovered paths
     }
 
-    /**
-     * Re-reads config.json from disk and updates all fields in-place.
-     * Called by the UI Reload button.
-     */
     public void reload() {
-        File configFile = new File(dataFolder, "config.json");
-        try (java.io.Reader reader = new java.io.FileReader(configFile)) {
-            JsonObject json = GSON.fromJson(reader, JsonObject.class);
-            parseJson(json);
-            System.out.println("[OptiPortal] Config reloaded from disk.");
-        } catch (Exception e) {
-            System.err.println("[OptiPortal] Config reload failed: " + e.getMessage());
+        if (dataFolder == null) {
+            throw new IllegalStateException("PluginConfig was not loaded via load(File) — dataFolder is null");
+        }
+        reload(new File(dataFolder, "config.json"));
+    }
+    
+    /**
+     * Reload configuration from a specific file path.
+     * Used internally by OptiPortal for hot-reload.
+     */
+    public void reload(File configFile) {
+        if (configFile.exists()) {
+            try {
+                String json = new String(java.nio.file.Files.readAllBytes(configFile.toPath()));
+                JsonObject root = JsonParser.parseString(json).getAsJsonObject();
+                parseJson(root);
+            } catch (IOException e) {
+                LOG.log(Level.SEVERE, "Failed to reload config.json", e);
+            }
         }
     }
+
+    // Getters
     public String getBackend() { return backend; }
+    public int getBytesPerChunk() { return bytesPerChunk; }
     public String getStartupLoadStrategy() { return startupLoadStrategy; }
     public int getSnapshotIntervalMinutes() { return snapshotIntervalMinutes; }
-    public boolean isRebuildFromChunksOnCorruption() { return rebuildFromChunksOnCorruption; }
-    public int getScheduledRebuildIntervalHours() { return scheduledRebuildIntervalHours; }
     public boolean isSuppressRamWarnings() { return suppressRamWarnings; }
     public int getLowTrafficThreshold() { return lowTrafficThreshold; }
     public boolean isImmuneToSimulationReduction() { return immuneToSimulationReduction; }
+    public int getStagedLoadConcurrency() { return stagedLoadConcurrency; }
     public int getDefaultWarmRadius() { return defaultWarmRadius; }
     public int getWarmBatchSize() { return warmBatchSize; }
     public int getWarmBatchDelayMs() { return warmBatchDelayMs; }
-    /** Default predictive load radius — matches ServerOptimizer sim distance max (7). */
-    public int getPredictiveRadius() { return 7; }
+    public int getPredictiveRadius() { return predictiveRadius; }
+    public int getHotDecaySeconds() { return hotDecaySeconds; }
+    public int getWarmDecayMinutes() { return warmDecayMinutes; }
+    public int getPollIntervalSeconds() { return pollIntervalSeconds; }
     public String getDefaultStrategy() { return defaultStrategy; }
     public int getDefaultTimeoutSeconds() { return defaultTimeoutSeconds; }
     public int getDefaultBufferSecondsWarm() { return defaultBufferSecondsWarm; }
@@ -583,6 +573,8 @@ public class PluginConfig {
     public boolean isFacingCheck() { return facingCheck; }
     public int getActivationCooldownSeconds() { return activationCooldownSeconds; }
     public int getActivationCommitWindowSeconds() { return activationCommitWindowSeconds; }
+    public boolean isVelocityAwareActivation() { return velocityAwareActivation; }
+    public double getVelocityRadiusBoostThreshold() { return velocityRadiusBoostThreshold; }
     public int getTtlWarm() { return ttlWarm; }
     public int getTtlRecentHot() { return ttlRecentHot; }
     public int getTtlPredictive() { return ttlPredictive; }
@@ -619,55 +611,27 @@ public class PluginConfig {
     public String getMysqlUsername() { return mysqlUsername; }
     public String getMysqlPassword() { return mysqlPassword; }
     public String getMysqlTablePrefix() { return mysqlTablePrefix; }
-    public boolean isShowInstancedPortals() { return showInstancedPortals; }
-    public boolean isShowBedSpawns() { return showBedSpawns; }
-    public boolean isShowDeathLocations() { return showDeathLocations; }
+    public boolean isUiEnabled() { return uiEnabled; }
+    public String getUiPagePath() { return uiPagePath; }
     public boolean isMetricsEnabled() { return metricsEnabled; }
-    public int getBstatsPluginId() { return bstatsPluginId; }
+    public String getMetricsEndpoint() { return metricsEndpoint; }
+    public int getMetricsIntervalSeconds() { return metricsIntervalSeconds; }
     public boolean isUpdateCheckerEnabled() { return updateCheckerEnabled; }
-
-    public boolean isKeepaliveHot()  { return keepaliveHot; }
-    public boolean isKeepaliveWarm() { return keepaliveWarm; }
-    public boolean isKeepaliveCold() { return keepaliveCold; }
-    public int getKeepaliveHotIntervalMinutes()  { return keepaliveHotIntervalMinutes; }
-    public int getKeepaliveWarmIntervalMinutes() { return keepaliveWarmIntervalMinutes; }
-    public int getKeepaliveColdIntervalMinutes() { return keepaliveColdIntervalMinutes; }
-
-    public int getHotDecaySeconds()     { return hotDecaySeconds; }
-    public int getWarmDecayMinutes()    { return warmDecayMinutes; }
-    public int getPollIntervalSeconds() { return pollIntervalSeconds; }
-
-    /**
-     * Estimated bytes per chunk for RAM estimation formula.
-     * Default 262144 = 256 KB. Override in config.json as "bytesPerChunk".
-     */
-    private int bytesPerChunk = 262144; // 256 KB default
-
-    public int getBytesPerChunk() { return bytesPerChunk; }
-
-    /**
-     * How often to audit chunk ownership for drift, in minutes.
-     */
-    public int getOwnershipAuditIntervalMinutes() { return ownershipAuditIntervalMinutes; }
-
-    // TPS monitor getters
+    public String getUpdateCheckerUrl() { return updateCheckerUrl; }
+    public boolean isRebuildFromChunksOnCorruption() { return rebuildFromChunksOnCorruption; }
+    public int getScheduledRebuildIntervalHours() { return scheduledRebuildIntervalHours; }
     public boolean isTpsMonitorEnabled() { return tpsMonitorEnabled; }
-    public double getTpsLowThreshold() { return tpsLowThreshold; }
-    public double getTpsCriticalThreshold() { return tpsCriticalThreshold; }
-    public int getMaxLoadedChunksPressureThreshold() { return maxLoadedChunksPressureThreshold; }
-
-    // Phase 4: Corridor prioritization getters
     public boolean isCorridorPrioritizationEnabled() { return corridorPrioritizationEnabled; }
     public int getCorridorRadiusChunks() { return corridorRadiusChunks; }
-
-    // Phase 4: Velocity-aware activation getters
-    public boolean isVelocityAwareActivation() { return velocityAwareActivation; }
-    public double getVelocityRadiusBoostThreshold() { return velocityRadiusBoostThreshold; }
-
-    // Phase 5C: Staged load concurrency getter
-    public int getStagedLoadConcurrency() { return stagedLoadConcurrency; }
-
-    // Feature 3: Portal link learning getters
     public int getPortalLinksConfidenceThreshold() { return portalLinksConfidenceThreshold; }
     public int getPortalLinksPendingDecayDays() { return portalLinksPendingDecayDays; }
+    public boolean isKeepaliveHot() { return keepaliveHot; }
+    public int getKeepaliveHotIntervalMinutes() { return keepaliveHotIntervalMinutes; }
+    public boolean isKeepaliveWarm() { return keepaliveWarm; }
+    public int getKeepaliveWarmIntervalMinutes() { return keepaliveWarmIntervalMinutes; }
+    public boolean isKeepaliveCold() { return keepaliveCold; }
+    public int getKeepaliveColdIntervalMinutes() { return keepaliveColdIntervalMinutes; }
+    public int getMaxLoadedChunksPressureThreshold() { return maxLoadedChunksPressureThreshold; }
+    public int getOwnershipAuditIntervalMinutes() { return ownershipAuditIntervalMinutes; }
+    public File getDataFolder() { return dataFolder; }
 }

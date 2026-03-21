@@ -179,7 +179,7 @@ public class AsyncErrorHandler {
         }
 
         LOG.info("[OptiPortal] Retrying chunk load: " + cx + "," + cz);
-        return world.getChunkAsync(cx, cz)
+        return world.getChunkAsync(chunkIndex)
                 .thenApply(chunk -> {
                     if (chunk != null) {
                         circuitBreaker.recordSuccess();
@@ -189,9 +189,14 @@ public class AsyncErrorHandler {
                 });
     }
     
+    /** Expose the circuit breaker for status reporting. */
+    public CircuitBreaker getCircuitBreaker() {
+        return circuitBreaker;
+    }
+
     /**
      * Get current error statistics.
-     * 
+     *
      * @return Error statistics
      */
     public ErrorStats getErrorStats() {

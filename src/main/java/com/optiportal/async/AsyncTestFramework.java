@@ -311,7 +311,7 @@ public class AsyncTestFramework {
                 
                 // Check load balancer
                 AsyncLoadBalancer.LoadStats loadStats = loadBalancer.getLoadStats();
-                boolean loadBalancerHealthy = loadStats.activeOperations < loadStats.activeOperations + 10;
+                boolean loadBalancerHealthy = loadStats.activeOperations < 100;
                 
                 // Check metrics
                 AsyncMetrics.PerformanceSummary perfSummary = metrics.getPerformanceSummary();

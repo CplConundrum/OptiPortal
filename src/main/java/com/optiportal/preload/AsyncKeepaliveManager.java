@@ -31,6 +31,10 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
     private final AsyncLoadBalancer loadBalancer;
     private final AsyncMetrics metrics;
     private final com.optiportal.metrics.MetricsCollector metricsCollector;
+
+    /** Injected after construction to avoid circular dependency with AsyncTeleportInterceptor. */
+    private volatile java.util.function.Supplier<java.util.List<com.optiportal.model.PortalEntry>>
+            portalCacheSupplier;
     
     // Batch processing configuration
     private static final int DEFAULT_BATCH_SIZE = 50;
@@ -51,6 +55,11 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
         this.loadBalancer = loadBalancer;
         this.metrics = metrics;
         this.metricsCollector = metricsCollector;
+    }
+
+    public void setPortalCacheSupplier(
+            java.util.function.Supplier<java.util.List<com.optiportal.model.PortalEntry>> supplier) {
+        this.portalCacheSupplier = supplier;
     }
     
     /**
@@ -163,7 +172,9 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
     private Map<String, List<ChunkCoordinate>> groupChunksByWorld(CacheTier tier) {
         Map<String, List<ChunkCoordinate>> result = new HashMap<>();
         
-        List<PortalEntry> entries = getStorage().loadAll();
+        List<PortalEntry> entries = portalCacheSupplier != null
+                ? portalCacheSupplier.get()
+                : getStorage().loadAll();
         for (PortalEntry entry : entries) {
             if (entry.isInstanced()) continue;
             if (getCacheManager().getZoneTier(entry.getId()) != tier) continue;

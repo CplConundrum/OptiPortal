@@ -6,6 +6,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
+import com.hypixel.hytale.math.util.ChunkUtil;
 import com.optiportal.cache.CacheManager;
 import com.optiportal.config.PluginConfig;
 import com.optiportal.model.CacheTier;
@@ -139,7 +140,7 @@ public class KeepaliveManager {
             // not when it completes. getNonTickingChunkAsync resets GC reachability.
             for (int dx = -radiusX; dx <= radiusX; dx++) {
                 for (int dz = -radiusZ; dz <= radiusZ; dz++) {
-                    world.getNonTickingChunkAsync(cx + dx, cz + dz);
+                    world.getNonTickingChunkAsync(ChunkUtil.indexChunk(cx + dx, cz + dz));
                 }
             }
         }

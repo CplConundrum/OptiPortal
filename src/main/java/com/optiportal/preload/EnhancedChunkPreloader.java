@@ -12,6 +12,7 @@ import com.hypixel.hytale.server.core.universe.world.storage.ChunkStore;
 import com.optiportal.async.AsyncLoadBalancer;
 import com.optiportal.async.AsyncMetrics;
 import com.optiportal.async.WorldThreadBridge;
+import com.optiportal.async.WorldTpsMonitor;
 import com.optiportal.cache.CacheManager;
 import com.optiportal.config.PluginConfig;
 import com.optiportal.metrics.MetricsCollector;
@@ -38,10 +39,13 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
 
     /** Optional corridor index for path-proximity prioritization. Null = disabled. */
     private final CorridorIndex corridorIndex;
+
+    /** Optional TPS monitor for adaptive batch sizing (H5). Null = disabled. */
+    private volatile WorldTpsMonitor tpsMonitor;
     
     /** Complexity score cache — avoids recomputing score() for already-seen chunks. */
     private final ChunkComplexityScorer.Cache complexityCache = new ChunkComplexityScorer.Cache();
-    
+
     public EnhancedChunkPreloader(PluginConfig config,
                                   CacheManager cacheManager,
                                   WorldRegistry worldRegistry,
@@ -64,6 +68,35 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
         worldRegistry.addWorldUnloadCallback(complexityCache::clearWorld);
     }
     
+    /** Inject TPS monitor after construction to break circular dependency. */
+    public void setTpsMonitor(WorldTpsMonitor tpsMonitor) {
+        this.tpsMonitor = tpsMonitor;
+    }
+
+    /**
+     * TPS-adaptive batch size: halves under low TPS to avoid amplifying server load.
+     */
+    @Override
+    protected int getEffectiveBatchSize(String worldName) {
+        WorldTpsMonitor mon = this.tpsMonitor;
+        if (mon != null && mon.isServerUnderLoad()) {
+            return Math.max(1, getConfig().getWarmBatchSize() / 2);
+        }
+        return getConfig().getWarmBatchSize();
+    }
+
+    /**
+     * TPS-adaptive inter-batch delay: doubles under low TPS to give the server breathing room.
+     */
+    @Override
+    protected int getEffectiveBatchDelay(String worldName) {
+        WorldTpsMonitor mon = this.tpsMonitor;
+        if (mon != null && mon.isServerUnderLoad()) {
+            return getConfig().getWarmBatchDelayMs() * 2;
+        }
+        return getConfig().getWarmBatchDelayMs();
+    }
+
     /**
      * Backward-compat constructor without CorridorIndex — for callers not yet updated.
      */
@@ -186,6 +219,11 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
         if (chunks.isEmpty()) {
             return CompletableFuture.completedFuture(null);
         }
+
+        // H5: apply TPS-adaptive batch size cap — getEffectiveBatchSize() halves under low TPS.
+        // Takes the smaller of the load-balancer's suggestion and the TPS-adaptive limit so
+        // both mechanisms contribute without fighting each other.
+        batchSize = Math.min(batchSize, getEffectiveBatchSize(worldName));
 
         // Guard 1: JVM heap — stop loading if approaching the engine's desperate-eviction
         // threshold (85%). A 5% margin gives the GC time to act before the engine starts
@@ -310,51 +348,15 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
                                 String zoneId, double baseKbPerChunk, String worldName) {
         try {
             float complexity = complexityCache.getOrComputeScore(worldName, chunk.getX(), chunk.getZ(), chunk);
-            double measuredRamMB = complexityCache.getOrComputeRam(
-                    worldName, chunk.getX(), chunk.getZ(), chunk, baseKbPerChunk);
-  
             LOG.fine("[OptiPortal] Chunk scored: zone=" + zoneId
                     + " chunk=" + chunk.getX() + "," + chunk.getZ()
-                    + " complexity=" + String.format("%.3f", complexity)
-                    + " measuredRamMB=" + String.format("%.4f", measuredRamMB));
-          
-            // Update PortalEntry with measured RAM after first load
-            // This replaces the pre-load estimate with actual post-load measurement
-            updatePortalEntryRamEstimate(zoneId, worldName, chunk.getX(), chunk.getZ(), measuredRamMB);
+                    + " complexity=" + String.format("%.3f", complexity));
         } catch (Exception e) {
             LOG.fine("[OptiPortal] scoreAndRecord error: " + e.getMessage());
         }
     }
-    
-    /**
-     * Update the PortalEntry's ramMarginalMB with the measured post-load value.
-     * This implements Phase 3 improvement: RAM estimation using post-load chunk data.
-     *
-     * @param zoneId Zone ID (may be null for non-zone chunk loads)
-     * @param worldName World name
-     * @param cx Chunk X coordinate
-     * @param cz Chunk Z coordinate
-     * @param measuredRamMB Measured RAM in MB from post-load analysis
-     */
-    private void updatePortalEntryRamEstimate(String zoneId, String worldName, int cx, int cz, double measuredRamMB) {
-        if (zoneId == null) return; // No zone context, skip update
-        
-        // Try to find a matching PortalEntry for this zone
-        getStorage().loadById(zoneId).ifPresent(entry -> {
-            // Update ramMarginalMB with measured value
-            // This replaces the pre-load estimate with actual post-load measurement
-            double oldMarginal = entry.getRamMarginalMB();
-            entry.setRamMarginalMB(measuredRamMB);
-  
-            LOG.fine(() -> "[OptiPortal] Updated ramMarginalMB for zone '" + zoneId
-                    + "': " + String.format("%.4f", oldMarginal) + " → "
-                    + String.format("%.4f", measuredRamMB) + " MB");
-  
-            // Persist the updated entry
-            getStorage().save(entry);
-        });
-    }
-    
+
+
     /**
      * Get current load balancer statistics.
      * 

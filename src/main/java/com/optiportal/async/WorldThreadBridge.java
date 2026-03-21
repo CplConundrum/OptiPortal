@@ -12,6 +12,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.logging.Logger;
 
+import com.hypixel.hytale.math.util.ChunkUtil;
 import com.hypixel.hytale.math.vector.Transform;
 import com.hypixel.hytale.server.core.modules.entity.teleport.TeleportRecord;
 import com.hypixel.hytale.server.core.modules.physics.component.Velocity;
@@ -289,8 +290,8 @@ public class WorldThreadBridge {
         long startTime = System.currentTimeMillis();
         
         CompletableFuture<WorldChunk> future = nonTicking
-                ? world.getNonTickingChunkAsync(cx, cz)
-                : world.getChunkAsync(cx, cz);
+                ? world.getNonTickingChunkAsync(ChunkUtil.indexChunk(cx, cz))
+                : world.getChunkAsync(ChunkUtil.indexChunk(cx, cz));
         
         return future.whenComplete((chunk, ex) -> {
             long duration = System.currentTimeMillis() - startTime;

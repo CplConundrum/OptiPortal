@@ -149,6 +149,29 @@ public class PortalLinkRegistry {
         return links.containsKey(portalId);
     }
 
+    /** Returns an unmodifiable snapshot of the confirmed link map (both directions stored). */
+    public Map<String, String> getLinks() {
+        return java.util.Collections.unmodifiableMap(links);
+    }
+
+    /**
+     * Returns a snapshot of pending link candidates as a map of canonical key → observation count.
+     * Key format is "origin:destination" with the lexicographically-smaller ID first.
+     */
+    public Map<String, Integer> getPendingLinkCounts() {
+        Map<String, Integer> snapshot = new java.util.LinkedHashMap<>();
+        for (Map.Entry<String, PendingLink> e : pendingLinks.entrySet()) {
+            snapshot.put(e.getKey(), e.getValue().count);
+        }
+        return java.util.Collections.unmodifiableMap(snapshot);
+    }
+
+    /** Removes all pending (unconfirmed) link candidates and schedules a save. */
+    public synchronized void clearPendingLinks() {
+        pendingLinks.clear();
+        schedulePendingSave();
+    }
+
     /**
      * Manually remove a link (both directions). Useful if a portal is deleted.
      */

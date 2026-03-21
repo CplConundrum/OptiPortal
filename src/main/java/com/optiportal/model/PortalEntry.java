@@ -18,6 +18,9 @@ public class PortalEntry {
     private String creator;
     private Instant creationDate;
 
+    // Hytale API integration: UUID of the portal world (for O(1) world lookup)
+    private java.util.UUID destinationWorldUuid;
+
     // Plugin strategy data
     private WarmStrategy strategy = WarmStrategy.PREDICTIVE;
     private int warmRadius = -1;        // -1 = use global default
@@ -28,6 +31,7 @@ public class PortalEntry {
 
     // Activation config (null = use global defaults)
     private Double activationDistance = null;
+    private Double activationDistanceHorizontal = null; // Per-zone horizontal override
     private Double activationDistanceVertical = null;
     private String activationShape = null;
     private Boolean floorCeilingCheck = null;
@@ -114,6 +118,9 @@ public class PortalEntry {
     public Double getActivationDistance() { return activationDistance; }
     public void setActivationDistance(Double activationDistance) { this.activationDistance = activationDistance; }
 
+    public Double getActivationDistanceHorizontal() { return activationDistanceHorizontal; }
+    public void setActivationDistanceHorizontal(Double activationDistanceHorizontal) { this.activationDistanceHorizontal = activationDistanceHorizontal; }
+
     public Double getActivationDistanceVertical() { return activationDistanceVertical; }
     public void setActivationDistanceVertical(Double activationDistanceVertical) { this.activationDistanceVertical = activationDistanceVertical; }
 
@@ -150,6 +157,32 @@ public class PortalEntry {
 
     public EntryType getType() { return type; }
     public void setType(EntryType type) { this.type = type; }
+
+    // --- Hytale API integration getters/setters ---
+
+    public java.util.UUID getDestinationWorldUuid() { return destinationWorldUuid; }
+    public void setDestinationWorldUuid(java.util.UUID uuid) { this.destinationWorldUuid = uuid; }
+
+    /**
+     * Resolves the X-axis chunk radius for this entry using the same precedence as
+     * ChunkPreloader: warmRadiusX > warmRadius > defaultRadius.
+     * Used by PortalChunkListener to expand the reverseIndex to the full zone footprint.
+     */
+    public int resolvedRadiusX(int defaultRadius) {
+        if (warmRadiusX != null) return warmRadiusX;
+        if (warmRadius > 0) return warmRadius;
+        return defaultRadius;
+    }
+
+    /**
+     * Resolves the Z-axis chunk radius for this entry using the same precedence as
+     * ChunkPreloader: warmRadiusZ > warmRadius > defaultRadius.
+     */
+    public int resolvedRadiusZ(int defaultRadius) {
+        if (warmRadiusZ != null) return warmRadiusZ;
+        if (warmRadius > 0) return warmRadius;
+        return defaultRadius;
+    }
 
     /**
      * Returns true if this entry is for a bed or death location.

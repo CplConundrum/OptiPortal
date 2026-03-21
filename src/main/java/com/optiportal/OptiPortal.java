@@ -183,9 +183,13 @@ public class OptiPortal extends JavaPlugin {
             chunkPreloader = new EnhancedChunkPreloader(config, cacheManager, worldRegistry, executor,
                     worldBridge, loadBalancer, metrics, storage, metricsCollector, corridorIndex);
             warmZoneManager.setChunkPreloader(chunkPreloader); // break circular dep via setter
+            // H5: inject TPS monitor for adaptive batch sizing
+            if (chunkPreloader instanceof EnhancedChunkPreloader) {
+                ((EnhancedChunkPreloader) chunkPreloader).setTpsMonitor(tpsMonitor);
+            }
 
             // PortalChunkListener — auto-detects PortalDevice blocks and promotes COLD zones
-            portalChunkListener = new PortalChunkListener(storage, cacheManager, warmZoneManager);
+            portalChunkListener = new PortalChunkListener(storage, cacheManager, warmZoneManager, config);
 
             // Register AllWorldsLoadedEvent listener — actual chunk loading is gated on this
             warmZoneManager.registerWorldsLoadedListener(getEventRegistry());
@@ -194,6 +198,10 @@ public class OptiPortal extends JavaPlugin {
             worldRegistry.addWorldLoadCallback(warmZoneManager::scanWorldForPortalDestination);
             // Register portal chunk listener for new worlds
             worldRegistry.addWorldLoadCallback(portalChunkListener::register);
+
+            // H6: evict stale zone state when a world is destroyed
+            worldRegistry.addWorldRemoveCallback(warmZoneManager::onWorldRemoved);
+            worldRegistry.addWorldRemoveCallback(portalChunkListener::onWorldRemoved);
 
             // Seed from Universe to capture already-live worlds (fires callbacks)
             worldRegistry.seedFromUniverse();
@@ -246,6 +254,7 @@ public class OptiPortal extends JavaPlugin {
             keepaliveManager = new AsyncKeepaliveManager(
                     config, cacheManager, chunkPreloader, storage, executor, worldBridge, loadBalancer, metrics, metricsCollector);
             keepaliveManager.start();
+            keepaliveManager.setPortalCacheSupplier(teleportInterceptor::getPortalCache);
 
             // TTL enforcer — runs scheduled cleanup to evict expired entries
             ttlEnforcer = new ZoneTtlEnforcer(config, storage, cacheManager, executor);
@@ -363,8 +372,8 @@ public class OptiPortal extends JavaPlugin {
      * Registers a warm zone programmatically without touching config.
      * Useful for other plugins to designate high-traffic areas.
      */
-    public void registerWarmZone(String id, double x, double y, double z, int radius) {
-        warmZoneManager.registerWarmZone(id, x, y, z, radius);
+    public void registerWarmZone(String id, String worldName, double x, double y, double z, int radius) {
+        warmZoneManager.registerWarmZone(id, worldName, x, y, z, radius);
     }
 
     /**
@@ -429,5 +438,15 @@ public class OptiPortal extends JavaPlugin {
         return errorHandler;
     }
 
-    
+    public com.optiportal.async.WorldTpsMonitor getTpsMonitor() {
+        return tpsMonitor;
+    }
+
+    public com.optiportal.preload.PortalLinkRegistry getPortalLinkRegistry() {
+        return portalLinkRegistry;
+    }
+
+    public PortalChunkListener getPortalChunkListener() {
+        return portalChunkListener;
+    }
 }

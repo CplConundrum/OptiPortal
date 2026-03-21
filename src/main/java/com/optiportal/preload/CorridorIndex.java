@@ -4,6 +4,7 @@ import java.util.Map;
 import java.util.logging.Logger;
 
 import com.hypixel.hytale.event.EventRegistry;
+import com.hypixel.hytale.math.util.ChunkUtil;
 import com.hypixel.hytale.math.vector.Transform;
 import com.hypixel.hytale.server.core.universe.world.World;
 import com.hypixel.hytale.server.core.universe.world.path.WorldPath;
@@ -86,9 +87,9 @@ public class CorridorIndex {
                         waypointCount++;
 
                         // Convert world-space X,Z to chunk coordinates.
-                        // Chunk coord = floor(worldCoord / 16)
-                        int wpCx = (int) Math.floor(waypoint.getPosition().x / 16.0);
-                        int wpCz = (int) Math.floor(waypoint.getPosition().z / 16.0);
+                        // Hytale chunks are 32 blocks wide — use ChunkUtil.chunkCoordinate().
+                        int wpCx = ChunkUtil.chunkCoordinate(waypoint.getPosition().x);
+                        int wpCz = ChunkUtil.chunkCoordinate(waypoint.getPosition().z);
 
                         // Add all chunks within corridorRadiusChunks (square radius)
                         for (int dx = -corridorRadiusChunks; dx <= corridorRadiusChunks; dx++) {

@@ -50,6 +50,8 @@ public class PreloadCommand extends AbstractCommand {
                     com.hypixel.hytale.server.core.universe.world.World world =
                             plugin.getChunkPreloader().getWorldRegistry().getWorldForPlayer(playerRef);
                     if (world != null) {
+                        // Fetch storage data off the world thread to avoid blocking it
+                        List<com.optiportal.model.PortalEntry> zones = plugin.getStorage().loadAll();
                         world.execute(() -> {
                             @SuppressWarnings("unchecked")
                             com.hypixel.hytale.server.core.entity.entities.Player player =
@@ -57,7 +59,7 @@ public class PreloadCommand extends AbstractCommand {
                                     playerRef.getComponent(
                                             com.hypixel.hytale.server.core.entity.entities.Player.getComponentType());
                             if (player != null) {
-                                com.optiportal.ui.OptiPortalUIPage.openFor(player, playerRef, plugin);
+                                com.optiportal.ui.OptiPortalUIPage.openFor(player, playerRef, plugin, zones);
                             }
                         });
                         return done();
@@ -74,6 +76,7 @@ public class PreloadCommand extends AbstractCommand {
             case "shape"     -> handleShape(context, args);
             case "radius"    -> handleRadius(context, args);
             case "radiusxz"  -> handleRadiusXZ(context, args);
+            case "activation"-> handleActivation(context, args);
             case "migrate"   -> handleMigrate(context, args);
             case "ram"       -> handleRam(context);
             case "reload"    -> handleReload(context);
@@ -82,6 +85,12 @@ public class PreloadCommand extends AbstractCommand {
             case "refresh"   -> handleRefresh(context, args);
             case "backup"    -> handleBackup(context, args);
             case "preload"   -> handleForcePreload(context, args);
+            case "status"    -> handleStatus(context);
+            case "links"     -> handleLinks(context, args);
+            case "ttl"       -> handleTtl(context, args);
+            case "zone"      -> handleZone(context, args);
+            case "delete"    -> handleDelete(context, args);
+            case "flush"     -> handleFlush(context);
             case "help"      -> handleHelp(context);
             default -> {
                 reply(context, "[OptiPortal] Unknown subcommand: " + args[0] + ". Try /preload help.");
@@ -101,6 +110,8 @@ public class PreloadCommand extends AbstractCommand {
         reply(ctx, "  /preload shape <id> <ELLIPSOID|CYLINDER|BOX> — set activation shape");
         reply(ctx, "  /preload radius <id> <X> [Z] — set asymmetric radius (Z defaults to X)");
         reply(ctx, "  /preload radiusxz <id> <rx> <rz> — set asymmetric radius (deprecated, use radius)");
+        reply(ctx, "  /preload activation <id> <distance> — set per-zone horizontal activation distance");
+        reply(ctx, "  /preload activation <id> reset — reset to global default");
         reply(ctx, "  /preload setwarm <id> [radius] — set WARM and preload now");
         reply(ctx, "  /preload unsetwarm <id> — revert to PREDICTIVE");
         reply(ctx, "  /preload preload <id> — force predictive preload");
@@ -109,6 +120,12 @@ public class PreloadCommand extends AbstractCommand {
         reply(ctx, "  /preload reload — hot-reload config.json (see output for what takes effect immediately)");
         reply(ctx, "  /preload migrate <JSON|SQLITE|H2|MYSQL> — migration instructions");
         reply(ctx, "  /preload backup <list|restore <date>> — WAL backups");
+        reply(ctx, "  /preload status — async infrastructure health (circuit breaker, TPS, zone tiers)");
+        reply(ctx, "  /preload links [remove <id>|clear-pending] — list or manage portal links");
+        reply(ctx, "  /preload ttl <id> <days|-1|reset> — set per-zone TTL override");
+        reply(ctx, "  /preload zone <id> — per-zone diagnostic information");
+        reply(ctx, "  /preload delete <id> — delete zone with full cleanup");
+        reply(ctx, "  /preload flush — force-write all zone entries to storage");
         return done();
     }
 
@@ -300,6 +317,268 @@ public class PreloadCommand extends AbstractCommand {
             reply(ctx, "[OptiPortal] Force-preloading " + id + " (world=" + entry.getWorld() + " r=" + radius + ")");
             return CompletableFuture.<Void>completedFuture(null);
         }).orElseGet(() -> { reply(ctx, "[OptiPortal] Portal '" + id + "' not found."); return done(); });
+    }
+
+    private CompletableFuture<Void> handleStatus(CommandContext ctx) {
+        com.optiportal.async.CircuitBreaker cb = plugin.getAsyncErrorHandler().getCircuitBreaker();
+        com.optiportal.async.CircuitBreaker.CircuitBreakerStats cbStats = cb.getStats();
+        com.optiportal.async.AsyncLoadBalancer.LoadStats lb = plugin.getAsyncLoadBalancer().getLoadStats();
+        com.optiportal.async.WorldTpsMonitor tps = plugin.getTpsMonitor();
+        java.util.Map<com.optiportal.model.CacheTier, Integer> tiers = plugin.getCacheManager().getTierCounts();
+        int totalChunks = plugin.getChunkPreloader().getWorldRegistry().getTotalLoadedChunkCount();
+
+        String tpsLabel;
+        double tpsVal;
+        if (tps == null) {
+            tpsVal = -1;
+            tpsLabel = "N/A (disabled)";
+        } else {
+            tpsVal = tps.getCurrentTps();
+            tpsLabel = tps.isCriticallyLoaded() ? "critical"
+                     : tps.isServerUnderLoad()  ? "under load"
+                     : "nominal";
+        }
+
+        reply(ctx, "[OptiPortal] Status — v1.1.1");
+        reply(ctx, String.format("  Circuit breaker : %s  (failures=%d)", cbStats.state, cbStats.failureCount));
+        reply(ctx, String.format("  Load balancer   : active=%d queued=%d avgTime=%.0fms batchSize=%d",
+                lb.activeOperations, lb.queuedTasks, lb.averageExecutionTime, lb.currentBatchSize));
+        if (tpsVal < 0) {
+            reply(ctx, "  TPS             : N/A (monitor disabled)");
+        } else {
+            reply(ctx, String.format("  TPS             : %.1f tps  (%s)", tpsVal, tpsLabel));
+        }
+        reply(ctx, String.format("  Server chunks   : %d loaded", totalChunks));
+        reply(ctx, String.format("  Zone registry   : %d HOT  |  %d WARM  |  %d COLD  |  %d UNVISITED",
+                tiers.getOrDefault(com.optiportal.model.CacheTier.HOT, 0),
+                tiers.getOrDefault(com.optiportal.model.CacheTier.WARM, 0),
+                tiers.getOrDefault(com.optiportal.model.CacheTier.COLD, 0),
+                tiers.getOrDefault(com.optiportal.model.CacheTier.UNVISITED, 0)));
+        return done();
+    }
+
+    private CompletableFuture<Void> handleLinks(CommandContext ctx, String[] args) {
+        com.optiportal.preload.PortalLinkRegistry reg = plugin.getPortalLinkRegistry();
+        if (reg == null) {
+            reply(ctx, "[OptiPortal] Portal link registry not available.");
+            return done();
+        }
+
+        if (args.length >= 2 && args[1].equalsIgnoreCase("clear-pending")) {
+            int before = reg.getPendingLinkCounts().size();
+            reg.clearPendingLinks();
+            reply(ctx, "[OptiPortal] Cleared " + before + " pending link(s).");
+            return done();
+        }
+
+        if (args.length >= 3 && args[1].equalsIgnoreCase("remove")) {
+            String id = args[2];
+            String linked = reg.getLinkedPortal(id);
+            if (linked == null) {
+                reply(ctx, "[OptiPortal] No confirmed link found for '" + id + "'.");
+            } else {
+                reg.removeLink(id);
+                reply(ctx, "[OptiPortal] Link removed: " + id + " ↔ " + linked + ".");
+            }
+            return done();
+        }
+
+        // Default: list all
+        java.util.Map<String, String> confirmed = reg.getLinks();
+        java.util.Map<String, Integer> pending = reg.getPendingLinkCounts();
+
+        // Deduplicate confirmed — both directions are stored, show each pair once
+        java.util.Set<String> seen = new java.util.LinkedHashSet<>();
+        java.util.List<String> pairs = new java.util.ArrayList<>();
+        for (java.util.Map.Entry<String, String> e : confirmed.entrySet()) {
+            String key = e.getKey().compareTo(e.getValue()) <= 0
+                    ? e.getKey() + "↔" + e.getValue()
+                    : e.getValue() + "↔" + e.getKey();
+            if (seen.add(key)) pairs.add(e.getKey() + " ↔ " + e.getValue());
+        }
+
+        int confirmedCount = pairs.size();
+        int pendingCount   = pending.size();
+        reply(ctx, String.format("[OptiPortal] Portal links (%d confirmed, %d pending):", confirmedCount, pendingCount));
+        if (!pairs.isEmpty()) {
+            reply(ctx, "  Confirmed:");
+            for (String pair : pairs) reply(ctx, "    " + pair);
+        }
+        if (!pending.isEmpty()) {
+            reply(ctx, "  Pending (threshold: " + plugin.getPluginConfig().getPortalLinksConfidenceThreshold() + "):");
+            for (java.util.Map.Entry<String, Integer> e : pending.entrySet()) {
+                String[] parts = e.getKey().split(":", 2);
+                String display = parts.length == 2 ? parts[0] + " → " + parts[1] : e.getKey();
+                reply(ctx, "    " + display + "  (" + e.getValue() + "/"
+                        + plugin.getPluginConfig().getPortalLinksConfidenceThreshold() + " observations)");
+            }
+        }
+        return done();
+    }
+
+    private CompletableFuture<Void> handleTtl(CommandContext ctx, String[] args) {
+        if (args.length < 3) {
+            reply(ctx, "Usage: /preload ttl <id> <days|-1|reset>");
+            return done();
+        }
+        String id  = args[1];
+        String val = args[2];
+        return plugin.getStorage().loadById(id).map(entry -> {
+            if (val.equalsIgnoreCase("reset")) {
+                entry.setCacheTTLDays(null);
+                plugin.getStorage().save(entry);
+                reply(ctx, "[OptiPortal] " + id + " TTL cleared (uses global default).");
+            } else {
+                int days;
+                try { days = Integer.parseInt(val); }
+                catch (NumberFormatException e) {
+                    reply(ctx, "[OptiPortal] Days must be an integer or 'reset'.");
+                    return CompletableFuture.<Void>completedFuture(null);
+                }
+                entry.setCacheTTLDays(days == -1 ? null : days);
+                plugin.getStorage().save(entry);
+                reply(ctx, days == -1
+                        ? "[OptiPortal] " + id + " TTL → never expire (-1)."
+                        : "[OptiPortal] " + id + " TTL → " + days + " day(s).");
+            }
+            return CompletableFuture.<Void>completedFuture(null);
+        }).orElseGet(() -> {
+            reply(ctx, "[OptiPortal] Portal '" + id + "' not found.");
+            return done();
+        });
+    }
+
+    // F1 — /preload activation <id> <distance> | <id> reset
+    private CompletableFuture<Void> handleActivation(CommandContext ctx, String[] args) {
+        if (args.length < 3) {
+            reply(ctx, "Usage: /preload activation <id> <distance> | <id> reset");
+            return done();
+        }
+        String id = args[1];
+        
+        return plugin.getStorage().loadById(id).map(entry -> {
+            if (args.length >= 3 && !args[2].equalsIgnoreCase("reset")) {
+                // Set horizontal activation distance
+                double distance;
+                try {
+                    distance = Double.parseDouble(args[2]);
+                } catch (NumberFormatException e) {
+                    reply(ctx, "[OptiPortal] Distance must be a number.");
+                    return CompletableFuture.<Void>completedFuture(null);
+                }
+                entry.setActivationDistanceHorizontal(distance);
+                plugin.getStorage().save(entry);
+                reply(ctx, "[OptiPortal] " + id + " horizontal activation distance → " + distance);
+            } else {
+                // Reset to global default
+                entry.setActivationDistanceHorizontal(null);
+                plugin.getStorage().save(entry);
+                reply(ctx, "[OptiPortal] " + id + " horizontal activation distance reset (uses global default).");
+            }
+            return CompletableFuture.<Void>completedFuture(null);
+        }).orElseGet(() -> {
+            reply(ctx, "[OptiPortal] Portal '" + id + "' not found.");
+            return done();
+        });
+    }
+
+    // F2 — /preload zone <id> — diagnostic command
+    private CompletableFuture<Void> handleZone(CommandContext ctx, String[] args) {
+        if (args.length < 2) {
+            reply(ctx, "Usage: /preload zone <id>");
+            return done();
+        }
+        String id = args[1];
+        
+        return plugin.getStorage().loadById(id).map(entry -> {
+            com.optiportal.model.CacheTier tier = plugin.getCacheManager().getZoneTier(id);
+            long tierAgeMs = plugin.getCacheManager().getZoneTierAgeMs(id);
+            int ownedChunks = plugin.getCacheManager().getOwnedChunkCount(id);
+            
+            reply(ctx, "[OptiPortal] Zone diagnostics for '" + id + "':");
+            reply(ctx, "  Strategy: " + entry.getStrategy());
+            reply(ctx, "  World: " + entry.getWorld());
+            reply(ctx, "  Position: (" + String.format("%.2f", entry.getX()) + ", "
+                    + String.format("%.2f", entry.getY()) + ", " + String.format("%.2f", entry.getZ()) + ")");
+            reply(ctx, "  Warm radius: " + (entry.getWarmRadius() >= 0 ? entry.getWarmRadius() : "default"));
+            reply(ctx, "  Warm radius X/Z: " + (entry.getWarmRadiusX() != null ? entry.getWarmRadiusX() + "x" + entry.getWarmRadiusZ() : "N/A"));
+            reply(ctx, "  Activation shape: " + (entry.getActivationShape() != null ? entry.getActivationShape() : "global"));
+            reply(ctx, "  Activation distance (H): " + (entry.getActivationDistanceHorizontal() != null ? entry.getActivationDistanceHorizontal() : "global"));
+            reply(ctx, "  Activation distance (V): " + (entry.getActivationDistanceVertical() != null ? entry.getActivationDistanceVertical() : "global"));
+            reply(ctx, "  Cache tier: " + tier);
+            reply(ctx, "  Tier age: " + (tierAgeMs > 0 ? String.format("%.1fs", tierAgeMs / 1000.0) : "N/A"));
+            reply(ctx, "  Owned chunks: " + ownedChunks);
+            reply(ctx, "  RAM est: " + String.format("%.1fMB", entry.getRamEstimatedMB()));
+            reply(ctx, "  Preload count: " + entry.getPreloadCount());
+            reply(ctx, "  Last active: " + (entry.getLastActive() != null ? entry.getLastActive() : "N/A"));
+            reply(ctx, "  Entry type: " + entry.getType());
+            return CompletableFuture.<Void>completedFuture(null);
+        }).orElseGet(() -> {
+            reply(ctx, "[OptiPortal] Portal '" + id + "' not found.");
+            return done();
+        });
+    }
+
+    private CompletableFuture<Void> handleFlush(CommandContext ctx) {
+        List<PortalEntry> all = plugin.getStorage().loadAll();
+        com.optiportal.config.PluginConfig cfg = plugin.getPluginConfig();
+        for (PortalEntry entry : all) {
+            int fallback = entry.getStrategy() == WarmStrategy.WARM
+                    ? cfg.getDefaultWarmRadius() : cfg.getPredictiveRadius();
+            int rx = entry.getWarmRadiusX() != null ? entry.getWarmRadiusX()
+                   : entry.getWarmRadius() > 0      ? entry.getWarmRadius()
+                   : fallback;
+            int rz = entry.getWarmRadiusZ() != null ? entry.getWarmRadiusZ()
+                   : entry.getWarmRadius() > 0      ? entry.getWarmRadius()
+                   : fallback;
+            int chunkCount = (2 * rx + 1) * (2 * rz + 1);
+            plugin.getChunkPreloader().updateEntryStats(entry, chunkCount);
+        }
+        plugin.getStorage().saveAll(all);
+        reply(ctx, "[OptiPortal] Flushed " + all.size() + " zone(s) to "
+                + plugin.getPluginConfig().getBackend().toUpperCase()
+                + " with recalculated RAM values.");
+        return done();
+    }
+
+    // F3 — /preload delete <id> — proper zone deletion with full cleanup
+    private CompletableFuture<Void> handleDelete(CommandContext ctx, String[] args) {
+        if (args.length < 2) {
+            reply(ctx, "Usage: /preload delete <id>");
+            return done();
+        }
+        String id = args[1];
+        
+        return plugin.getStorage().loadById(id).map(entry -> {
+            String world = entry.getWorld();
+
+            // Step 1: Release keep-loaded pins and deregister chunk ownership
+            plugin.getCacheManager().deregisterAllChunks(id);
+
+            // Step 2: Remove tier and timestamp entries
+            plugin.getCacheManager().removeTierEntry(id);
+
+            // Step 3: Remove from portal chunk listener reverse index
+            var portalChunkListener = plugin.getPortalChunkListener();
+            if (portalChunkListener != null) {
+                portalChunkListener.removeFromIndex(id);
+            }
+
+            // Step 4: Remove any confirmed or pending portal links
+            plugin.getPortalLinkRegistry().removeLink(id);
+
+            // Step 5: Delete from storage
+            plugin.getStorage().delete(id);
+
+            // Step 6: Invalidate in-memory portal cache
+            plugin.getTeleportInterceptor().refreshPortalCache();
+
+            reply(ctx, "[OptiPortal] Deleted zone '" + id + "' (world=" + world + ").");
+            return CompletableFuture.<Void>completedFuture(null);
+        }).orElseGet(() -> {
+            reply(ctx, "[OptiPortal] Portal '" + id + "' not found.");
+            return done();
+        });
     }
 
     // -------------------------------------------------------------------------
