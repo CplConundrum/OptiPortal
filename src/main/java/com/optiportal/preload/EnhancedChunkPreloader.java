@@ -251,20 +251,17 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
             }
         }
         
-        // Process chunks in adaptive batches
-        List<CompletableFuture<Void>> batchFutures = new ArrayList<>();
-        
-        for (int i = 0; i < chunks.size(); i += batchSize) {
-            List<int[]> batch = chunks.subList(i, Math.min(i + batchSize, chunks.size()));
+        // Process chunks in sequential batches so each batch starts only after the previous
+        // completes — prevents all batches hammering the world thread simultaneously.
+        CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
 
-            // Load batch with proper async handling
-            CompletableFuture<Void> batchFuture = loadChunkBatch(worldName, batch, nonTicking, zoneId);
-            batchFutures.add(batchFuture);
+        for (int i = 0; i < chunks.size(); i += batchSize) {
+            final List<int[]> batch = chunks.subList(i, Math.min(i + batchSize, chunks.size()));
+            chain = chain.thenCompose(ignored -> loadChunkBatch(worldName, batch, nonTicking, zoneId));
         }
-        
-        // Wait for all batches — ownership is registered per-chunk in loadChunkBatch
-        return CompletableFuture.allOf(batchFutures.toArray(CompletableFuture[]::new))
-                .whenComplete((result, ex) -> {
+
+        // Ownership is registered per-chunk in loadChunkBatch
+        return chain.whenComplete((result, ex) -> {
                     if (ex == null) {
                         LOG.fine(() -> "[OptiPortal] Enhanced chunk load completed: " + zoneId +
                                 " (" + chunks.size() + " chunks)");

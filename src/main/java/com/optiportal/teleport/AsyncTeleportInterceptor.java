@@ -8,6 +8,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 
 import com.hypixel.hytale.builtin.portals.resources.PortalWorld;
@@ -50,6 +51,9 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
     // Staggered position update configuration
     private static final int POSITION_UPDATE_BATCH_SIZE = 10;
     private static final int POSITION_UPDATE_INTERVAL_MS = 200;
+
+    // Round-robin cursor for fair player batch selection
+    private final AtomicInteger batchCursor = new AtomicInteger(0);
     
     public AsyncTeleportInterceptor(OptiPortal plugin, PluginConfig config,
                                    WarmZoneManager warmZoneManager,
@@ -106,16 +110,18 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
     }
     
     protected boolean isOnCooldown(UUID playerId, String zoneId) {
+        if (playerId == null) return false;
         Long last = getCooldowns()
-                .computeIfAbsent(playerId != null ? playerId : new UUID(0, 0), k -> new ConcurrentHashMap<>())
+                .computeIfAbsent(playerId, k -> new ConcurrentHashMap<>())
                 .get(zoneId);
         if (last == null) return false;
         return (System.currentTimeMillis() - last) < (getConfig().getActivationCooldownSeconds() * 1000L);
     }
-    
+
     protected void recordCooldown(UUID playerId, String zoneId) {
+        if (playerId == null) return;
         getCooldowns()
-                .computeIfAbsent(playerId != null ? playerId : new UUID(0, 0), k -> new ConcurrentHashMap<>())
+                .computeIfAbsent(playerId, k -> new ConcurrentHashMap<>())
                 .put(zoneId, System.currentTimeMillis());
     }
     
@@ -201,21 +207,22 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
      * @return List of player IDs to update
      */
     private List<UUID> getNextPlayerBatch() {
-        List<UUID> batch = new ArrayList<>();
-        int processed = 0;
-        
-        for (UUID playerId : getPlayerRefs().keySet()) {
-            if (processed >= POSITION_UPDATE_BATCH_SIZE) {
-                break;
-            }
-  
+        List<UUID> allPlayers = new ArrayList<>(getPlayerRefs().keySet());
+        int total = allPlayers.size();
+        if (total == 0) return Collections.emptyList();
+
+        // Advance cursor by one batch each call for round-robin fairness
+        int start = batchCursor.getAndAdd(POSITION_UPDATE_BATCH_SIZE) % total;
+
+        List<UUID> batch = new ArrayList<>(POSITION_UPDATE_BATCH_SIZE);
+        for (int i = 0; i < total && batch.size() < POSITION_UPDATE_BATCH_SIZE; i++) {
+            UUID playerId = allPlayers.get((start + i) % total);
             PlayerPositionCache cache = positionCaches.get(playerId);
             if (cache == null || cache.shouldUpdate()) {
                 batch.add(playerId);
-                processed++;
             }
         }
-        
+
         return batch;
     }
     

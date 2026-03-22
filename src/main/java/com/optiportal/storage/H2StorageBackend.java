@@ -35,8 +35,8 @@ public class H2StorageBackend extends AbstractSqlStorageBackend {
                 instanced, notes, cache_ttl_days,
                 ram_estimated, ram_marginal,
                 preload_count, last_cache_tier, last_active, last_status,
-                entry_type, updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                entry_type, activation_json, destination_world_uuid, updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
                 world=excluded.world, x=excluded.x, y=excluded.y, z=excluded.z,
                 yaw=excluded.yaw, strategy=excluded.strategy,
@@ -46,7 +46,9 @@ public class H2StorageBackend extends AbstractSqlStorageBackend {
                 ram_estimated=excluded.ram_estimated, ram_marginal=excluded.ram_marginal,
                 preload_count=excluded.preload_count, last_cache_tier=excluded.last_cache_tier,
                 last_active=excluded.last_active, last_status=excluded.last_status,
-                entry_type=excluded.entry_type, updated_at=excluded.updated_at
+                entry_type=excluded.entry_type, activation_json=excluded.activation_json,
+                destination_world_uuid=excluded.destination_world_uuid,
+                updated_at=excluded.updated_at
         """;
     }
 

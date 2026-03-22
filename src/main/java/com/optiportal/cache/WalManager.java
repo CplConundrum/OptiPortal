@@ -1,9 +1,12 @@
 package com.optiportal.cache;
 
 import java.io.File;
-import java.io.FileWriter;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.OutputStreamWriter;
 import java.io.Writer;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.BasicFileAttributes;
@@ -68,8 +71,13 @@ public class WalManager {
      */
     public void writeAtomic(File target, String content) throws IOException {
         File tmp = new File(target.getParent(), target.getName() + ".tmp");
-        try (Writer w = new FileWriter(tmp)) {
+        try (FileOutputStream fos = new FileOutputStream(tmp);
+             FileChannel channel = fos.getChannel();
+             Writer w = new OutputStreamWriter(fos, StandardCharsets.UTF_8)) {
             w.write(content);
+            w.flush();
+            // fsync before rename so content is on disk before the file is visible
+            channel.force(true);
         }
         // Atomic rename — on most OS this is atomic at filesystem level
         if (!tmp.renameTo(target)) {

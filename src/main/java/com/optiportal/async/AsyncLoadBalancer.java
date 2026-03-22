@@ -41,6 +41,7 @@ public class AsyncLoadBalancer {
     // EMA for execution time — α=0.1 gives ~95% weight to last 29 samples
     private static final double EMA_ALPHA = 0.1;
     private volatile double emaExecutionTimeMs = 0.0;
+    private final Object emaLock = new Object();
     
     // Priority queues
     private final ConcurrentHashMap<AsyncMetrics.AsyncTaskPriority, ConcurrentLinkedDeque<Supplier<CompletableFuture<Void>>>> pendingTasks =
@@ -258,8 +259,10 @@ public class AsyncLoadBalancer {
             activeOperations.decrementAndGet();
             totalExecutionTime.addAndGet(duration);  // keep for LoadStats.totalOperations context
 
-            // Update EMA — volatile double, no lock needed (slight race acceptable; result converges)
-            emaExecutionTimeMs = EMA_ALPHA * duration + (1.0 - EMA_ALPHA) * emaExecutionTimeMs;
+            // Update EMA — synchronized to prevent non-atomic read-modify-write races
+            synchronized (emaLock) {
+                emaExecutionTimeMs = EMA_ALPHA * duration + (1.0 - EMA_ALPHA) * emaExecutionTimeMs;
+            }
 
             if (metrics != null) {
                 metrics.recordAsyncTaskComplete(priority, duration);
@@ -357,7 +360,9 @@ public class AsyncLoadBalancer {
      * @return EMA of execution time in milliseconds
      */
     private double getAverageExecutionTime() {
-        return emaExecutionTimeMs;
+        synchronized (emaLock) {
+            return emaExecutionTimeMs;
+        }
     }
     
     /**

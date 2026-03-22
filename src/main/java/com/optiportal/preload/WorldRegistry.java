@@ -132,15 +132,11 @@ public class WorldRegistry {
         try {
             java.util.UUID worldUuid = playerRef.getWorldUuid();
             if (worldUuid != null) {
-                for (World w : worlds.values()) {
-                    // World UUID is the UUID of its EntityStore's first ref, or matched via getName()
-                    // against the world UUID stored in TeleportRecord. Since World has no getUUID(),
-                    // we match by checking if the world's entity store contains the player's ref UUID.
-                    com.hypixel.hytale.component.Ref<com.hypixel.hytale.server.core.universe.world.storage.EntityStore> ref =
-                            w.getEntityStore().getRefFromUUID(playerRef.getUuid());
-                    if (ref != null) {
-                        return w;
-                    }
+                // playerRef.getWorldUuid() is set from WorldConfig.getUuid() via updatePosition(),
+                // which is the same UUID key used by Universe.getWorld(UUID) — O(1) lookup.
+                World w = Universe.get().getWorld(worldUuid);
+                if (w != null) {
+                    return w;
                 }
             }
         } catch (Exception ignored) {}

@@ -56,32 +56,48 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
              Statement stmt = conn.createStatement()) {
             stmt.execute("""
                 CREATE TABLE IF NOT EXISTS portal_entries (
-                    id              VARCHAR(255) PRIMARY KEY,
-                    world           VARCHAR(255),
-                    x               DOUBLE,
-                    y               DOUBLE,
-                    z               DOUBLE,
-                    yaw             DOUBLE,
-                    creator         VARCHAR(255),
-                    creation_date   VARCHAR(64),
-                    strategy        VARCHAR(32)  DEFAULT 'PREDICTIVE',
-                    warm_radius     INT          DEFAULT -1,
-                    warm_radius_x   INT,
-                    warm_radius_z   INT,
-                    instanced       BOOLEAN      DEFAULT FALSE,
-                    notes           TEXT,
-                    cache_ttl_days  INT,
-                    ram_estimated   DOUBLE       DEFAULT 0,
-                    ram_marginal    DOUBLE       DEFAULT 0,
-                    preload_count   INT          DEFAULT 0,
-                    last_cache_tier VARCHAR(32)  DEFAULT 'UNVISITED',
-                    last_active     VARCHAR(64),
-                    last_status     VARCHAR(64)  DEFAULT 'UNVISITED',
-                    entry_type      VARCHAR(32)  DEFAULT 'PORTAL',
-                    activation_json TEXT,
-                    updated_at      VARCHAR(64)
+                    id                   VARCHAR(255) PRIMARY KEY,
+                    world                VARCHAR(255),
+                    x                    DOUBLE,
+                    y                    DOUBLE,
+                    z                    DOUBLE,
+                    yaw                  DOUBLE,
+                    creator              VARCHAR(255),
+                    creation_date        VARCHAR(64),
+                    strategy             VARCHAR(32)  DEFAULT 'PREDICTIVE',
+                    warm_radius          INT          DEFAULT -1,
+                    warm_radius_x        INT,
+                    warm_radius_z        INT,
+                    instanced            BOOLEAN      DEFAULT FALSE,
+                    notes                TEXT,
+                    cache_ttl_days       INT,
+                    ram_estimated        DOUBLE       DEFAULT 0,
+                    ram_marginal         DOUBLE       DEFAULT 0,
+                    preload_count        INT          DEFAULT 0,
+                    last_cache_tier      VARCHAR(32)  DEFAULT 'UNVISITED',
+                    last_active          VARCHAR(64),
+                    last_status          VARCHAR(64)  DEFAULT 'UNVISITED',
+                    entry_type           VARCHAR(32)  DEFAULT 'PORTAL',
+                    activation_json      TEXT,
+                    destination_world_uuid VARCHAR(36),
+                    updated_at           VARCHAR(64)
                 )
             """);
+            // Migrate existing databases that predate these columns
+            migrateAddColumnIfMissing(stmt, "activation_json",       "TEXT");
+            migrateAddColumnIfMissing(stmt, "destination_world_uuid", "VARCHAR(36)");
+        }
+    }
+
+    /**
+     * Silently adds a column to portal_entries if it does not already exist.
+     * Used for forward-compatible schema migrations on server upgrade.
+     */
+    private void migrateAddColumnIfMissing(Statement stmt, String column, String definition) {
+        try {
+            stmt.execute("ALTER TABLE portal_entries ADD COLUMN " + column + " " + definition);
+        } catch (SQLException ignored) {
+            // Column already exists — safe to ignore
         }
     }
 
@@ -142,18 +158,25 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
     @Override
     public void saveAll(List<PortalEntry> entries) {
         if (entries == null || entries.isEmpty()) return;
-        
+
         String sql = upsertSql();
-        
+
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
-            
-            for (PortalEntry entry : entries) {
-                bindEntry(ps, entry);
-                ps.addBatch();
+            conn.setAutoCommit(false);
+            try {
+                for (PortalEntry entry : entries) {
+                    bindEntry(ps, entry);
+                    ps.addBatch();
+                }
+                ps.executeBatch();
+                conn.commit();
+            } catch (SQLException e) {
+                conn.rollback();
+                throw e;
+            } finally {
+                conn.setAutoCommit(true);
             }
-            
-            ps.executeBatch();
         } catch (SQLException e) {
             System.err.println("[OptiPortal] SQL saveAll error: " + e.getMessage());
         }
@@ -209,7 +232,19 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
         ps.setString(20, e.getLastActive() != null ? e.getLastActive().toString() : null);
         ps.setString(21, e.getLastStatus());
         ps.setString(22, e.getType().name());
-        ps.setString(23, Instant.now().toString());
+        // activation_json: serialize the six per-zone activation override fields
+        java.util.Map<String, Object> activationMap = new java.util.LinkedHashMap<>();
+        activationMap.put("activationDistance",           e.getActivationDistance());
+        activationMap.put("activationDistanceHorizontal", e.getActivationDistanceHorizontal());
+        activationMap.put("activationDistanceVertical",   e.getActivationDistanceVertical());
+        activationMap.put("activationShape",              e.getActivationShape());
+        activationMap.put("floorCeilingCheck",            e.getFloorCeilingCheck());
+        activationMap.put("facingCheck",                  e.getFacingCheck());
+        boolean hasActivation = activationMap.values().stream().anyMatch(v -> v != null);
+        ps.setString(23, hasActivation ? GSON.toJson(activationMap) : null);
+        // destination_world_uuid
+        ps.setString(24, e.getDestinationWorldUuid() != null ? e.getDestinationWorldUuid().toString() : null);
+        ps.setString(25, Instant.now().toString());
     }
 
     private PortalEntry mapRow(ResultSet rs) throws SQLException {
@@ -238,6 +273,31 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
         if (la != null) e.setLastActive(Instant.parse(la));
         e.setLastStatus(rs.getString("last_status"));
         e.setType(PortalEntry.EntryType.valueOf(rs.getString("entry_type")));
+        // activation_json: deserialize per-zone activation overrides (H2 fix)
+        String activationJson = rs.getString("activation_json");
+        if (activationJson != null) {
+            try {
+                @SuppressWarnings("unchecked")
+                java.util.Map<String, Object> m = GSON.fromJson(activationJson, java.util.Map.class);
+                if (m != null) {
+                    if (m.get("activationDistance") instanceof Number n)
+                        e.setActivationDistance(n.doubleValue());
+                    if (m.get("activationDistanceHorizontal") instanceof Number n)
+                        e.setActivationDistanceHorizontal(n.doubleValue());
+                    if (m.get("activationDistanceVertical") instanceof Number n)
+                        e.setActivationDistanceVertical(n.doubleValue());
+                    if (m.get("activationShape") instanceof String s)
+                        e.setActivationShape(s);
+                    if (m.get("floorCeilingCheck") instanceof Boolean b)
+                        e.setFloorCeilingCheck(b);
+                    if (m.get("facingCheck") instanceof Boolean b)
+                        e.setFacingCheck(b);
+                }
+            } catch (Exception ignored) { /* corrupt JSON — skip activation overrides */ }
+        }
+        // destination_world_uuid (H1 fix)
+        String dwu = rs.getString("destination_world_uuid");
+        if (dwu != null) e.setDestinationWorldUuid(java.util.UUID.fromString(dwu));
         return e;
     }
 }

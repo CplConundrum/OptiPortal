@@ -2,6 +2,7 @@ package com.optiportal.async;
 
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
@@ -41,7 +42,9 @@ public class AsyncMetrics {
         worldThreadExecutions.increment();
         totalWorldThreadExecutionTime.addAndGet(durationMs);
         
-        LOG.fine("World thread execution: " + operation + " took " + durationMs + "ms");
+        if (LOG.isLoggable(Level.FINE)) {
+            LOG.fine("World thread execution: " + operation + " took " + durationMs + "ms");
+        }
     }
     
     /**
@@ -68,7 +71,9 @@ public class AsyncMetrics {
         chunkLoadSuccesses.increment();
         totalChunkLoadTime.addAndGet(durationMs);
         
-        LOG.fine("Chunk load success: " + cx + "," + cz + " took " + durationMs + "ms");
+        if (LOG.isLoggable(Level.FINE)) {
+            LOG.fine("Chunk load success: " + cx + "," + cz + " took " + durationMs + "ms");
+        }
     }
     
     /**
@@ -115,7 +120,9 @@ public class AsyncMetrics {
     public void recordAsyncTaskStart(AsyncTaskPriority priority) {
         activeAsyncTasks.increment();
         
-        LOG.fine("Async task started with priority: " + priority);
+        if (LOG.isLoggable(Level.FINE)) {
+            LOG.fine("Async task started with priority: " + priority);
+        }
     }
     
     /**
@@ -127,7 +134,9 @@ public class AsyncMetrics {
     public void recordAsyncTaskComplete(AsyncTaskPriority priority, long durationMs) {
         activeAsyncTasks.decrement();
         
-        LOG.fine("Async task completed with priority: " + priority + " in " + durationMs + "ms");
+        if (LOG.isLoggable(Level.FINE)) {
+            LOG.fine("Async task completed with priority: " + priority + " in " + durationMs + "ms");
+        }
     }
     
     /**

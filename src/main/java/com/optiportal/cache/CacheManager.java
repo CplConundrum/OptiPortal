@@ -112,9 +112,10 @@ public class CacheManager {
                         long decayMs = (tier == CacheTier.HOT) ? hotMs : warmMs;
 
                         if (age >= decayMs) {
-                            // Zone has already expired while the server was down — skip (COLD)
+                            // Zone expired while server was down — demote to COLD
                             LOG.info("[OptiPortal] loadRegistry: zone '" + e.getKey()
                                     + "' expired during downtime (" + tier + ") — marking COLD");
+                            zoneTiers.put(e.getKey(), CacheTier.COLD);
                             continue;
                         }
 
@@ -124,8 +125,10 @@ public class CacheManager {
                         nextEarliest = Math.min(nextEarliest, savedTs + decayMs);
                         LOG.info("[OptiPortal] loadRegistry: restored zone '" + e.getKey()
                                 + "' as " + tier + " (" + ((decayMs - age) / 1000) + "s remaining)");
+                    } else if (tier == CacheTier.COLD) {
+                        // Restore explicitly-saved COLD zones
+                        zoneTiers.put(e.getKey(), CacheTier.COLD);
                     }
-                    // COLD / UNVISITED zones are not stored (they have no timestamp to restore)
                 }
             }
 
@@ -397,14 +400,23 @@ public class CacheManager {
                                   com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk chunk) {
         if (zoneId == null) return;
         long key = packChunkIndex(cx, cz);
-        Set<String> owners = chunkOwnership
+        // Use compute() so the "is this the first owner?" check and add are atomic —
+        // prevents two concurrent callers from both observing isEmpty()=true and both
+        // calling addKeepLoaded(), which would over-count the keepLoaded ref.
+        boolean[] isFirst = {false};
+        chunkOwnership
                 .computeIfAbsent(world, w -> new ConcurrentHashMap<>())
-                .computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet());
-        boolean wasEmpty = owners.isEmpty();
-        owners.add(zoneId);
+                .compute(key, (k, existingSet) -> {
+                    if (existingSet == null) {
+                        existingSet = ConcurrentHashMap.newKeySet();
+                        isFirst[0] = true;
+                    }
+                    existingSet.add(zoneId);
+                    return existingSet;
+                });
         recordReverseOwnership(zoneId, world, key);
         // Only pin on first owner — prevents double-increment
-        if (wasEmpty && chunk != null) {
+        if (isFirst[0] && chunk != null) {
             chunk.addKeepLoaded();
             LOG.fine("[OptiPortal] addKeepLoaded: " + world + ":" + cx + ":" + cz);
         }
@@ -425,7 +437,10 @@ public class CacheManager {
                 Set<String> owners = worldMap.get(key);
                 if (owners != null) {
                     owners.remove(zoneId);
-                    if (owners.isEmpty()) worldMap.remove(key, owners);
+                    if (owners.isEmpty()) {
+                        worldMap.remove(key, owners);
+                        tryReleaseKeepLoaded(world, cx + dx, cz + dz);
+                    }
                 }
                 if (zoneKeys != null) zoneKeys.remove(key);
             }

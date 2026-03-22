@@ -68,7 +68,7 @@ public class StorageFactory {
         StorageBackend backend = switch (type) {
             case "SQLITE" -> new SqliteStorageBackend(config);
             case "H2"     -> new H2StorageBackend(config);
-            case "MYSQL"  -> new MysqlStorageBackend(config);
+            case "MYSQL"  -> new MySqlStorageBackend(config);
             default       -> new JsonStorageBackend(config);
         };
         try {

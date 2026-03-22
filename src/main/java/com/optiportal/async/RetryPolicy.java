@@ -70,7 +70,11 @@ public class RetryPolicy {
             return future;
         }
         
-        LOG.info("Executing " + operationType + ":" + operationId + " (attempt " + (attempt + 1) + ")");
+        if (attempt == 0) {
+            LOG.fine("Executing " + operationType + ":" + operationId + " (attempt 1)");
+        } else {
+            LOG.info("Retrying " + operationType + ":" + operationId + " (attempt " + (attempt + 1) + ")");
+        }
         
         try {
             CompletableFuture<T> future = operation.get();
@@ -249,7 +253,11 @@ public class RetryPolicy {
                 return future;
             }
             
-            LOG.info("Executing " + operationType + ":" + operationId + " (attempt " + (attempt + 1) + ")");
+            if (attempt == 0) {
+            LOG.fine("Executing " + operationType + ":" + operationId + " (attempt 1)");
+        } else {
+            LOG.info("Retrying " + operationType + ":" + operationId + " (attempt " + (attempt + 1) + ")");
+        }
             
             try {
                 CompletableFuture<T> future = operation.get();

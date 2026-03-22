@@ -2,6 +2,7 @@ package com.optiportal.async;
 
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Logger;
 
 /**
@@ -27,7 +28,7 @@ public class CircuitBreaker {
     private static final int SUCCESS_THRESHOLD = 3;      // Close after 3 successes in half-open
     
     // State tracking
-    private volatile State state = State.CLOSED;
+    private final AtomicReference<State> state = new AtomicReference<>(State.CLOSED);
     private final AtomicInteger failureCount = new AtomicInteger(0);
     private final AtomicInteger successCount = new AtomicInteger(0);
     private final AtomicLong lastFailureTime = new AtomicLong(0);
@@ -37,12 +38,12 @@ public class CircuitBreaker {
      * Record a successful operation.
      */
     public void recordSuccess() {
-        if (state == State.HALF_OPEN) {
+        if (state.get() == State.HALF_OPEN) {
             int successes = successCount.incrementAndGet();
             if (successes >= SUCCESS_THRESHOLD) {
                 closeCircuit();
             }
-        } else if (state == State.CLOSED) {
+        } else if (state.get() == State.CLOSED) {
             // Reset failure count on success in closed state
             failureCount.set(0);
         }
@@ -54,10 +55,10 @@ public class CircuitBreaker {
     public void recordFailure() {
         int failures = failureCount.incrementAndGet();
         lastFailureTime.set(System.currentTimeMillis());
-        
-        if (state == State.CLOSED && failures >= FAILURE_THRESHOLD) {
+
+        if (state.get() == State.CLOSED && failures >= FAILURE_THRESHOLD) {
             openCircuit();
-        } else if (state == State.HALF_OPEN) {
+        } else if (state.get() == State.HALF_OPEN) {
             // Any failure in half-open state opens the circuit again
             openCircuit();
         }
@@ -69,15 +70,16 @@ public class CircuitBreaker {
      * @return true if circuit is open
      */
     public boolean isOpen() {
-        if (state == State.OPEN) {
+        if (state.get() == State.OPEN) {
             // Check if recovery timeout has passed
             long timeSinceOpen = System.currentTimeMillis() - lastStateChange.get();
             if (timeSinceOpen >= RECOVERY_TIMEOUT_MS) {
-                // Transition to half-open to test recovery
-                state = State.HALF_OPEN;
-                successCount.set(0);
-                lastStateChange.set(System.currentTimeMillis());
-                LOG.info("Circuit breaker transitioning to HALF_OPEN");
+                // Atomically transition OPEN → HALF_OPEN (prevents duplicate transitions)
+                if (state.compareAndSet(State.OPEN, State.HALF_OPEN)) {
+                    successCount.set(0);
+                    lastStateChange.set(System.currentTimeMillis());
+                    LOG.info("Circuit breaker transitioning to HALF_OPEN");
+                }
                 return false;
             }
             return true;
@@ -91,7 +93,7 @@ public class CircuitBreaker {
      * @return true if reset can be attempted
      */
     public boolean canAttemptReset() {
-        return state == State.OPEN && 
+        return state.get() == State.OPEN &&
                (System.currentTimeMillis() - lastStateChange.get()) >= RECOVERY_TIMEOUT_MS;
     }
     
@@ -99,8 +101,7 @@ public class CircuitBreaker {
      * Attempt to reset the circuit breaker.
      */
     public void attemptReset() {
-        if (canAttemptReset()) {
-            state = State.HALF_OPEN;
+        if (state.compareAndSet(State.OPEN, State.HALF_OPEN)) {
             successCount.set(0);
             lastStateChange.set(System.currentTimeMillis());
             LOG.info("Circuit breaker reset attempt - transitioning to HALF_OPEN");
@@ -127,38 +128,38 @@ public class CircuitBreaker {
      * @return Current state
      */
     public State getState() {
-        return state;
+        return state.get();
     }
-    
+
     /**
      * Get circuit breaker statistics.
-     * 
+     *
      * @return Statistics
      */
     public CircuitBreakerStats getStats() {
         return new CircuitBreakerStats(
-            state,
+            state.get(),
             failureCount.get(),
             successCount.get(),
             lastFailureTime.get(),
             lastStateChange.get()
         );
     }
-    
+
     /**
      * Open the circuit breaker.
      */
     private void openCircuit() {
-        state = State.OPEN;
+        state.set(State.OPEN);
         lastStateChange.set(System.currentTimeMillis());
         LOG.warning("Circuit breaker OPENED due to " + failureCount.get() + " failures");
     }
-    
+
     /**
      * Close the circuit breaker.
      */
     private void closeCircuit() {
-        state = State.CLOSED;
+        state.set(State.CLOSED);
         failureCount.set(0);
         successCount.set(0);
         lastStateChange.set(System.currentTimeMillis());

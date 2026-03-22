@@ -112,7 +112,7 @@ public class TeleportInterceptor {
         // Poll TeleportRecord every second to detect walk-through portal teleports.
         // No portal-use event exists in Hytale for zone-trigger portals.
         int pollInterval = config.getPollIntervalSeconds();
-        executor.scheduleAtFixedRate(this::pollTeleportRecords, pollInterval, pollInterval, TimeUnit.SECONDS);
+        executor.scheduleWithFixedDelay(this::pollTeleportRecords, pollInterval, pollInterval, TimeUnit.SECONDS);
     }
 
     // Protected getters for subclass access
@@ -796,17 +796,16 @@ public class TeleportInterceptor {
     }
 
     private boolean isOnCooldown(UUID playerId, String zoneId) {
-        Long last = cooldowns
-                .computeIfAbsent(playerId != null ? playerId : new UUID(0, 0), k -> new ConcurrentHashMap<>())
-                .get(zoneId);
+        if (playerId == null) return false;
+        Long last = cooldowns.computeIfAbsent(playerId, k -> new ConcurrentHashMap<>()).get(zoneId);
         if (last == null) return false;
         return (System.currentTimeMillis() - last) < (config.getActivationCooldownSeconds() * 1000L);
     }
 
     private void recordCooldown(UUID playerId, String zoneId) {
-        cooldowns
-                .computeIfAbsent(playerId != null ? playerId : new UUID(0, 0), k -> new ConcurrentHashMap<>())
-                .put(zoneId, System.currentTimeMillis());
+        if (playerId == null) return;
+        cooldowns.computeIfAbsent(playerId, k -> new ConcurrentHashMap<>())
+                 .put(zoneId, System.currentTimeMillis());
     }
 
     private int resolveRadius(PortalEntry entry) {

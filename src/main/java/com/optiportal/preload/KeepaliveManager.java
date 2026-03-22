@@ -82,21 +82,21 @@ public class KeepaliveManager {
     public void start() {
         if (config.isKeepaliveHot()) {
             int interval = config.getKeepaliveHotIntervalMinutes();
-            hotTask = executor.scheduleAtFixedRate(
+            hotTask = executor.scheduleWithFixedDelay(
                     () -> pingTier(CacheTier.HOT, "HOT"),
                     interval, interval, TimeUnit.MINUTES);
             LOG.info("[OptiPortal] Keepalive HOT scheduled every " + interval + "m");
         }
         if (config.isKeepaliveWarm()) {
             int interval = config.getKeepaliveWarmIntervalMinutes();
-            warmTask = executor.scheduleAtFixedRate(
+            warmTask = executor.scheduleWithFixedDelay(
                     () -> pingTier(CacheTier.WARM, "WARM"),
                     interval, interval, TimeUnit.MINUTES);
             LOG.info("[OptiPortal] Keepalive WARM scheduled every " + interval + "m");
         }
         if (config.isKeepaliveCold()) {
             int interval = config.getKeepaliveColdIntervalMinutes();
-            coldTask = executor.scheduleAtFixedRate(
+            coldTask = executor.scheduleWithFixedDelay(
                     () -> pingTier(CacheTier.COLD, "COLD"),
                     interval, interval, TimeUnit.MINUTES);
             LOG.info("[OptiPortal] Keepalive COLD scheduled every " + interval + "m");

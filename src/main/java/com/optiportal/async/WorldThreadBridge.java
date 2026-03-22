@@ -51,18 +51,26 @@ public class WorldThreadBridge {
                             AsyncMetrics metrics) {
         this(executor, errorHandler, metrics, null);
     }
-    
+
     public WorldThreadBridge(ScheduledExecutorService executor,
                             AsyncErrorHandler errorHandler,
                             AsyncMetrics metrics,
                             WorldTpsMonitor tpsMonitor) {
+        this(executor, errorHandler, metrics, tpsMonitor, errorHandler.getCircuitBreaker());
+    }
+
+    public WorldThreadBridge(ScheduledExecutorService executor,
+                            AsyncErrorHandler errorHandler,
+                            AsyncMetrics metrics,
+                            WorldTpsMonitor tpsMonitor,
+                            CircuitBreaker circuitBreaker) {
         this.executor = executor;
         this.errorHandler = errorHandler;
         this.metrics = metrics;
         this.tpsMonitor = tpsMonitor;
-        this.circuitBreaker = new CircuitBreaker();
+        this.circuitBreaker = circuitBreaker;
         this.operationQueues = new ConcurrentHashMap<>();
-        
+
         // Start batch processor
         startBatchProcessor();
     }
@@ -326,6 +334,7 @@ public class WorldThreadBridge {
      */
     private void processBatch(World world, Queue<Runnable> queue) {
         if (queue.isEmpty()) {
+            operationQueues.remove(world, queue); // evict dead entry; two-arg remove avoids TOCTOU
             return;
         }
         

@@ -433,7 +433,11 @@ public class WarmZoneManager {
 
         for (String zoneId : toEvict) {
             cacheManager.releaseZoneChunks(zoneId);
-            cacheManager.removeTierEntry(zoneId);
+            // Preserve COLD tier so PRED zones don't show UNVISITED when the world
+            // is re-created. WARM zones self-heal via scanWorldForPortalDestination;
+            // PRED zones have no re-init path and must stay in zoneTiers as COLD so
+            // the keepalive and UI remain correct until the next player visit.
+            cacheManager.setZoneTier(zoneId, CacheTier.COLD);
             managedZones.remove(zoneId);
             LOG.fine("[OptiPortal] Evicted zone " + zoneId + " from removed world " + worldName);
         }

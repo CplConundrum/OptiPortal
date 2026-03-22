@@ -304,7 +304,17 @@ public class OptiPortal extends JavaPlugin {
             if (warmZoneManager != null) warmZoneManager.serializeAll();
             if (cacheManager != null) cacheManager.saveRegistry();
             if (storage != null) storage.close();
-            if (executor != null) executor.shutdown();
+            if (executor != null) {
+                executor.shutdown();
+                try {
+                    if (!executor.awaitTermination(10, java.util.concurrent.TimeUnit.SECONDS)) {
+                        executor.shutdownNow();
+                    }
+                } catch (InterruptedException ie) {
+                    executor.shutdownNow();
+                    Thread.currentThread().interrupt();
+                }
+            }
             getLogger().at(Level.INFO).log("[OptiPortal] Cache saved cleanly.");
         } catch (Exception e) {
             getLogger().at(Level.SEVERE).log("[OptiPortal] Error during shutdown: " + e.getMessage());

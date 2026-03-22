@@ -2,10 +2,8 @@ package com.optiportal.storage;
 
 import java.io.File;
 import java.io.FileReader;
-import java.io.FileWriter;
 import java.io.IOException;
 import java.io.Reader;
-import java.io.Writer;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.time.Instant;
@@ -191,9 +189,13 @@ public class JsonStorageBackend implements StorageBackend {
             }
             root.add("portals", array);
 
-            // Write to tmp
-            try (Writer writer = new FileWriter(tmpFile)) {
+            // Write to tmp with fsync before rename to prevent partial-write corruption
+            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(tmpFile);
+                 java.nio.channels.FileChannel ch = fos.getChannel();
+                 java.io.OutputStreamWriter writer = new java.io.OutputStreamWriter(fos, java.nio.charset.StandardCharsets.UTF_8)) {
                 GSON.toJson(root, writer);
+                writer.flush();
+                ch.force(true);
             }
 
             // Backup existing file

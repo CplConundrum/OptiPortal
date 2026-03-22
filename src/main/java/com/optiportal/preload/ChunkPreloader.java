@@ -158,12 +158,6 @@ public class ChunkPreloader {
             final int loadedCount = toLoad.size();
             final long startTime = System.nanoTime();
             future.thenRun(() -> {
-                // Register ownership for dedup path only (chunks already loaded by another zone)
-                for (int[] coord : allChunks) {
-                    if (!toLoad.contains(coord)) {
-                        cacheManager.registerOwnership(zid, worldName, coord[0], coord[1]);
-                    }
-                }
                 cacheManager.setZoneTier(zid, com.optiportal.model.CacheTier.HOT);
                 if (loadedCount > 0) {
                     LOG.info(() -> "[OptiPortal] predictiveLoad complete: " + zid + " → HOT (loaded=" + loadedCount + " shared=" + skipped + ")");
@@ -277,12 +271,6 @@ public class ChunkPreloader {
             final int loadedCount = toLoad.size();
             final long startTime = System.nanoTime();
             future.thenRun(() -> {
-                // Register ownership for dedup path only (chunks already loaded by another zone)
-                for (int[] coord : allChunks) {
-                    if (!toLoad.contains(coord)) {
-                        cacheManager.registerOwnership(zid, worldName, coord[0], coord[1]);
-                    }
-                }
                 LOG.info(() -> "[OptiPortal] warmLoad complete: " + zid + " (loaded=" + loadedCount + " shared=" + skipped + ")");
                 // Update entry stats
                 Optional<PortalEntry> entryOpt = storage.loadById(zid);
