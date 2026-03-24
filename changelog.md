@@ -1,5 +1,110 @@
 # Changelog
 
+---
+
+## [1.1.6] - 2026-03-24
+
+### Fixed
+
+- **BUG FIX — Keepalive pinged overlapping chunks multiple times per cycle**: When two zones in the same world had overlapping chunk areas, the keepalive built its ping list per-zone without cross-zone deduplication. Each shared chunk coordinate appeared multiple times, producing redundant async chunk requests every keepalive cycle. Overlapping chunks are now deduplicated before the ping list is dispatched.
+
+---
+
+## [1.1.5] - 2026-03-23
+
+### Fixed
+
+- **BUG FIX — Chunk preloading aborted immediately on server startup**: The JVM heap guard used the wrong formula, causing it to see near-maximum heap usage even when the server had just started and the JVM had not yet expanded its heap. Preloading would abort before any zones were ever loaded. The guard now correctly measures actual used heap against the configured maximum.
+
+- **BUG FIX — Enhanced preloader loaded duplicate chunks already owned by other zones**: The enhanced predictive and warm load paths skipped the deduplication check present in the base preloader, causing chunks already claimed by another zone to be requested from the world again. The enhanced paths now skip chunks that are already owned and only load genuinely new ones.
+
+- **BUG FIX — Tier registry leaked stale entries after TTL eviction**: When the TTL enforcer removed an expired zone, it released the zone's chunk pins and deleted it from storage but did not remove its entry from the in-memory tier registry. The stale tier entry persisted indefinitely, causing the zone to appear as COLD in status output and interfering with tier-aware logic even though the zone no longer existed.
+
+- **BUG FIX — Deduplication metric reported newly-loaded chunks instead of skipped ones**: The chunk deduplication counter tracked chunks that were loaded for the first time rather than chunks that were skipped because they were already owned. The metric now correctly counts chunks that were deduplicated away.
+
+- **BUG FIX — Cache manager metrics were siloed from the rest of the plugin**: The cache manager created its own isolated metrics collector instead of sharing the one owned by the plugin. Metrics recorded inside the cache manager were never visible to the plugin's reporting and bStats integration.
+
+- **BUG FIX — Portal link confidence counters could be corrupted by a concurrent decay sweep**: The pending-link decay task ran on a background thread without holding the lock used by the link-recording path. A concurrent write to a pending link's observation count or timestamp while the decay task was reading those fields was a data race under the Java Memory Model. The fields are now declared volatile so reads by the decay task always see the latest written values.
+
+- **BUG FIX — JVM errors during chunk loading triggered recovery logic**: When a non-recoverable JVM `Error` (such as `OutOfMemoryError`) occurred during chunk loading, it was wrapped in a generic `Exception` and passed to the error handler, which would attempt retry and recovery logic — the wrong response under severe JVM stress. `Error` types are now logged directly at SEVERE level and not forwarded to the error handler. Recoverable `Exception` types are unaffected.
+
+---
+
+## [1.1.4] - 2026-03-22
+
+### Fixed
+
+- **BUG FIX — Destination zone not promoted to HOT after same-world portal teleport**: The async TeleportRecord processing path blocked same-world `adventure.teleporter` portals because the destination world field is null for same-world teleports. The current world name is now used as the fallback, so destination zones are promoted to HOT immediately on arrival. Portal link learning (source → destination mapping) was also missing from the async path and is now restored.
+
+- **BUG FIX — Chunk pressure limit too low for servers with permanently-warm zones**: The hard abort threshold for chunk loading defaulted to 512, which could be exceeded by the chunks already held by WARM zones alone. The default is now 2048, and the threshold is documented in config.json under `chunkPressure.maxLoadedThreshold`.
+- **BUG FIX — WARM zones dropped to COLD**: Zones set to the WARM (never-expire) strategy were still subject to normal tier decay and chunk eviction downgrade logic, causing them to drop to COLD and lose their loaded chunks between player visits. WARM zones now hold a minimum tier of WARM — they decay from HOT to WARM normally when not in active use, but are protected from dropping to COLD through both the periodic decay cycle and the chunk eviction path.
+
+- **BUG FIX — Destination zone not promoted to HOT when approaching a same-world portal**: Walking toward a location-to-location portal did not promote the destination zone from WARM to HOT before the player arrived. The proximity check only fired when the player was already near the destination position, which is too late. The plugin now detects teleports by observing sudden position changes in the async position poll, learns the source portal position after the first use, and promotes the destination to HOT on all subsequent approaches.
+
+- **BUG FIX — Portal destination world link lost on server restart**: The world a portal device linked to was not saved when the zone was first registered, so the connection was forgotten on every restart and had to be rediscovered at runtime. The destination is now persisted immediately on registration.
+
+- **BUG FIX — Destination zone not promoted to HOT when approaching a portal with an unresolved link**: If the destination link for a portal had not yet been confirmed — for example on first login after a fresh install — the approach check skipped HOT promotion entirely. The link is now backfilled from the live portal block the first time the surrounding chunk loads, and the approach check falls back to promoting all known destination zones while the link is still being resolved.
+
+---
+
+## [1.1.3] - 2026-03-21
+
+### Fixed
+
+- **BUG FIX — Portal destination world lost after server restart**: The world a portal linked to was only tracked in memory. On every restart that mapping was wiped, forcing the plugin to fall back to a slower name-based lookup until players walked through the portal again and the link was rediscovered. The destination world is now persisted to the database and restored on startup.
+
+- **BUG FIX — Per-zone activation overrides lost after server restart**: Custom activation distances, trigger shapes, floor/ceiling checks, and facing requirements configured per zone via `/preload activation` or `/preload shape` were stored in memory only. They appeared to apply correctly during a session but were silently reset to defaults on every restart. These settings are now saved and restored correctly.
+
+- **BUG FIX — Storage left in inconsistent state after a failed bulk save**: When saving multiple zones at once, a failure partway through committed the zones processed before the error and silently dropped the rest. After a crash or constraint violation during a bulk operation, some zones would reflect their new state while others were rolled back to an older snapshot with no indication that anything was wrong. Bulk saves are now wrapped in a transaction that rolls back fully on any error.
+
+- **BUG FIX — Cooldown map grew unboundedly for anonymous zone activations**: A ghost entry was inserted into the teleport cooldown map whenever a zone activation occurred without a traceable player — for example, from scripted or server-side triggers. This entry was never associated with a real player and was never cleaned up, causing the map to accumulate one entry per affected zone indefinitely. Anonymous activations are now ignored cleanly.
+
+- **BUG FIX — Chunks could be permanently locked in memory under concurrent load**: When two zone loads completed at the same moment for the same chunk, both could race to claim first-owner status and each pin the chunk independently. Because the chunk only needed one pin but received two, it required two releases before the engine was allowed to unload it — meaning it could never be evicted until both owning zones were fully torn down. The first-owner check is now atomic.
+
+- **BUG FIX — Load balancer performance metric drifted under concurrent completions (regression from v1.1.2)**: The v1.1.2 fix serialized writes to the async execution-time average but left reads unprotected. Under concurrent task completions the read could race the write, producing a stale or partially-updated value. Reads are now covered by the same lock as writes.
+
+- **BUG FIX — Keepalive scans could run back-to-back if a scan took longer than its interval**: Keepalive pings for HOT, WARM, and COLD zones were scheduled on a fixed wall-clock interval. If a scan took longer than its configured interval to complete, the next scan was queued to start immediately on completion rather than waiting the full interval again. On a loaded server this caused consecutive scans with no gap, adding unnecessary pressure. The scheduler now always waits the full interval after a scan finishes before starting the next.
+
+- **BUG FIX — JSON portal data file could be corrupted on an unclean shutdown**: When saving portal data, content was written to a temporary file and then renamed into place — but the file was not flushed to disk before the rename. On an unclean shutdown, the OS could complete the rename while the write was still buffered, producing an empty or truncated data file after recovery. The file is now synced to disk before the rename takes effect.
+
+- **BUG FIX — Portal detection scans could overlap on busy servers**: The periodic scan that detects players walking through portals was scheduled to fire at a fixed rate. On servers with many online players the scan could take longer than its one-second interval, causing the next scan to start immediately when the previous finished rather than waiting. Under sustained load this caused overlapping scans that crowded out other background tasks. The scheduler now waits the full interval between scans.
+
+- **BUG FIX — In-flight tasks abandoned on plugin shutdown or reload**: When the plugin shut down, background tasks that were already mid-execution — chunk preloads, keepalive pings, storage writes — were cut off immediately rather than being allowed to finish. This could leave the cache registry or storage in a partially-updated state. Shutdown now waits up to ten seconds for running tasks to complete before forcing a stop.
+
+- **BUG FIX — Memory overhead accumulated on servers that frequently load and unload worlds**: Each time a world's pending operation queue was fully processed, its empty entry was left in the queue registry rather than removed. On servers that regularly create and destroy worlds this caused the registry to grow with dead entries that were visited on every processing cycle but did no work.
+
+- **BUG FIX — Predictive zones showed as Unvisited after a world reload**: When a world was removed and re-created — for example during a world reload or dynamic world cycle — all zones belonging to that world were fully erased from the tier registry. Warm zones recovered automatically when the world came back because the portal scanner re-registered them on load. Predictive zones had no equivalent recovery path, so they stayed absent from the registry and reported Unvisited until a player approached them again and triggered a fresh load. Predictive zones now retain a Cold tier entry when their world is removed, matching the behaviour of all other tiers on world cycle.
+
+- **BUG FIX — Chunks could remain pinned after a zone was removed by radius**: When a zone was deregistered using a radius-based removal, the chunks it exclusively owned were correctly removed from the ownership registry but their in-memory pin was never released. The engine was not told the chunks no longer needed to stay loaded, so they remained resident longer than necessary. The pin is now released correctly alongside the ownership record.
+
+## [1.1.2] - 2026-03-21
+
+### Fixed
+
+- **BUG FIX — Cold zones lost after server restart**: Zones that had fully decayed to COLD while the server was running were saved correctly, but on the next startup they were silently dropped from the tier registry instead of being restored. After a restart, these zones were treated as unregistered, causing them to miss COLD→WARM promotion and tier-based diagnostics until they were explicitly reloaded or a player triggered them.
+
+- **BUG FIX — Chunk ownership registered twice for deduped chunks**: When a zone's preload pass encountered a chunk that was already owned by another zone, ownership was claimed for the new zone immediately in the dedup check — and then claimed a second time after the load completed. This produced duplicate ownership records, inflated ref counts in the chunk registry, and could interfere with correct eviction protection.
+
+- **BUG FIX — Circuit breaker transition was not thread-safe**: The OPEN→HALF_OPEN state transition checked the elapsed time and then wrote the new state in two separate operations. Under concurrent access, multiple threads could pass the time check simultaneously, each independently resetting the circuit breaker and the success counter, making recovery unreliable under load.
+
+- **BUG FIX — World thread error handler and bridge used separate circuit breakers**: The async error handler and the world thread bridge each created their own independent circuit breaker instance. Failures recorded by the error handler had no effect on the bridge's breaker, and vice versa — the breaker never opened even when the error threshold was repeatedly exceeded.
+
+- **BUG FIX — World lookup for player unnecessarily scanned all worlds**: Resolving which world a player was in iterated every loaded world and queried each one's entity store until a match was found. This O(N) scan runs on every position update cycle; it is now replaced with a direct O(1) lookup using the world identity already stored on the player reference.
+
+- **BUG FIX — Chunk preload batches all dispatched simultaneously**: When loading chunks for a zone, all batches were submitted at once and allowed to run in parallel. This could produce a large burst of concurrent world thread requests, negating the purpose of batching. Batches are now chained sequentially so each one starts only after the previous completes.
+
+- **BUG FIX — Same players always selected for position update batch**: The player batch selector iterated the player map from the beginning on every cycle, meaning the same players at the front of the map were always included and players further down were consistently skipped. A round-robin cursor now advances each cycle, giving all online players equal update frequency.
+
+- **BUG FIX — WAL atomic write not truly crash-safe**: The write-ahead log wrote content to a temporary file and renamed it into place, but did not flush the file to disk before renaming. On an unclean shutdown, the rename could complete while the file content was still in the OS write buffer, leaving a zero-byte or partial file visible after recovery. The file is now fsynced before the rename.
+
+- **BUG FIX — Null player ID created a permanent ghost cooldown entry**: If a cooldown check or record was called with a null player ID, a substitute sentinel UUID was inserted into the cooldown map. This entry accumulated indefinitely, was never associated with a real player, and could not be evicted by normal player lifecycle events. Null player IDs are now rejected early and treated as not on cooldown.
+
+- **BUG FIX — First operation attempt logged at INFO level**: Every operation submitted through the retry policy produced an INFO log line on the first attempt, regardless of whether it succeeded. On busy servers this generated continuous noise for routine operations. First attempts are now logged at FINE; only retries (second attempt and beyond) are logged at INFO.
+
+- **BUG FIX — Execution time average subject to race condition**: The exponential moving average used to track async execution time was updated with a non-atomic read-modify-write on a volatile field. Concurrent completions could read the same stale value, each apply their sample independently, and one overwrite the other — making the average drift under load. Updates are now serialized through a dedicated lock.
+
+---
+
 ## [1.1.1] - 2026-03-21
 
 ### Changed

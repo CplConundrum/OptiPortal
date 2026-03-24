@@ -109,6 +109,7 @@ public class ZoneTtlEnforcer {
 
             if (lastActive.plusSeconds(ttlDays * 86_400L).isBefore(now)) {
                 cacheManager.releaseZoneChunks(entry.getId());
+                cacheManager.removeTierEntry(entry.getId());
                 storage.delete(entry.getId());
                 removed++;
                 LOG.info("[OptiPortal] TTL expired: " + entry.getId()

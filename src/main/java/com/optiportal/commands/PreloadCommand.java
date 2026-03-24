@@ -339,7 +339,7 @@ public class PreloadCommand extends AbstractCommand {
                      : "nominal";
         }
 
-        reply(ctx, "[OptiPortal] Status — v1.1.1");
+        reply(ctx, "[OptiPortal] Status — v1.1.6");
         reply(ctx, String.format("  Circuit breaker : %s  (failures=%d)", cbStats.state, cbStats.failureCount));
         reply(ctx, String.format("  Load balancer   : active=%d queued=%d avgTime=%.0fms batchSize=%d",
                 lb.activeOperations, lb.queuedTasks, lb.averageExecutionTime, lb.currentBatchSize));

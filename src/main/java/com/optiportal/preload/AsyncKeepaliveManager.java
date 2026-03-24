@@ -170,8 +170,9 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
      * @return Map of world name to chunk coordinates
      */
     private Map<String, List<ChunkCoordinate>> groupChunksByWorld(CacheTier tier) {
+        Map<String, java.util.Set<Long>> seen = new HashMap<>();
         Map<String, List<ChunkCoordinate>> result = new HashMap<>();
-        
+
         List<PortalEntry> entries = portalCacheSupplier != null
                 ? portalCacheSupplier.get()
                 : getStorage().loadAll();
@@ -180,6 +181,7 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
             if (getCacheManager().getZoneTier(entry.getId()) != tier) continue;
 
             String worldName = entry.getWorld();
+            java.util.Set<Long> worldSeen = seen.computeIfAbsent(worldName, k -> new java.util.HashSet<>());
             List<ChunkCoordinate> worldChunks = result.computeIfAbsent(worldName, k -> new ArrayList<>());
 
             int cx = ChunkPreloader.toChunkCoord(entry.getX());
@@ -187,14 +189,16 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
             int radiusX = resolveRadiusX(entry);
             int radiusZ = resolveRadiusZ(entry);
 
-            // Add all chunks in the zone
             for (int dx = -radiusX; dx <= radiusX; dx++) {
                 for (int dz = -radiusZ; dz <= radiusZ; dz++) {
-                    worldChunks.add(new ChunkCoordinate(cx + dx, cz + dz));
+                    long key = ((long)(cx + dx) << 32) | ((cz + dz) & 0xFFFFFFFFL);
+                    if (worldSeen.add(key)) {
+                        worldChunks.add(new ChunkCoordinate(cx + dx, cz + dz));
+                    }
                 }
             }
         }
-        
+
         return result;
     }
     

@@ -92,6 +92,26 @@ public class TeleportInterceptor {
     /** Tracks player's last known position before teleport for origin portal detection */
     private final ConcurrentHashMap<UUID, double[]> lastKnownPosition = new ConcurrentHashMap<>();
 
+    /**
+     * Portal hotspot index: source-world → list of confirmed hotspots.
+     * Each hotspot maps a source position (near an adventure.teleporter block) to the
+     * destination zone ID. Populated by learnPortalHotspot after reaching the confidence
+     * threshold. Used by checkHotspotPromotion.
+     */
+    protected final ConcurrentHashMap<String, java.util.concurrent.CopyOnWriteArrayList<PortalHotspot>>
+            portalHotspots = new ConcurrentHashMap<>();
+
+    /**
+     * Pending hotspot observations: canonical key → count.
+     * Key format: "sourceWorld:chunkX:chunkZ:destZoneId".
+     * Entries graduate to portalHotspots after HOTSPOT_CONFIDENCE_THRESHOLD observations.
+     * Prevents one-off teleports (/tp home, admin commands) from creating false hotspots.
+     */
+    private final ConcurrentHashMap<String, Integer> pendingHotspotCounts = new ConcurrentHashMap<>();
+
+    private static final int HOTSPOT_CONFIDENCE_THRESHOLD = 3;
+
+
     public TeleportInterceptor(OptiPortal plugin, PluginConfig config,
                                WarmZoneManager warmZoneManager,
                                ChunkPreloader chunkPreloader, StorageBackend storage,
@@ -234,6 +254,14 @@ public class TeleportInterceptor {
                     triggerPredictiveLoad(normalizedZone, entry.getWorld(), cx, cz, radius, null);
                     matched = true;
                 }
+            } else if (!entry.isInstanced() && entry.getStrategy() == WarmStrategy.WARM) {
+                com.optiportal.model.CacheTier current = plugin.getCacheManager().getZoneTier(normalizedZone);
+                if (current != com.optiportal.model.CacheTier.HOT) {
+                    plugin.getCacheManager().setZoneTier(normalizedZone, com.optiportal.model.CacheTier.HOT);
+                    LOG.fine(() -> "[OptiPortal] Zone discovery HOT: " + normalizedZone
+                            + " (was " + current + ")");
+                }
+                matched = true;
             }
         }
 
@@ -254,6 +282,14 @@ public class TeleportInterceptor {
                         triggerPredictiveLoad(zoneName, entry.getWorld(), cx, cz, resolveRadius(entry), null);
                         matched = true;
                     }
+                } else if (!entry.isInstanced() && entry.getStrategy() == WarmStrategy.WARM) {
+                    com.optiportal.model.CacheTier current = plugin.getCacheManager().getZoneTier(zoneName);
+                    if (current != com.optiportal.model.CacheTier.HOT) {
+                        plugin.getCacheManager().setZoneTier(zoneName, com.optiportal.model.CacheTier.HOT);
+                        LOG.fine(() -> "[OptiPortal] Zone discovery HOT (raw): " + zoneName
+                                + " (was " + current + ")");
+                    }
+                    matched = true;
                 }
             }
         }
@@ -301,13 +337,17 @@ public class TeleportInterceptor {
                                         Location dest = last.destination();
                                         if (dest != null) {
                                             String destWorld = dest.getWorld();
+                                            // Same-world teleports omit the world name in TeleportRecord
+                                            if (destWorld == null) destWorld = w.getName();
                                             com.hypixel.hytale.math.vector.Vector3d pos = dest.getPosition();
-                                            if (pos != null && destWorld != null) {
+                                            if (pos != null) {
                                                 final String dw = destWorld;
                                                 final double dx = pos.x, dy = pos.y, dz = pos.z;
                                                 final UUID fUuid = uuid;
                                                 // Snapshot pre-teleport position for origin portal lookup
                                                 final double[] prePos = lastKnownPosition.get(fUuid);
+                                                // Compute source world before entering executor lambda
+                                                final String sourceWorld = dw.equals(w.getName()) ? dw : w.getName();
                                                 executor.execute(() -> {
                                                     LOG.fine(() -> "[OptiPortal] Poll teleport → "
                                                         + dx + "," + dy + "," + dz + " world=" + dw);
@@ -315,9 +355,11 @@ public class TeleportInterceptor {
                                                     checkProximityAndPreload(fUuid, dw, dx, dy, dz);
                                                     // Derive origin portal from pre-teleport position
                                                     String originId = prePos != null
-                                                        ? findNearestPortal(dw.equals(w.getName()) ? dw : w.getName(), prePos[0], prePos[1], prePos[2])
+                                                        ? findNearestPortal(sourceWorld, prePos[0], prePos[1], prePos[2])
                                                         : null;
-                                                    reversePreloadOrigin(fUuid, originId, dw, dx, dy, dz);
+                                                    // Pass prePos directly — by the time this executor task
+                                                    // runs, lastKnownPosition may already hold the destination
+                                                    reversePreloadOrigin(fUuid, originId, sourceWorld, dw, dx, dy, dz, prePos);
                                                 });
                                             }
                                         }
@@ -335,6 +377,46 @@ public class TeleportInterceptor {
                             final double cx = transform.getPosition().x;
                             final double cy = transform.getPosition().y;
                             final double cz = transform.getPosition().z;
+
+                            // ── Position-jump detection ──────────────────────
+                            // adventure.teleporter same-world portals may not update TeleportRecord.
+                            // A jump > 16 blocks between poll cycles cannot be normal movement,
+                            // so it reliably signals a same-world teleport.
+                            // srcPos is captured here before lastKnownPosition is overwritten.
+                            double[] prevPos = lastKnownPosition.get(uuid);
+                            if (prevPos != null) {
+                                double jumpSq = (cx - prevPos[0]) * (cx - prevPos[0])
+                                              + (cz - prevPos[2]) * (cz - prevPos[2]);
+                                if (jumpSq > 1024.0) { // > 32 blocks
+                                    final double srcX = prevPos[0], srcZ = prevPos[2];
+                                    final double dstX = cx, dstZ = cz;
+                                    final String jWorld = curWorld;
+                                    executor.execute(() -> {
+                                        PortalEntry best = null;
+                                        double bestD = config.getActivationDistance() * 2;
+                                        for (PortalEntry pe : getAllPortalEntries()) {
+                                            if (pe.isInstanced() || pe.getId().contains(":")) continue;
+                                            if (!pe.getWorld().equals(jWorld)) continue;
+                                            double d = Math.sqrt(Math.pow(pe.getX() - dstX, 2)
+                                                               + Math.pow(pe.getZ() - dstZ, 2));
+                                            if (d < bestD) { bestD = d; best = pe; }
+                                        }
+                                        if (best != null) {
+                                            final PortalEntry fBest = best;
+                                            learnPortalHotspot(jWorld, srcX, srcZ, fBest.getId());
+                                            LOG.info(() -> "[OptiPortal] Jump hotspot learned: ("
+                                                    + (int) srcX + ", " + (int) srcZ + ") → "
+                                                    + fBest.getId() + " in " + jWorld);
+                                        } else {
+                                            LOG.fine(() -> "[OptiPortal] Jump detected but no zone"
+                                                    + " near (" + (int)dstX + ", " + (int)dstZ
+                                                    + ") in " + jWorld + " within "
+                                                    + (config.getActivationDistance() * 2) + " blocks");
+                                        }
+                                    });
+                                }
+                            }
+
                             // Save position for origin detection on next teleport
                             lastKnownPosition.put(uuid, new double[]{cx, cy, cz});
                             final UUID fUuid2 = uuid;
@@ -458,6 +540,9 @@ public class TeleportInterceptor {
                 }
             }
         }
+
+        // Promote destination zones for any learned portal hotspots near the player's position
+        checkHotspotPromotion(worldName, px, pz);
     }
 
     /**
@@ -467,7 +552,7 @@ public class TeleportInterceptor {
      * Finds the portal entry closest to the teleport destination coordinates —
      * that's the destination warp. Then preloads it so the return trip is hot.
      */
-    private void reversePreloadOrigin(UUID playerUuid, String originId, String destWorld, double dx, double dy, double dz) {
+    protected void reversePreloadOrigin(UUID playerUuid, String originId, String sourceWorld, String destWorld, double dx, double dy, double dz, double[] srcPos) {
         PortalEntry destEntry = null;
         double bestDist = Double.MAX_VALUE;
 
@@ -491,6 +576,13 @@ public class TeleportInterceptor {
 
         if (destEntry == null) return;
         if (bestDist > config.getActivationDistance() * 2) return; // sanity bound
+
+        // Learn portal hotspot so future approaches pre-warm this destination.
+        // srcPos is captured at the call site before the world thread advances lastKnownPosition
+        // to the destination — reading lastKnownPosition here would give the wrong position.
+        if (srcPos != null) {
+            learnPortalHotspot(sourceWorld, srcPos[0], srcPos[2], destEntry.getId());
+        }
 
         // Record the learned link if origin is known and both IDs are plain portal names
         if (originId != null && !originId.equals(destEntry.getId())
@@ -516,7 +608,7 @@ public class TeleportInterceptor {
      * Linger: keeps the player's last active zone HOT for 30s after teleport.
      * The existing HOT→WARM decay timer handles cleanup — no extra scheduling needed.
      */
-    private String findNearestPortal(String worldName, double px, double py, double pz) {
+    protected String findNearestPortal(String worldName, double px, double py, double pz) {
         String best = null;
         double bestDist = config.getActivationDistance();
         for (PortalEntry entry : getAllPortalEntries()) {
@@ -858,6 +950,90 @@ public class TeleportInterceptor {
                         storage.save(e);
                     }
                 });
+    }
+
+    // -------------------------------------------------------------------------
+    // Portal hotspot helpers
+    // -------------------------------------------------------------------------
+
+    /**
+     * Record a source-portal position that links to a destination zone.
+     * Confirmed on first observation — tier promotion (WARM→HOT) is cheap and
+     * reversible, so no confidence threshold is needed here (unlike PortalLinkRegistry
+     * which gates persistent chunk loads behind 5 observations).
+     * Deduplicates by chunk bucket so position jitter across multiple runs doesn't
+     * add redundant entries.
+     */
+    protected void learnPortalHotspot(String sourceWorld, double sx, double sz, String destZoneId) {
+        int chunkX = ChunkPreloader.toChunkCoord(sx);
+        int chunkZ = ChunkPreloader.toChunkCoord(sz);
+
+        // Skip if an equivalent confirmed hotspot already exists
+        java.util.concurrent.CopyOnWriteArrayList<PortalHotspot> list =
+                portalHotspots.get(sourceWorld);
+        if (list != null) {
+            for (PortalHotspot h : list) {
+                if (!h.destZoneId.equals(destZoneId)) continue;
+                if (ChunkPreloader.toChunkCoord(h.x) == chunkX
+                        && ChunkPreloader.toChunkCoord(h.z) == chunkZ) return;
+            }
+        }
+
+        // Require HOTSPOT_CONFIDENCE_THRESHOLD observations before confirming.
+        // Prevents one-off teleports (/tp home, admin commands) from creating false hotspots.
+        String key = sourceWorld + ":" + chunkX + ":" + chunkZ + ":" + destZoneId;
+        int count = pendingHotspotCounts.merge(key, 1, Integer::sum);
+        if (count < HOTSPOT_CONFIDENCE_THRESHOLD) {
+            LOG.fine(() -> "[OptiPortal] Hotspot pending: " + destZoneId
+                    + " chunk (" + chunkX + ", " + chunkZ + ") in " + sourceWorld
+                    + " (" + count + "/" + HOTSPOT_CONFIDENCE_THRESHOLD + ")");
+            return;
+        }
+
+        // Confirmed — graduate to active hotspot
+        pendingHotspotCounts.remove(key);
+        portalHotspots.computeIfAbsent(sourceWorld,
+                        k -> new java.util.concurrent.CopyOnWriteArrayList<>())
+                .add(new PortalHotspot(sx, sz, destZoneId));
+        LOG.info(() -> "[OptiPortal] Confirmed portal hotspot: chunk (" + chunkX + ", " + chunkZ
+                + ") in " + sourceWorld + " → " + destZoneId);
+    }
+
+    /**
+     * When a player is near a known portal hotspot, promote the destination zone
+     * from WARM → HOT so chunks are not evicted before the player arrives.
+     * Called from checkProximityAndPreload and AsyncTeleportInterceptor's async variant.
+     */
+    protected void checkHotspotPromotion(String worldName, double px, double pz) {
+        java.util.concurrent.CopyOnWriteArrayList<PortalHotspot> list = portalHotspots.get(worldName);
+        if (list == null || list.isEmpty()) return;
+        double maxDistSq = config.getActivationDistance() * config.getActivationDistance();
+        com.optiportal.cache.CacheManager cm = plugin.getCacheManager();
+        for (PortalHotspot h : list) {
+            double ddx = h.x - px, ddz = h.z - pz;
+            if (ddx * ddx + ddz * ddz > maxDistSq) continue;
+            com.optiportal.model.CacheTier tier = cm.getZoneTier(h.destZoneId);
+            if (tier == com.optiportal.model.CacheTier.WARM) {
+                cm.setZoneTier(h.destZoneId, com.optiportal.model.CacheTier.HOT);
+                LOG.fine(() -> "[OptiPortal] Hotspot approach: promoted " + h.destZoneId + " → HOT");
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Inner classes
+    // -------------------------------------------------------------------------
+
+    /** Lightweight record of a learned source-portal position → destination zone mapping. */
+    private static class PortalHotspot {
+        final double x, z;
+        final String destZoneId;
+
+        PortalHotspot(double x, double z, String destZoneId) {
+            this.x = x;
+            this.z = z;
+            this.destZoneId = destZoneId;
+        }
     }
 
 }

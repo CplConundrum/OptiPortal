@@ -1,11 +1,16 @@
 package com.optiportal.preload;
 
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.FileReader;
-import java.io.FileWriter;
+import java.io.IOException;
+import java.io.OutputStreamWriter;
 import java.io.Reader;
-import java.io.Writer;
 import java.lang.reflect.Type;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
@@ -273,9 +278,7 @@ public class PortalLinkRegistry {
     private void save() {
         try {
             linksFile.getParentFile().mkdirs();
-            try (Writer writer = new FileWriter(linksFile)) {
-                GSON.toJson(links, writer);
-            }
+            writeAtomicJson(linksFile, GSON.toJson(links));
         } catch (Exception e) {
             LOG.warning("[OptiPortal] PortalLinks: failed to save portal-links.json: " + e.getMessage());
         }
@@ -284,11 +287,30 @@ public class PortalLinkRegistry {
     private void savePendingLinks() {
         try {
             pendingLinksFile.getParentFile().mkdirs();
-            try (Writer writer = new FileWriter(pendingLinksFile)) {
-                GSON.toJson(pendingLinks, writer);
-            }
+            writeAtomicJson(pendingLinksFile, GSON.toJson(pendingLinks));
         } catch (Exception e) {
             LOG.warning("[OptiPortal] PortalLinks: failed to save portal-links-pending.json: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Write JSON content to a file atomically: write to a .tmp sibling, fsync,
+     * then rename over the target. Mirrors WalManager.writeAtomic without
+     * requiring a WalManager reference.
+     */
+    private static void writeAtomicJson(File target, String content) throws IOException {
+        File tmp = new File(target.getParent(), target.getName() + ".tmp");
+        try (FileOutputStream fos = new FileOutputStream(tmp);
+             FileChannel channel = fos.getChannel();
+             OutputStreamWriter w = new OutputStreamWriter(fos, StandardCharsets.UTF_8)) {
+            w.write(content);
+            w.flush();
+            // fsync before rename — ensures bytes are on disk before the file is visible
+            channel.force(true);
+        }
+        // Atomic rename; fall back to Files.move on platforms where renameTo fails
+        if (!tmp.renameTo(target)) {
+            Files.move(tmp.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
         }
     }
 
@@ -329,8 +351,8 @@ public class PortalLinkRegistry {
      * Pending entries decay after a configurable idle period.
      */
     private static class PendingLink {
-        int count;
-        long lastSeenMs;
+        volatile int count;
+        volatile long lastSeenMs;
 
         // count starts at 0; recordLink always calls increment(), so first observation → count=1
         PendingLink() {

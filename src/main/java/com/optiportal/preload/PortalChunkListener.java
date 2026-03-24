@@ -167,12 +167,24 @@ public class PortalChunkListener {
 
         String zoneId = "portaldevice:" + world.getName() + ":" + chunkX + ":" + chunkZ;
 
-        // Skip if already registered
-        if (storage.loadById(zoneId).isPresent()) return;
+        // If already registered, backfill destination UUID if not yet persisted
+        java.util.Optional<PortalEntry> existing = storage.loadById(zoneId);
+        if (existing.isPresent()) {
+            PortalEntry existingEntry = existing.get();
+            if (existingEntry.getDestinationWorldUuid() == null && device.getDestinationWorldUuid() != null) {
+                existingEntry.setDestinationWorldUuid(device.getDestinationWorldUuid());
+                storage.save(existingEntry);
+                LOG.fine(() -> "[OptiPortal] Backfilled destination UUID for existing zone: " + zoneId);
+            }
+            return;
+        }
 
         PortalEntry entry = new PortalEntry(zoneId, world.getName(), worldX, 64.0, worldZ, 0);
         entry.setStrategy(WarmStrategy.PREDICTIVE);
         entry.setType(PortalEntry.EntryType.MANUAL);
+        if (device.getDestinationWorldUuid() != null) {
+            entry.setDestinationWorldUuid(device.getDestinationWorldUuid());
+        }
         storage.save(entry);
 
         // Keep reverse index in sync with new auto-registered zone (full footprint, not just centre)

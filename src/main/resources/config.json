@@ -130,6 +130,12 @@
   "_immuneToSimulationReduction_info": "If true, PreloadPlugin-managed zones are never unloaded by Hytale's own simulation distance reduction. Keeps them stable.",
   "immuneToSimulationReduction": true,
 
+  "_section_chunk_pressure": "=== CHUNK PRESSURE LIMIT ===",
+  "_chunkPressure_info": "Hard abort: if the world already has this many chunks loaded, OptiPortal will not load more. Set to -1 to disable. Raise this if you see 'chunk pressure limit' warnings caused by permanently-warm zones keeping the count high.",
+  "chunkPressure": {
+    "maxLoadedThreshold": 2048
+  },
+
   "_section_keepalive": "=== KEEPALIVE (PREVENT ZONES FROM GOING COLD) ===",
   "_keepalive_info": "Periodically 'pings' zones to prevent them dropping to a lower tier. Useful for warps or hubs you want always-ready.",
   "keepalive": {

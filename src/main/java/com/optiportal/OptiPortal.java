@@ -149,19 +149,23 @@ public class OptiPortal extends JavaPlugin {
                 tpsMonitor.start();
             }
 
+            // Metrics collector — created early so CacheManager can share the same instance
+            metricsCollector = new MetricsCollector();
+
             // Cache manager — must be after worldRegistry for tryReleaseKeepLoaded
             // P11: Create registry file path and pass to CacheManager constructor
             File registryFile = new File(getDataDirectory().toFile(), "cache-registry.json");
-            cacheManager = new CacheManager(config, walManager, executor, worldRegistry, registryFile);
+            cacheManager = new CacheManager(config, walManager, executor, worldRegistry, registryFile, metricsCollector);
             // P11: Load persisted registry before staged load so warm zones are restored
             cacheManager.loadRegistry();
+            // Warm up stream lambdas in getTotalSharedChunks() so the JVM defines their
+            // inner classes here (off the world thread) rather than on first UI open.
+            cacheManager.getTotalSharedChunks();
 
             // Ownership drift auditor — requires both cacheManager and worldRegistry
             ownershipAuditor = new ChunkOwnershipAuditor(cacheManager, worldRegistry, executor, config);
             ownershipAuditor.start();
 
-            // Metrics — must be initialised before ChunkPreloader so it isn't passed null
-            metricsCollector = new MetricsCollector();
 
             // Initialize async infrastructure — must come before EnhancedChunkPreloader
             metrics = new AsyncMetrics();

@@ -171,8 +171,25 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
         }
         return loadBalancer.scheduleLoad(() -> {
             List<int[]> chunks = buildChunkListEnhanced(cx, cz, radiusX, radiusZ);
-            int batchSize = Math.min(loadBalancer.calculateOptimalBatchSize(chunks.size()) * 2, 16);
-            return loadChunksAsync(worldName, chunks, true, zoneId, batchSize);
+            
+            // Dedup: claim already-owned chunks, only load new ones
+            List<int[]> toLoad = new ArrayList<>();
+            int skipped = 0;
+            for (int[] coord : chunks) {
+                if (cacheManager.isChunkOwned(worldName, coord[0], coord[1])) {
+                    if (zoneId != null) cacheManager.registerOwnership(zoneId, worldName, coord[0], coord[1]);
+                    skipped++;
+                } else {
+                    toLoad.add(coord);
+                }
+            }
+            final int skippedCount = skipped;
+            if (skippedCount > 0) LOG.fine(() -> "[OptiPortal] warmLoad " + zoneId + ": skipped " + skippedCount + " already-owned chunks");
+            
+            int batchSize = Math.min(loadBalancer.calculateOptimalBatchSize(toLoad.size()) * 2, 16);
+            return toLoad.isEmpty()
+                    ? CompletableFuture.completedFuture(null)
+                    : loadChunksAsync(worldName, toLoad, true, zoneId, batchSize);
         }, AsyncMetrics.AsyncTaskPriority.NORMAL);
     }
     
@@ -182,10 +199,26 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
     private CompletableFuture<Void> enhancedPredictiveLoad(String zoneId, String worldName, int cx, int cz, int radius) {
         List<int[]> chunks = buildChunkListEnhanced(cx, cz, radius);
 
-        // Use adaptive batch sizing
-        int batchSize = loadBalancer.calculateOptimalBatchSize(chunks.size());
+        // Dedup: claim already-owned chunks, only load new ones
+        List<int[]> toLoad = new ArrayList<>();
+        int skipped = 0;
+        for (int[] coord : chunks) {
+            if (cacheManager.isChunkOwned(worldName, coord[0], coord[1])) {
+                if (zoneId != null) cacheManager.registerOwnership(zoneId, worldName, coord[0], coord[1]);
+                skipped++;
+            } else {
+                toLoad.add(coord);
+            }
+        }
+        final int skippedCount = skipped;
+        if (skippedCount > 0) LOG.fine(() -> "[OptiPortal] enhancedPredictiveLoad " + zoneId + ": skipped " + skippedCount + " already-owned chunks");
 
-        CompletableFuture<Void> load = loadChunksAsync(worldName, chunks, false, zoneId, batchSize);
+        // Use adaptive batch sizing
+        int batchSize = loadBalancer.calculateOptimalBatchSize(toLoad.size());
+
+        CompletableFuture<Void> load = toLoad.isEmpty()
+                ? CompletableFuture.completedFuture(null)
+                : loadChunksAsync(worldName, toLoad, false, zoneId, batchSize);
         if (zoneId != null) {
             return load.thenRunAsync(() -> cacheManager.setZoneTier(zoneId, CacheTier.HOT), executor);
         }
@@ -198,10 +231,26 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
     private CompletableFuture<Void> enhancedWarmLoad(String zoneId, String worldName, int cx, int cz, int radius) {
         List<int[]> chunks = buildChunkListEnhanced(cx, cz, radius);
         
-        // Use larger batch size for warm loads (they're less time-sensitive)
-        int batchSize = Math.min(loadBalancer.calculateOptimalBatchSize(chunks.size()) * 2, 16);
+        // Dedup: claim already-owned chunks, only load new ones
+        List<int[]> toLoad = new ArrayList<>();
+        int skipped = 0;
+        for (int[] coord : chunks) {
+            if (cacheManager.isChunkOwned(worldName, coord[0], coord[1])) {
+                if (zoneId != null) cacheManager.registerOwnership(zoneId, worldName, coord[0], coord[1]);
+                skipped++;
+            } else {
+                toLoad.add(coord);
+            }
+        }
+        final int skippedCount = skipped;
+        if (skippedCount > 0) LOG.fine(() -> "[OptiPortal] enhancedWarmLoad " + zoneId + ": skipped " + skippedCount + " already-owned chunks");
         
-        return loadChunksAsync(worldName, chunks, true, zoneId, batchSize);
+        // Use larger batch size for warm loads (they're less time-sensitive)
+        int batchSize = Math.min(loadBalancer.calculateOptimalBatchSize(toLoad.size()) * 2, 16);
+        
+        return toLoad.isEmpty()
+                ? CompletableFuture.completedFuture(null)
+                : loadChunksAsync(worldName, toLoad, true, zoneId, batchSize);
     }
     
     /**
@@ -214,7 +263,7 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
      * @param batchSize Batch size for processing
      * @return CompletableFuture that completes when all chunks are loaded
      */
-    private CompletableFuture<Void> loadChunksAsync(String worldName, List<int[]> chunks, 
+    private CompletableFuture<Void> loadChunksAsync(String worldName, List<int[]> chunks,
                                                     boolean nonTicking, String zoneId, int batchSize) {
         if (chunks.isEmpty()) {
             return CompletableFuture.completedFuture(null);
@@ -226,10 +275,11 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
         batchSize = Math.min(batchSize, getEffectiveBatchSize(worldName));
 
         // Guard 1: JVM heap — stop loading if approaching the engine's desperate-eviction
-        // threshold (85%). A 5% margin gives the GC time to act before the engine starts
-        // evicting aggressively. Pure Java — no Hytale API required.
-        double heapUsed = 1.0 - (double) Runtime.getRuntime().freeMemory()
-                                / Runtime.getRuntime().maxMemory();
+        // threshold (80%). Uses actual used/max ratio: (totalMemory - freeMemory) / maxMemory.
+        // NOTE: do NOT use (1 - freeMemory/maxMemory) — that over-estimates usage when the JVM
+        // has not yet expanded the heap to -Xmx, causing false aborts on startup.
+        Runtime rt = Runtime.getRuntime();
+        double heapUsed = (double)(rt.totalMemory() - rt.freeMemory()) / rt.maxMemory();
         if (heapUsed >= 0.80) {
             LOG.warning(() -> "[OptiPortal] loadChunksAsync: aborting — JVM heap at "
                     + String.format("%.1f", heapUsed * 100) + "% (threshold 80%)");

@@ -44,6 +44,12 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
     
     // Player position cache for staggered updates
     private final ConcurrentHashMap<UUID, PlayerPositionCache> positionCaches;
+
+    // Last confirmed position per player, keyed by UUID.
+    // Used to detect position jumps (same-world portal teleports) in the async path.
+    // Stored as double[]{x, z, worldUuidMostSig, worldUuidLeastSig} to guard against
+    // cross-world false positives.
+    private final ConcurrentHashMap<UUID, double[]> lastAsyncPosition = new ConcurrentHashMap<>();
     
     // In-memory portal cache - populated at startup, invalidated on mutations
     private volatile List<PortalEntry> portalCache = Collections.emptyList();
@@ -212,7 +218,7 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
         if (total == 0) return Collections.emptyList();
 
         // Advance cursor by one batch each call for round-robin fairness
-        int start = batchCursor.getAndAdd(POSITION_UPDATE_BATCH_SIZE) % total;
+        int start = Math.floorMod(batchCursor.getAndAdd(POSITION_UPDATE_BATCH_SIZE), total);
 
         List<UUID> batch = new ArrayList<>(POSITION_UPDATE_BATCH_SIZE);
         for (int i = 0; i < total && batch.size() < POSITION_UPDATE_BATCH_SIZE; i++) {
@@ -249,7 +255,70 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
         return worldBridge.getPlayerPositionAsync(world, playerRef)
                 .thenAcceptAsync(position -> {
                     if (position != null) {
-                        updatePositionCache(playerId, position);
+                        positionCaches.computeIfAbsent(playerId, k -> new PlayerPositionCache()).update();
+
+                        // Capture previous position before overwriting — used as portal source
+                        // if TeleportRecord confirms a same-world adventure.teleporter jump.
+                        // Store: [x, z, worldUuid.mostSigBits, worldUuid.leastSigBits]
+                        double[] prev = lastAsyncPosition.get(playerId);
+                        java.util.UUID wUuid = position.worldUuid;
+                        double wMsb = wUuid != null ? Double.longBitsToDouble(wUuid.getMostSignificantBits()) : 0;
+                        double wLsb = wUuid != null ? Double.longBitsToDouble(wUuid.getLeastSignificantBits()) : 0;
+                        lastAsyncPosition.put(playerId, new double[]{position.x, position.z, wMsb, wLsb});
+
+                        // Portal hotspot learning via TeleportRecord.
+                        // adventure.teleporter sets destination world = null (same-world);
+                        // command teleports (/tp home etc.) set an explicit world name.
+                        // Read TeleportRecord on the world thread and return its timestamp so
+                        // we can deduplicate and only learn each teleport once.
+                        final double[] capturedPrev = prev;
+                        final String wName = world.getName();
+                        final double dstX = position.x, dstZ = position.z;
+                        worldBridge.executeOnWorldThread(world, () -> {
+                            try {
+                                com.hypixel.hytale.server.core.modules.entity.teleport
+                                        .TeleportRecord rec = playerRef.getComponent(
+                                        com.hypixel.hytale.server.core.modules.entity.teleport
+                                                .TeleportRecord.getComponentType());
+                                if (rec == null) return null;
+                                var entry = rec.getLastTeleport();
+                                if (entry == null) return null;
+                                var dest = entry.destination();
+                                // Only same-world adventure.teleporter portals have null world
+                                if (dest == null || dest.getWorld() != null) return null;
+                                return entry.timestampNanos();
+                            } catch (Exception e) {
+                                return null;
+                            }
+                        }).thenAcceptAsync((Long ts) -> {
+                            if (ts == null) return;
+                            // Deduplicate: each teleport event has a unique nanosecond timestamp
+                            Long prevTs = getLastSeenTeleportNanos().get(playerId);
+                            if (prevTs != null && prevTs.equals(ts)) return;
+                            getLastSeenTeleportNanos().put(playerId, ts);
+                            // We need a pre-teleport position in the same world as source
+                            if (capturedPrev == null
+                                    || capturedPrev[2] != wMsb || capturedPrev[3] != wLsb) return;
+                            final double srcX = capturedPrev[0], srcZ = capturedPrev[1];
+                            // Find nearest destination zone to landing position
+                            PortalEntry best = null;
+                            double bestD = getPluginConfig().getActivationDistance();
+                            for (PortalEntry pe : getPortalCache()) {
+                                if (pe.isInstanced() || pe.getId().contains(":")) continue;
+                                if (!pe.getWorld().equals(wName)) continue;
+                                double d = Math.sqrt(Math.pow(pe.getX() - dstX, 2)
+                                                   + Math.pow(pe.getZ() - dstZ, 2));
+                                if (d < bestD) { bestD = d; best = pe; }
+                            }
+                            if (best != null) {
+                                final PortalEntry fBest = best;
+                                learnPortalHotspot(wName, srcX, srcZ, fBest.getId());
+                                LOG.info(() -> "[OptiPortal] Async portal hotspot learned: ("
+                                        + (int) srcX + ", " + (int) srcZ + ") → "
+                                        + fBest.getId() + " in " + wName);
+                            }
+                        }, getExecutor()).exceptionally(ex -> null);
+
                         checkProximityAndPreloadAsync(playerId, world.getName(), position.x, position.y, position.z);
                     }
                 }, getExecutor())
@@ -259,30 +328,11 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
                 });
     }
     
-    /**
-     * Update position cache for a player.
-     * 
-     * @param playerId Player ID
-     * @param position New position
-     */
-    private void updatePositionCache(UUID playerId, WorldThreadBridge.PlayerPosition position) {
-        PlayerPositionCache cache = positionCaches.computeIfAbsent(playerId, 
-            k -> new PlayerPositionCache());
-        cache.updatePosition(position);
-    }
-    
-    /**
-     * Check proximity and trigger preload asynchronously.
-     *
-     * @param playerId  Player ID
-     * @param worldName World name (matches PortalEntry.getWorld())
-     * @param x         Player X position
-     * @param z         Player Z position
-     */
     @Override
     public void removePlayerRef(UUID uuid) {
         super.removePlayerRef(uuid);
         positionCaches.remove(uuid);
+        lastAsyncPosition.remove(uuid);
     }
 
     private void checkProximityAndPreloadAsync(UUID playerId, String worldName, double x, double y, double z) {
@@ -322,6 +372,72 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
                                         + linkedId + ": " + ex.getMessage());
                         });
                     });
+                }
+            }
+        }
+
+        // Preload destination zones for any nearby portal devices in this (source) world
+        checkNearbyPortalDevicesForDestination(playerId, worldName, x, y, z);
+
+        // Promote destination zones to HOT for any learned portal hotspots near the player
+        checkHotspotPromotion(worldName, x, z);
+    }
+
+    /**
+     * Scan for portaldevice entries in the player's current (source) world.
+     * When the player is within activation distance of a portal device, trigger
+     * load of the corresponding portaldest zone in the destination world.
+     *
+     * This fires pre-arrival: the destination world warms up while the player
+     * is still standing in front of the portal, not after they step through.
+     */
+    private void checkNearbyPortalDevicesForDestination(UUID playerId, String worldName,
+            double x, double y, double z) {
+        double activationDist = getPluginConfig().getActivationDistance();
+        double activationDistV = getPluginConfig().getActivationDistanceVertical();
+
+        for (PortalEntry device : getPortalCache()) {
+            if (!device.getId().startsWith("portaldevice:")) continue;
+            if (!device.getWorld().equals(worldName)) continue;
+
+            double dx = device.getX() - x;
+            double dy = device.getY() - y;
+            double dz = device.getZ() - z;
+            if (Math.abs(dy) > activationDistV) continue;
+            if (dx * dx + dz * dz > activationDist * activationDist) continue;
+
+            // Player is near this portal device — resolve destination world if UUID is known.
+            // If UUID is not yet persisted (pre-1.1.4 entries), destWorldName stays null and
+            // we promote all portaldest zones rather than skipping entirely.
+            java.util.UUID destUuid = device.getDestinationWorldUuid();
+            String destWorldName = null;
+            if (destUuid != null) {
+                World destWorld = getChunkPreloader().getWorldRegistry().resolveWorld(destUuid, null);
+                if (destWorld != null) {
+                    destWorldName = destWorld.getName();
+                }
+            }
+
+            // Find all destination zones and trigger load
+            for (PortalEntry dest : getPortalCache()) {
+                if (dest.isInstanced()) continue;
+                if (dest.getId().startsWith("portaldevice:")) continue; // skip source-side entries
+
+                // If destination world is resolved, restrict to that world; otherwise consider all zones
+                if (destWorldName != null && !dest.getWorld().equals(destWorldName)) continue;
+
+                CacheTier tier = getPlugin().getCacheManager().getZoneTier(dest.getId());
+                if (tier == CacheTier.HOT) continue;
+                if (tier == CacheTier.WARM) {
+                    getPlugin().getCacheManager().setZoneTier(dest.getId(), CacheTier.HOT);
+                    LOG.fine(() -> "[OptiPortal] Portal device approach: promoted " + dest.getId() + " → HOT");
+                    continue;
+                }
+                // Only trigger a full chunk load when we have a precise destination match
+                if (destWorldName != null && !isOnCooldown(playerId, dest.getId())) {
+                    LOG.fine(() -> "[OptiPortal] Portal device approach: triggering preload of "
+                            + dest.getId() + " (player near " + device.getId() + ")");
+                    triggerAsyncPreload(dest, playerId);
                 }
             }
         }
@@ -458,10 +574,11 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
             removePlayerRef(playerId);
             return java.util.concurrent.CompletableFuture.completedFuture(null);
         }
+        final String worldName = world.getName();
         return worldBridge.getTeleportRecordAsync(world, playerRef)
                 .thenAccept(record -> {
                     if (record != null) {
-                        processTeleportRecord(playerId, record);
+                        processTeleportRecord(playerId, record, worldName);
                     }
                 })
                 .exceptionally(ex -> {
@@ -476,7 +593,7 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
      * @param playerId Player ID
      * @param record Teleport record entry
      */
-    private void processTeleportRecord(UUID playerId, com.hypixel.hytale.server.core.modules.entity.teleport.TeleportRecord.Entry record) {
+    private void processTeleportRecord(UUID playerId, com.hypixel.hytale.server.core.modules.entity.teleport.TeleportRecord.Entry record, String currentWorldName) {
         // Check if this is a new teleport
         Long prev = getLastSeenTeleportNanos().get(playerId);
         long ts = record.timestampNanos();
@@ -490,10 +607,26 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
                 com.hypixel.hytale.math.vector.Location dest = record.destination();
                 if (dest != null) {
                     String destWorld = dest.getWorld();
+                    // Same-world adventure.teleporter portals omit the world name —
+                    // fall back to the world the player is currently in.
+                    if (destWorld == null) destWorld = currentWorldName;
                     com.hypixel.hytale.math.vector.Vector3d pos = dest.getPosition();
-                    if (pos != null && destWorld != null) {
-                        // Process teleport asynchronously
+                    if (pos != null) {
+                        // Process teleport — proximity check / tier promotion
                         processTeleportAsync(playerId, destWorld, pos.x, pos.y, pos.z);
+                        // Portal link learning: record source→destination mapping.
+                        // Capture the last-known async position as the pre-teleport source.
+                        // There is an inherent race with updatePlayerPositionAsync but this
+                        // is best-effort — the hotspot system also learns independently.
+                        final double[] srcPos = lastAsyncPosition.get(playerId);
+                        final String fDestWorld = destWorld;
+                        final double fdx = pos.x, fdy = pos.y, fdz = pos.z;
+                        lingerOriginZone(playerId);
+                        String originId = srcPos != null
+                                ? findNearestPortal(currentWorldName, srcPos[0], 0, srcPos[1])
+                                : null;
+                        reversePreloadOrigin(playerId, originId, currentWorldName,
+                                fDestWorld, fdx, fdy, fdz, srcPos);
                     }
                 }
             }
@@ -520,21 +653,15 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
      * Player position cache for staggered updates.
      */
     private static class PlayerPositionCache {
-        private WorldThreadBridge.PlayerPosition position;
         private long lastUpdate;
         private static final long UPDATE_INTERVAL_MS = 1000; // Update every second
-        
+
         public boolean shouldUpdate() {
             return System.currentTimeMillis() - lastUpdate >= UPDATE_INTERVAL_MS;
         }
-        
-        public void updatePosition(WorldThreadBridge.PlayerPosition position) {
-            this.position = position;
+
+        public void update() {
             this.lastUpdate = System.currentTimeMillis();
-        }
-        
-        public WorldThreadBridge.PlayerPosition getPosition() {
-            return position;
         }
     }
     

@@ -297,13 +297,16 @@ public class WarmZoneManager {
         return chunkPreloader.warmLoad(entry, cx, cz, radiusX, radiusZ)
                 .thenRun(() -> {
                     cacheManager.setZoneTier(entry.getId(), CacheTier.HOT);
-                    // Exempt eternal-world zones from cache decay
+                    // WARM strategy zones never expire by design; eternal worlds also get no-decay.
                     com.hypixel.hytale.server.core.universe.world.World zoneWorld =
                             chunkPreloader.getWorldRegistry().getWorld(entry.getWorld());
-                    if (zoneWorld != null && !zoneWorld.getWorldConfig().canUnloadChunks()) {
+                    boolean isEternal = zoneWorld != null && !zoneWorld.getWorldConfig().canUnloadChunks();
+                    if (isEternal) {
                         cacheManager.markNoDecay(entry.getId());
-                        LOG.info(() -> "[OptiPortal] Zone '" + entry.getId()
-                                + "' in eternal world — decay exempted.");
+                        LOG.info(() -> "[OptiPortal] Zone '" + entry.getId() + "' in eternal world — no-decay exempted.");
+                    } else if (entry.getStrategy() == WarmStrategy.WARM) {
+                        cacheManager.markWarmFloor(entry.getId());
+                        LOG.info(() -> "[OptiPortal] Zone '" + entry.getId() + "' marked WARM floor (strategy=WARM).");
                     }
                     // Heap-delta measurement is unreliable on a live server (GC + other plugins).
                     // Use estimate for both fields; TODO: instrument via chunk object sizing.

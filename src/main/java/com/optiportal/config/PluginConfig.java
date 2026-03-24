@@ -146,7 +146,7 @@ public class PluginConfig {
     private int keepaliveColdIntervalMinutes = 120;
 
     // Chunk pressure / auditing
-    private int maxLoadedChunksPressureThreshold = 512;
+    private int maxLoadedChunksPressureThreshold = 2048;
     private int ownershipAuditIntervalMinutes = 60;
 
     /**

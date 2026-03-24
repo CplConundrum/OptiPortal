@@ -470,10 +470,11 @@ public class ChunkPreloader {
         if (coords.isEmpty()) return CompletableFuture.completedFuture(null);
 
         // Guard 1: JVM heap — stop loading if approaching the engine's desperate-eviction
-        // threshold (85%). A 5% margin gives the GC time to act before the engine starts
-        // evicting aggressively. Pure Java — no Hytale API required.
-        double heapUsed = 1.0 - (double) Runtime.getRuntime().freeMemory()
-                                / Runtime.getRuntime().maxMemory();
+        // threshold (80%). Uses actual used/max ratio: (totalMemory - freeMemory) / maxMemory.
+        // NOTE: do NOT use (1 - freeMemory/maxMemory) — that over-estimates usage when the JVM
+        // has not yet expanded the heap to -Xmx, causing false aborts on startup.
+        Runtime rt = Runtime.getRuntime();
+        double heapUsed = (double)(rt.totalMemory() - rt.freeMemory()) / rt.maxMemory();
         if (heapUsed >= 0.80) {
             LOG.warning(() -> "[OptiPortal] loadChunks: aborting — JVM heap at "
                     + String.format("%.1f", heapUsed * 100) + "% (threshold 80%)");

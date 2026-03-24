@@ -61,19 +61,23 @@ public class CacheManager {
     // CopyOnWriteArraySet: written rarely (zone registration), read on every decayTiers() call.
     private final java.util.Set<String> noDecayZones = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
+    // Zone IDs in this set may decay HOT→WARM normally but are held at WARM minimum — never go COLD.
+    // Used for WARM-strategy zones that should always stay loaded but should still reflect active/idle state.
+    private final java.util.Set<String> warmFloorZones = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     // Persistence fields for P11
     private final File registryFile;
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
 
     public CacheManager(PluginConfig config, WalManager walManager,
                         ScheduledExecutorService executor, WorldRegistry worldRegistry,
-                        File registryFile) {
+                        File registryFile, MetricsCollector metricsCollector) {
         this.config = config;
         this.walManager = walManager;
         this.executor = executor;
         this.worldRegistry = worldRegistry;
         this.registryFile = registryFile;
-        this.metricsCollector = new MetricsCollector();
+        this.metricsCollector = metricsCollector;
         // Run tier decay check every 10 seconds
         executor.scheduleAtFixedRate(this::decayTiers, 10, 10, TimeUnit.SECONDS);
     }
@@ -81,7 +85,7 @@ public class CacheManager {
     /** Backwards-compat constructor for existing callers without registryFile */
     public CacheManager(PluginConfig config, WalManager walManager,
                         ScheduledExecutorService executor, WorldRegistry worldRegistry) {
-        this(config, walManager, executor, worldRegistry, null);
+        this(config, walManager, executor, worldRegistry, null, new MetricsCollector());
     }
 
     public void loadRegistry() {
@@ -161,6 +165,20 @@ public class CacheManager {
         return noDecayZones.contains(zoneId);
     }
 
+    /**
+     * Mark a zone as having a WARM floor.
+     * HOT→WARM decay proceeds normally, but WARM→COLD is blocked — the WARM timer
+     * simply resets so the zone stays at WARM indefinitely.
+     * Used for WARM-strategy zones that must stay loaded but should still reflect idle state.
+     */
+    public void markWarmFloor(String zoneId) {
+        warmFloorZones.add(zoneId);
+    }
+
+    public void unmarkWarmFloor(String zoneId) {
+        warmFloorZones.remove(zoneId);
+    }
+
     public void saveRegistry() {
         if (registryFile == null) return;
         try {
@@ -197,7 +215,8 @@ public class CacheManager {
             owners.add(zoneId);
             recordReverseOwnership(zoneId, world, key);
         }
-        metricsCollector.recordChunksDeduped(newChunks);
+        int deduped = chunkCoords.size() - newChunks;
+        if (deduped > 0) metricsCollector.recordChunksDeduped(deduped);
         return newChunks;
     }
 
@@ -262,6 +281,7 @@ public class CacheManager {
         if (oldTier != null) {
             tierTimestamps.remove(zoneId);
             noDecayZones.remove(zoneId);
+            warmFloorZones.remove(zoneId);
             LOG.fine(() -> "[OptiPortal] Removed tier entry: " + zoneId + " (was " + oldTier + ")");
         }
     }
@@ -320,10 +340,16 @@ public class CacheManager {
                 nextEarliest = Math.min(nextEarliest, now + warmMs);
                 LOG.fine(() -> "[OptiPortal] Tier decay: " + zoneId + " HOT → WARM");
             } else if (tier == CacheTier.WARM && age >= warmMs) {
-                zoneTiers.put(zoneId, CacheTier.COLD);
-                tierTimestamps.remove(zoneId);
-                deregisterAllChunks(zoneId);
-                LOG.fine(() -> "[OptiPortal] Tier decay: " + zoneId + " WARM → COLD");
+                if (warmFloorZones.contains(zoneId)) {
+                    // WARM-floor zone: reset the timer to keep it at WARM indefinitely
+                    tierTimestamps.put(zoneId, now);
+                    nextEarliest = Math.min(nextEarliest, now + warmMs);
+                } else {
+                    zoneTiers.put(zoneId, CacheTier.COLD);
+                    tierTimestamps.remove(zoneId);
+                    deregisterAllChunks(zoneId);
+                    LOG.fine(() -> "[OptiPortal] Tier decay: " + zoneId + " WARM → COLD");
+                }
             } else {
                 // Not yet due — contribute to next earliest
                 long decayMs = (tier == CacheTier.HOT) ? hotMs : warmMs;
@@ -499,12 +525,14 @@ public class CacheManager {
                 Set<Long> zoneKeys = zoneWorldMap.get(worldName);
                 if (zoneKeys != null) zoneKeys.remove(key);
             }
-            // Tier downgrade
+            // noDecay zones keep their tier regardless of eviction
+            if (noDecayZones.contains(zoneId)) continue;
+            // Tier downgrade — warmFloor zones cannot drop below WARM
             CacheTier current = zoneTiers.getOrDefault(zoneId, CacheTier.COLD);
             CacheTier downgraded;
             switch (current) {
                 case HOT:  downgraded = CacheTier.WARM; break;
-                case WARM: downgraded = CacheTier.COLD; break;
+                case WARM: downgraded = warmFloorZones.contains(zoneId) ? CacheTier.WARM : CacheTier.COLD; break;
                 default:   downgraded = current; break;
             }
             if (downgraded != current) {
@@ -556,10 +584,12 @@ public class CacheManager {
         for (Map.Entry<String, CacheTier> entry : downgrades.entrySet()) {
             String zoneId = entry.getKey();
             CacheTier current = entry.getValue();
+            // noDecay zones keep their tier regardless of eviction
+            if (noDecayZones.contains(zoneId)) continue;
             CacheTier downgraded;
             switch (current) {
                 case HOT:  downgraded = CacheTier.WARM; break;
-                case WARM: downgraded = CacheTier.COLD; break;
+                case WARM: downgraded = warmFloorZones.contains(zoneId) ? CacheTier.WARM : CacheTier.COLD; break;
                 default:   downgraded = current; break;
             }
             if (downgraded != current) {
