@@ -1,8 +1,10 @@
 package com.optiportal.teleport;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -220,7 +222,7 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
         // Advance cursor by one batch each call for round-robin fairness
         int start = Math.floorMod(batchCursor.getAndAdd(POSITION_UPDATE_BATCH_SIZE), total);
 
-        List<UUID> batch = new ArrayList<>(POSITION_UPDATE_BATCH_SIZE);
+        Queue<UUID> batch = new ArrayDeque<>(POSITION_UPDATE_BATCH_SIZE);
         for (int i = 0; i < total && batch.size() < POSITION_UPDATE_BATCH_SIZE; i++) {
             UUID playerId = allPlayers.get((start + i) % total);
             PlayerPositionCache cache = positionCaches.get(playerId);
@@ -229,7 +231,7 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
             }
         }
 
-        return batch;
+        return new ArrayList<>(batch);
     }
     
     /**
@@ -306,8 +308,8 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
                             for (PortalEntry pe : getPortalCache()) {
                                 if (pe.isInstanced() || pe.getId().contains(":")) continue;
                                 if (!pe.getWorld().equals(wName)) continue;
-                                double d = Math.sqrt(Math.pow(pe.getX() - dstX, 2)
-                                                   + Math.pow(pe.getZ() - dstZ, 2));
+                                // D2: Use Math.hypot instead of Math.sqrt for better performance
+                                double d = Math.hypot(pe.getX() - dstX, pe.getZ() - dstZ);
                                 if (d < bestD) { bestD = d; best = pe; }
                             }
                             if (best != null) {
@@ -552,7 +554,7 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
         if (entries.isEmpty()) return;
 
         loadBalancer.scheduleLoad(() -> {
-            List<CompletableFuture<Void>> futures = new ArrayList<>(entries.size());
+            Queue<CompletableFuture<Void>> futures = new ArrayDeque<>(entries.size());
             for (java.util.Map.Entry<UUID, PlayerRef> e : entries) {
                 futures.add(checkTeleportRecordAsync(e.getKey(), e.getValue()));
             }
@@ -625,8 +627,11 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
                         String originId = srcPos != null
                                 ? findNearestPortal(currentWorldName, srcPos[0], 0, srcPos[1])
                                 : null;
-                        reversePreloadOrigin(playerId, originId, currentWorldName,
-                                fDestWorld, fdx, fdy, fdz, srcPos);
+                        // D1: Guard against race condition where srcPos is null
+                        if (srcPos != null) {
+                            reversePreloadOrigin(playerId, originId, currentWorldName,
+                                    fDestWorld, fdx, fdy, fdz, srcPos);
+                        }
                     }
                 }
             }
@@ -694,10 +699,9 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
                     if (speed == null) return;
                     if (speed > speedThreshold && baseRadius < maxRadius) {
                         int boostedRadius = baseRadius + 1; // cap at +1
-                        LOG.fine("[OptiPortal] Velocity boost: speed=" + String.format("%.2f", speed)
-                                + " threshold=" + speedThreshold
-                                + " radius=" + baseRadius + " → " + boostedRadius
-                                + " zone=" + zoneId);
+                        LOG.fine(() -> String.format(
+                                "[OptiPortal] Velocity boost: speed=%.2f threshold=%s radius=%d → %d zone=%s",
+                                speed, speedThreshold, baseRadius, boostedRadius, zoneId));
                         predictiveLoadWithRam(zoneId, worldName, cx, cz, boostedRadius);
                     }
                 })

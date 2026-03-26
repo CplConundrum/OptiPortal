@@ -85,7 +85,7 @@ public class JsonStorageBackend implements StorageBackend {
             loadFromDisk();
         } else {
             // Fresh install - write empty structure
-            flush();
+            flush(List.of());
         }
     }
 
@@ -129,35 +129,45 @@ public class JsonStorageBackend implements StorageBackend {
     }
 
     @Override
-    public synchronized void save(PortalEntry entry) {
-        entries.put(entry.getId(), entry);
-        flush();
-        // Notify cache updater
+    public void save(PortalEntry entry) {
+        List<PortalEntry> snapshot;
+        synchronized (this) {
+            entries.put(entry.getId(), entry);
+            snapshot = new ArrayList<>(entries.values());
+        }
+        flush(snapshot);
         if (cacheUpdater != null) {
-            cacheUpdater.onUpdate(new ArrayList<>(entries.values()));
+            cacheUpdater.onUpdate(snapshot);
         }
     }
 
     @Override
-    public synchronized void saveAll(List<PortalEntry> newEntries) {
-        for (PortalEntry e : newEntries) {
-            entries.put(e.getId(), e);
+    public void saveAll(List<PortalEntry> newEntries) {
+        List<PortalEntry> snapshot;
+        synchronized (this) {
+            for (PortalEntry e : newEntries) {
+                entries.put(e.getId(), e);
+            }
+            snapshot = new ArrayList<>(entries.values());
         }
-        flush();
-        // Notify cache updater
+        flush(snapshot);
         if (cacheUpdater != null) {
-            cacheUpdater.onUpdate(new ArrayList<>(entries.values()));
+            cacheUpdater.onUpdate(snapshot);
         }
     }
 
     @Override
-    public synchronized void delete(String id) {
-        PortalEntry removed = entries.remove(id);
-        if (removed != null) {
-            flush();
-            // Notify cache updater
+    public void delete(String id) {
+        List<PortalEntry> snapshot = null;
+        synchronized (this) {
+            if (entries.remove(id) != null) {
+                snapshot = new ArrayList<>(entries.values());
+            }
+        }
+        if (snapshot != null) {
+            flush(snapshot);
             if (cacheUpdater != null) {
-                cacheUpdater.onUpdate(new ArrayList<>(entries.values()));
+                cacheUpdater.onUpdate(snapshot);
             }
         }
     }
@@ -169,14 +179,19 @@ public class JsonStorageBackend implements StorageBackend {
 
     @Override
     public void close() {
-        flush();
+        List<PortalEntry> snapshot;
+        synchronized (this) {
+            snapshot = new ArrayList<>(entries.values());
+        }
+        flush(snapshot);
     }
 
     /**
      * Atomic write: tmp → rename to data, backup old.
-     * Ensures partial writes never corrupt the primary file.
+     * Snapshot is taken by the caller under the lock before this is called,
+     * so disk I/O (serialize + fsync + rename) never blocks concurrent readers.
      */
-    private synchronized void flush() {
+    private void flush(List<PortalEntry> snapshot) {
         try {
             // Build JSON
             JsonObject root = new JsonObject();
@@ -184,7 +199,7 @@ public class JsonStorageBackend implements StorageBackend {
             root.addProperty("_lastSaved", Instant.now().toString());
 
             JsonArray array = new JsonArray();
-            for (PortalEntry entry : entries.values()) {
+            for (PortalEntry entry : snapshot) {
                 array.add(GSON.toJsonTree(entry));
             }
             root.add("portals", array);

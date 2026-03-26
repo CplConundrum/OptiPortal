@@ -136,19 +136,22 @@ public class RetryPolicy {
                     });
             }, delayMs, TimeUnit.MILLISECONDS);
         } else {
-            // Fallback to simple delay
+            // E3: Remove Thread.sleep to avoid conflict with engine backoff
+            // Use executor-based scheduling even when no executor is provided
+            ScheduledExecutorService defaultExecutor = java.util.concurrent.Executors.newScheduledThreadPool(1);
             try {
-                Thread.sleep(delayMs);
-                executeWithRetry(operation, operationType, operationId, attempt)
-                    .whenComplete((result, ex) -> {
-                        if (ex == null) {
-                            future.complete(result);
-                        } else {
-                            future.completeExceptionally(ex);
-                        }
-                    });
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+                defaultExecutor.schedule(() -> {
+                    executeWithRetry(operation, operationType, operationId, attempt)
+                        .whenComplete((result, ex) -> {
+                            if (ex == null) {
+                                future.complete(result);
+                            } else {
+                                future.completeExceptionally(ex);
+                            }
+                            defaultExecutor.shutdown();
+                        });
+                }, delayMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+            } catch (Exception e) {
                 future.completeExceptionally(e);
             }
         }
@@ -312,23 +315,27 @@ public class RetryPolicy {
                         });
                 }, delayMs, TimeUnit.MILLISECONDS);
             } else {
+                // E3: Remove Thread.sleep to avoid conflict with engine backoff
+                // Use executor-based scheduling even when no executor is provided
+                ScheduledExecutorService defaultExecutor = java.util.concurrent.Executors.newScheduledThreadPool(1);
                 try {
-                    Thread.sleep(delayMs);
-                    executeWithRetry(operation, operationType, operationId, attempt)
-                        .whenComplete((result, ex) -> {
-                            if (ex == null) {
-                                future.complete(result);
-                            } else {
-                                future.completeExceptionally(ex);
-                            }
-                        });
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
+                    defaultExecutor.schedule(() -> {
+                        executeWithRetry(operation, operationType, operationId, attempt)
+                            .whenComplete((result, ex) -> {
+                                if (ex == null) {
+                                    future.complete(result);
+                                } else {
+                                    future.completeExceptionally(ex);
+                                }
+                                defaultExecutor.shutdown();
+                            });
+                    }, delayMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+                } catch (Exception e) {
                     future.completeExceptionally(e);
                 }
             }
-            
-            return future;
-        }
-    }
+           
+           return future;
+       }
+   }
 }

@@ -6,7 +6,9 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.function.Supplier;
 import java.util.logging.Logger;
 
 import com.hypixel.hytale.math.util.ChunkUtil;
@@ -46,6 +48,13 @@ public class ChunkPreloader {
     private final ScheduledExecutorService executor;
     private final StorageBackend storage;
     private final MetricsCollector metricsCollector;
+
+    /**
+     * In-flight load dedup map: zoneId → relay future currently being loaded.
+     * Shared by subclasses so both ChunkPreloader and EnhancedChunkPreloader
+     * deduplicate against the same state.
+     */
+    protected final ConcurrentHashMap<String, CompletableFuture<Void>> inflightLoads = new ConcurrentHashMap<>();
 
     public ChunkPreloader(PluginConfig config,
                           CacheManager cacheManager,
@@ -108,6 +117,47 @@ public class ChunkPreloader {
     }
 
     // -------------------------------------------------------------------------
+    // In-flight dedup
+    // -------------------------------------------------------------------------
+
+    /**
+     * Atomically ensures at most one predictive load runs per zone at a time.
+     *
+     * Uses ConcurrentHashMap.compute to install a relay CompletableFuture before
+     * the loader starts, so any concurrent caller that arrives after the compute
+     * but before the load completes receives the same relay rather than starting
+     * a second load. The relay mirrors the actual future's completion.
+     *
+     * If zoneId is null (anonymous load), the loader runs unconditionally.
+     */
+    protected final CompletableFuture<Void> withInflightDedup(
+            String zoneId, Supplier<CompletableFuture<Void>> loader) {
+        if (zoneId == null) {
+            return loader.get();
+        }
+        boolean[] isNew = {false};
+        CompletableFuture<Void> relay = inflightLoads.compute(zoneId, (k, existing) -> {
+            if (existing != null && !existing.isDone()) {
+                return existing; // re-use; isNew stays false
+            }
+            isNew[0] = true;
+            return new CompletableFuture<>();
+        });
+        if (!isNew[0]) {
+            LOG.fine(() -> "[OptiPortal] predictiveLoad: reusing in-flight future for " + zoneId);
+            return relay;
+        }
+        // We own the slot — start the actual load and wire it to the relay.
+        CompletableFuture<Void> actual = loader.get();
+        actual.whenComplete((v, ex) -> {
+            if (ex != null) relay.completeExceptionally(ex);
+            else relay.complete(null);
+            inflightLoads.remove(zoneId, relay);
+        });
+        return relay;
+    }
+
+    // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------
 
@@ -129,50 +179,68 @@ public class ChunkPreloader {
      * On completion, promotes the zone tier from UNVISITED → HOT in CacheManager.
      */
     public CompletableFuture<Void> predictiveLoad(String zoneId, String worldName, int cx, int cz, int radius) {
-        World world = worldRegistry.getWorld(worldName);
-        if (world == null) {
-            LOG.warning("[OptiPortal] predictiveLoad: world not loaded: " + worldName);
-            return CompletableFuture.completedFuture(null);
-        }
-        // Dedup: register ownership for already-loaded chunks, only load new ones
-        // Use density-sorted list so resident chunks are claimed first at zero IO cost (H5)
-        List<int[]> allChunks = buildChunkListWithDensity(worldName, cx, cz, radius);
-        List<int[]> toLoad = new ArrayList<>();
-        for (int[] coord : allChunks) {
-            if (cacheManager.isChunkOwned(worldName, coord[0], coord[1])) {
-                // Already loaded by another zone — just claim ownership
-                if (zoneId != null) cacheManager.registerOwnership(zoneId, worldName, coord[0], coord[1]);
-            } else {
-                toLoad.add(coord);
+        return withInflightDedup(zoneId, () -> {
+            World world = worldRegistry.getWorld(worldName);
+            if (world == null) {
+                LOG.warning("[OptiPortal] predictiveLoad: world not loaded: " + worldName);
+                return CompletableFuture.completedFuture(null);
             }
-        }
-        int skipped = allChunks.size() - toLoad.size();
-        if (skipped > 0 && toLoad.size() > 0) LOG.info(() -> "[OptiPortal] predictiveLoad " + zoneId + ": skipped " + skipped + " already-owned chunks");
-
-        CompletableFuture<Void> future = toLoad.isEmpty()
-                ? CompletableFuture.completedFuture(null)
-                : loadChunks(world, toLoad, false, zoneId);
-
-        if (zoneId != null) {
-            final String zid = zoneId;
-            final int loadedCount = toLoad.size();
-            final long startTime = System.nanoTime();
-            future.thenRun(() -> {
-                cacheManager.setZoneTier(zid, com.optiportal.model.CacheTier.HOT);
-                if (loadedCount > 0) {
-                    LOG.info(() -> "[OptiPortal] predictiveLoad complete: " + zid + " → HOT (loaded=" + loadedCount + " shared=" + skipped + ")");
+            // Dedup: register ownership for already-loaded chunks, only load new ones
+            // Use density-sorted list so resident chunks are claimed first at zero IO cost (H5)
+            List<int[]> allChunks = buildChunkListWithDensity(worldName, cx, cz, radius);
+            List<int[]> toLoad = new ArrayList<>();
+            for (int[] coord : allChunks) {
+                if (cacheManager.isChunkOwned(worldName, coord[0], coord[1])) {
+                    // Already loaded by another zone — just claim ownership
+                    if (zoneId != null) cacheManager.registerOwnership(zoneId, worldName, coord[0], coord[1]);
+                } else {
+                    toLoad.add(coord);
                 }
-                // Update entry stats
-                Optional<PortalEntry> entryOpt = storage.loadById(zid);
-                entryOpt.ifPresent(entry -> updateEntryStats(entry, loadedCount));
-                // Record metrics
-                metricsCollector.recordPreload();
-                metricsCollector.recordChunksDeduped(skipped);
-                long durationMs = (System.nanoTime() - startTime) / 1_000_000;
-                metricsCollector.recordFreshLoadTime(durationMs);
-            });
-        }
-        return future;
+            }
+            int skipped = allChunks.size() - toLoad.size();
+            if (skipped > 0 && toLoad.size() > 0) LOG.info(() -> "[OptiPortal] predictiveLoad " + zoneId + ": skipped " + skipped + " already-owned chunks");
+
+            CompletableFuture<Void> future = toLoad.isEmpty()
+                    ? CompletableFuture.completedFuture(null)
+                    : loadChunks(world, toLoad, false, zoneId);
+
+            if (zoneId != null) {
+                final String zid = zoneId;
+                final int loadedCount = toLoad.size();
+                final int totalCount = allChunks.size();
+                final long startTime = System.nanoTime();
+                // D4: thenRunAsync dispatches storage I/O to executor, not the world thread.
+                // U1: thenRunAsync does not fire on a failed future (e.g. ChunkLoadAbortedException),
+                //     so HOT promotion is suppressed when the load was aborted by a guard.
+                CompletableFuture<Void> chainedFuture = future.thenRunAsync(() -> {
+                    cacheManager.setZoneTier(zid, com.optiportal.model.CacheTier.HOT);
+                    if (loadedCount > 0) {
+                        LOG.info(() -> "[OptiPortal] predictiveLoad complete: " + zid + " → HOT (loaded=" + loadedCount + " shared=" + skipped + ")");
+                    }
+                    // Update entry stats using total chunk count (not just newly loaded),
+                    // so shared-chunk loads still record correct RAM and preload count.
+                    Optional<PortalEntry> entryOpt = storage.loadById(zid);
+                    entryOpt.ifPresent(entry -> {
+                        updateEntryStats(entry, totalCount);
+                        storage.save(entry);
+                    });
+                    // Record metrics
+                    metricsCollector.recordPreload();
+                    metricsCollector.recordChunksDeduped(skipped);
+                    long durationMs = (System.nanoTime() - startTime) / 1_000_000;
+                    metricsCollector.recordFreshLoadTime(durationMs);
+                }, executor).exceptionally(ex -> {
+                    if (ex instanceof ChunkLoadAbortedException || ex.getCause() instanceof ChunkLoadAbortedException) {
+                        LOG.fine("[OptiPortal] predictiveLoad aborted for " + zid + " — tier not promoted: " + ex.getMessage());
+                    } else {
+                        LOG.warning("[OptiPortal] predictiveLoad post-load error for " + zid + ": " + ex.getMessage());
+                    }
+                    return null;
+                });
+                return chainedFuture;
+            }
+            return future;
+        });
     }
 
     /**
@@ -269,18 +337,32 @@ public class ChunkPreloader {
         if (zoneId != null) {
             final String zid = zoneId;
             final int loadedCount = toLoad.size();
+            final int totalCount = allChunks.size();
             final long startTime = System.nanoTime();
-            future.thenRun(() -> {
+            // D4 + U1: thenRunAsync dispatches to executor; does not fire on failed future.
+            CompletableFuture<Void> chainedFuture = future.thenRunAsync(() -> {
                 LOG.info(() -> "[OptiPortal] warmLoad complete: " + zid + " (loaded=" + loadedCount + " shared=" + skipped + ")");
-                // Update entry stats
+                // Update entry stats using total chunk count so shared-chunk loads
+                // still record correct RAM. Save so the UI reflects updated values.
                 Optional<PortalEntry> entryOpt = storage.loadById(zid);
-                entryOpt.ifPresent(entry -> updateEntryStats(entry, loadedCount));
+                entryOpt.ifPresent(entry -> {
+                    updateEntryStats(entry, totalCount);
+                    storage.save(entry);
+                });
                 // Record metrics
                 metricsCollector.recordPreload();
                 metricsCollector.recordChunksDeduped(skipped);
                 long durationMs = (System.nanoTime() - startTime) / 1_000_000;
                 metricsCollector.recordRestoreTime(durationMs);
+            }, executor).exceptionally(ex -> {
+                if (ex instanceof ChunkLoadAbortedException || ex.getCause() instanceof ChunkLoadAbortedException) {
+                    LOG.fine("[OptiPortal] warmLoad aborted for " + zid + " — skipping stats update: " + ex.getMessage());
+                } else {
+                    LOG.warning("[OptiPortal] warmLoad post-load error for " + zid + ": " + ex.getMessage());
+                }
+                return null;
             });
+            return chainedFuture;
         }
         return future;
     }
@@ -476,9 +558,11 @@ public class ChunkPreloader {
         Runtime rt = Runtime.getRuntime();
         double heapUsed = (double)(rt.totalMemory() - rt.freeMemory()) / rt.maxMemory();
         if (heapUsed >= 0.80) {
-            LOG.warning(() -> "[OptiPortal] loadChunks: aborting — JVM heap at "
-                    + String.format("%.1f", heapUsed * 100) + "% (threshold 80%)");
-            return CompletableFuture.completedFuture(null);
+            String reason = "JVM heap at " + String.format("%.1f", heapUsed * 100) + "% (threshold 80%)";
+            LOG.warning(() -> "[OptiPortal] loadChunks: aborting — " + reason);
+            // U1: Return a failed future so thenRun/thenRunAsync callbacks do NOT fire,
+            // preventing the zone from being promoted to HOT when no load occurred.
+            return CompletableFuture.failedFuture(new ChunkLoadAbortedException(reason));
         }
 
         // Guard 2: Chunk count — abort if world already exceeds the configured ceiling.
@@ -487,9 +571,10 @@ public class ChunkPreloader {
         if (pressureThreshold > 0) {
             int liveCount = world.getChunkStore().getLoadedChunksCount();
             if (liveCount >= pressureThreshold) {
-                LOG.warning(() -> "[OptiPortal] loadChunks: aborting — chunk pressure limit ("
-                        + liveCount + " >= " + pressureThreshold + ")");
-                return CompletableFuture.completedFuture(null);
+                String reason = "chunk pressure limit (" + liveCount + " >= " + pressureThreshold + ")";
+                LOG.warning(() -> "[OptiPortal] loadChunks: aborting — " + reason);
+                // U1: Same as above — failed future suppresses HOT promotion.
+                return CompletableFuture.failedFuture(new ChunkLoadAbortedException(reason));
             }
         }
 

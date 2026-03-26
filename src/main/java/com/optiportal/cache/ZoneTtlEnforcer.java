@@ -87,6 +87,14 @@ public class ZoneTtlEnforcer {
      * exceeds their TTL. HOT and WARM zones are never evicted.
      */
     public void runCleanup() {
+        try {
+            runCleanupInternal();
+        } catch (Exception e) {
+            LOG.warning("[OptiPortal] ZoneTtlEnforcer: cleanup error (scheduler preserved): " + e.getMessage());
+        }
+    }
+
+    private void runCleanupInternal() {
         Instant now = Instant.now();
         int removed = 0;
 

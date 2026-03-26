@@ -230,6 +230,33 @@ public class WarmZoneManager {
                 .whenComplete((v, ex) ->
                     LOG.info(() -> "[OptiPortal] Startup load complete: "
                             + loaded.get() + " loaded, " + skipped.get() + " skipped."));
+
+        // PRED zones are never chunk-loaded at startup, so their RAM stats are never
+        // written unless a player has approached them before. Zones whose tier was
+        // restored from the registry arrive with ramMarginalMB == 0 and show "--" in
+        // the UI indefinitely. Compute and persist the expected RAM value from the zone
+        // radius so the column shows a meaningful number immediately after restart.
+        List<PortalEntry> statlessPred = all.stream()
+                .filter(e -> e.getStrategy() != WarmStrategy.WARM)
+                .filter(e -> !e.isInstanced())
+                .filter(e -> e.getRamMarginalMB() <= 0)
+                .toList();
+        for (PortalEntry zone : statlessPred) {
+            int fallback = config.getPredictiveRadius();
+            int rx = zone.getWarmRadiusX() != null ? zone.getWarmRadiusX()
+                   : zone.getWarmRadius() > 0      ? zone.getWarmRadius()
+                   : fallback;
+            int rz = zone.getWarmRadiusZ() != null ? zone.getWarmRadiusZ()
+                   : zone.getWarmRadius() > 0      ? zone.getWarmRadius()
+                   : fallback;
+            int chunkCount = (2 * rx + 1) * (2 * rz + 1);
+            zone.setRamMarginalMB((chunkCount * (double) config.getBytesPerChunk()) / (1024.0 * 1024.0));
+            storage.save(zone);
+        }
+        if (!statlessPred.isEmpty()) {
+            final int n = statlessPred.size();
+            LOG.info(() -> "[OptiPortal] Startup: initialized RAM stats for " + n + " PRED zone(s).");
+        }
     }
 
     private int startupPriority(PortalEntry e) {
@@ -290,12 +317,14 @@ public class WarmZoneManager {
                 + " world=" + entry.getWorld()
                 + " cx=" + cx + " cz=" + cz + " rx=" + radiusX + " rz=" + radiusZ);
 
-        // Estimated RAM: (2*rx+1)*(2*rz+1) chunks × 64KB × 1.5x overhead for entities/metadata
+        // Estimated RAM: bytesPerChunk already includes the 1.5x overhead factor.
         int chunkCount = (2 * radiusX + 1) * (2 * radiusZ + 1);
-        double estimatedMB = (chunkCount * 65536.0 * 1.5) / (1024.0 * 1024.0);
+        double estimatedMB = (chunkCount * (double) config.getBytesPerChunk()) / (1024.0 * 1024.0);
 
         return chunkPreloader.warmLoad(entry, cx, cz, radiusX, radiusZ)
-                .thenRun(() -> {
+                // D4: supply executor so storage I/O runs on the plugin executor,
+                //     not ForkJoinPool.commonPool() (the thenRunAsync default).
+                .thenRunAsync(() -> {
                     cacheManager.setZoneTier(entry.getId(), CacheTier.HOT);
                     // WARM strategy zones never expire by design; eternal worlds also get no-decay.
                     com.hypixel.hytale.server.core.universe.world.World zoneWorld =
@@ -318,7 +347,7 @@ public class WarmZoneManager {
                     });
                     LOG.info(() -> "[OptiPortal] WARM zone loaded: " + entry.getId()
                             + " est=" + String.format("%.1f", estimatedMB) + "MB");
-                })
+                }, executor)
                 .exceptionally(ex -> {
                     LOG.warning(() -> "[OptiPortal] WARM zone load failed for "
                             + entry.getId() + ": " + ex.getMessage());

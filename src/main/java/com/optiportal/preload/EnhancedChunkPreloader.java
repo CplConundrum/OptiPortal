@@ -129,11 +129,13 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
             LOG.warning("[OptiPortal] predictiveLoad: world not loaded: " + worldName);
             return CompletableFuture.completedFuture(null);
         }
-        
-        // Use load balancer to distribute load across time
-        return loadBalancer.scheduleLoad(() -> {
-            return enhancedPredictiveLoad(zoneId, worldName, cx, cz, radius);
-        }, AsyncMetrics.AsyncTaskPriority.HIGH);
+        // In-flight dedup: if a load is already running for this zone, return its relay future.
+        // Prevents N concurrent portal approaches from queuing N identical scheduleLoad tasks.
+        return withInflightDedup(zoneId, () ->
+            loadBalancer.scheduleLoad(
+                () -> enhancedPredictiveLoad(zoneId, worldName, cx, cz, radius),
+                AsyncMetrics.AsyncTaskPriority.HIGH)
+        );
     }
     
     /**
@@ -220,7 +222,18 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
                 ? CompletableFuture.completedFuture(null)
                 : loadChunksAsync(worldName, toLoad, false, zoneId, batchSize);
         if (zoneId != null) {
-            return load.thenRunAsync(() -> cacheManager.setZoneTier(zoneId, CacheTier.HOT), executor);
+            final String zid = zoneId;
+            // U1: thenRunAsync does not fire on a failed future (ChunkLoadAbortedException),
+            //     so HOT promotion is suppressed when the load was aborted by a guard.
+            return load.thenRunAsync(() -> cacheManager.setZoneTier(zid, CacheTier.HOT), executor)
+                    .exceptionally(ex -> {
+                        if (ex instanceof ChunkLoadAbortedException || ex.getCause() instanceof ChunkLoadAbortedException) {
+                            LOG.fine("[OptiPortal] enhancedPredictiveLoad aborted for " + zid + " — tier not promoted: " + ex.getMessage());
+                        } else {
+                            LOG.warning("[OptiPortal] enhancedPredictiveLoad error for " + zid + ": " + ex.getMessage());
+                        }
+                        return null;
+                    });
         }
         return load;
     }
@@ -281,9 +294,11 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
         Runtime rt = Runtime.getRuntime();
         double heapUsed = (double)(rt.totalMemory() - rt.freeMemory()) / rt.maxMemory();
         if (heapUsed >= 0.80) {
-            LOG.warning(() -> "[OptiPortal] loadChunksAsync: aborting — JVM heap at "
-                    + String.format("%.1f", heapUsed * 100) + "% (threshold 80%)");
-            return CompletableFuture.completedFuture(null);
+            String reason = "JVM heap at " + String.format("%.1f", heapUsed * 100) + "% (threshold 80%)";
+            LOG.warning(() -> "[OptiPortal] loadChunksAsync: aborting — " + reason);
+            // U1: Return a failed future so thenRunAsync does NOT fire and the zone
+            // is not promoted to HOT when no chunks were actually loaded.
+            return CompletableFuture.failedFuture(new ChunkLoadAbortedException(reason));
         }
 
         // Guard 2: Chunk count — abort if world already exceeds the configured ceiling.
@@ -294,9 +309,10 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
             if (world != null) {
                 int liveCount = world.getChunkStore().getLoadedChunksCount();
                 if (liveCount >= pressureThreshold) {
-                    LOG.warning(() -> "[OptiPortal] loadChunksAsync: aborting — chunk pressure limit ("
-                            + liveCount + " >= " + pressureThreshold + ")");
-                    return CompletableFuture.completedFuture(null);
+                    String reason = "chunk pressure limit (" + liveCount + " >= " + pressureThreshold + ")";
+                    LOG.warning(() -> "[OptiPortal] loadChunksAsync: aborting — " + reason);
+                    // U1: Same — failed future suppresses HOT promotion.
+                    return CompletableFuture.failedFuture(new ChunkLoadAbortedException(reason));
                 }
             }
         }
@@ -442,9 +458,10 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
                 && !corridorIndex.isEmpty()
                 && getConfig().isCorridorPrioritizationEnabled();
 
+        // A3: Use Chebyshev distance instead of Manhattan for better chunk loading prioritization
         list.sort((c1, c2) -> {
-            int dist1 = Math.abs(c1[0] - cx) + Math.abs(c1[1] - cz);
-            int dist2 = Math.abs(c2[0] - cx) + Math.abs(c2[1] - cz);
+            int dist1 = Math.max(Math.abs(c1[0] - cx), Math.abs(c1[1] - cz));
+            int dist2 = Math.max(Math.abs(c2[0] - cx), Math.abs(c2[1] - cz));
 
             if (corridorEnabled) {
                 if (corridorIndex.isCorridor(c1[0], c1[1])) dist1 = Math.max(0, dist1 - 1);

@@ -41,7 +41,15 @@ public class CircuitBreaker {
         if (state.get() == State.HALF_OPEN) {
             int successes = successCount.incrementAndGet();
             if (successes >= SUCCESS_THRESHOLD) {
-                closeCircuit();
+                // CAS: only close if still in HALF_OPEN. A concurrent failure may have
+                // already re-opened the circuit; unconditional state.set() would overwrite
+                // that OPEN back to CLOSED, masking the failure.
+                if (state.compareAndSet(State.HALF_OPEN, State.CLOSED)) {
+                    failureCount.set(0);
+                    successCount.set(0);
+                    lastStateChange.set(System.currentTimeMillis());
+                    LOG.info("Circuit breaker CLOSED - normal operation resumed");
+                }
             }
         } else if (state.get() == State.CLOSED) {
             // Reset failure count on success in closed state

@@ -8,6 +8,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.logging.Logger;
 
+import com.hypixel.hytale.server.core.universe.world.World;
 import com.optiportal.async.AsyncLoadBalancer;
 import com.optiportal.async.AsyncMetrics;
 import com.optiportal.async.WorldThreadBridge;
@@ -142,24 +143,59 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
      * @return CompletableFuture that completes when batch is done
      */
     private CompletableFuture<Void> pingChunkBatch(String worldName, List<ChunkCoordinate> batch, CacheTier tier) {
+        World world = getChunkPreloader().getWorldRegistry().getWorld(worldName);
+        if (world == null) return CompletableFuture.completedFuture(null);
+
         List<CompletableFuture<Void>> chunkFutures = new ArrayList<>();
-        
+
         for (ChunkCoordinate coord : batch) {
-            // WorldThreadBridge.getChunkAsync already records success/error metrics — do not double-count.
+            // U2: Residency check via ChunkStore.getChunkReference() — a StampedLock map
+            // lookup that is safe to call from any thread and never triggers a load.
+            // Returns null if the chunk is not currently in the store (evicted or never loaded).
+            // Formula matches ChunkUtil.indexChunk(x, z) from the engine source.
+            long index = (long) coord.cx << 32 | (coord.cz & 0xFFFFFFFFL);
+            boolean resident = world.getChunkStore().getChunkReference(index) != null;
+
+            if (!resident && tier == CacheTier.HOT) {
+                // Chunk was evicted since the last keepalive ping. Find every HOT zone
+                // that contains this coordinate and demote it to WARM so the UI reflects
+                // the actual state rather than claiming the chunks are in memory.
+                List<PortalEntry> entries = portalCacheSupplier != null
+                        ? portalCacheSupplier.get()
+                        : getStorage().loadAll();
+                for (PortalEntry entry : entries) {
+                    if (entry.isInstanced()) continue;
+                    if (getCacheManager().getZoneTier(entry.getId()) != CacheTier.HOT) continue;
+
+                    int cx = ChunkPreloader.toChunkCoord(entry.getX());
+                    int cz = ChunkPreloader.toChunkCoord(entry.getZ());
+                    int radiusX = resolveRadiusX(entry);
+                    int radiusZ = resolveRadiusZ(entry);
+
+                    if (Math.abs(coord.cx - cx) <= radiusX && Math.abs(coord.cz - cz) <= radiusZ) {
+                        getCacheManager().setZoneTier(entry.getId(), CacheTier.WARM);
+                        LOG.info(() -> "[OptiPortal] Keepalive: chunk " + coord.cx + "," + coord.cz
+                                + " evicted — demoted zone '" + entry.getId() + "' HOT → WARM");
+                        break;
+                    }
+                }
+            }
+
+            // Always call getChunkAsync regardless of current residency. This is the
+            // actual keepalive ping — it re-requests the chunk from the engine, which
+            // resets its eviction timer and reloads it if it was evicted.
             CompletableFuture<Void> chunkFuture = worldBridge.getChunkAsync(
-                getChunkPreloader().getWorldRegistry().getWorld(worldName),
-                coord.cx, coord.cz, true) // Non-ticking for keepalive
-                .thenRun(() -> {
-                    // Chunk pinged — metrics recorded by WorldThreadBridge
-                })
-                .exceptionally(ex -> {
-                    LOG.fine("Keepalive chunk ping failed: " + coord.cx + "," + coord.cz + ": " + ex.getMessage());
-                    return null;
-                });
-  
+                    world, coord.cx, coord.cz, true)
+                    .thenRun(() -> { /* chunk pinged — metrics recorded by WorldThreadBridge */ })
+                    .exceptionally(ex -> {
+                        LOG.fine(() -> "Keepalive chunk ping failed: " + coord.cx + "," + coord.cz
+                                + ": " + ex.getMessage());
+                        return null;
+                    });
+
             chunkFutures.add(chunkFuture);
         }
-        
+
         return CompletableFuture.allOf(chunkFutures.toArray(new CompletableFuture[0]));
     }
     

@@ -53,13 +53,18 @@ public class PreloadCommand extends AbstractCommand {
                         // Fetch storage data off the world thread to avoid blocking it
                         List<com.optiportal.model.PortalEntry> zones = plugin.getStorage().loadAll();
                         world.execute(() -> {
-                            @SuppressWarnings("unchecked")
-                            com.hypixel.hytale.server.core.entity.entities.Player player =
-                                    (com.hypixel.hytale.server.core.entity.entities.Player)
-                                    playerRef.getComponent(
-                                            com.hypixel.hytale.server.core.entity.entities.Player.getComponentType());
-                            if (player != null) {
-                                com.optiportal.ui.OptiPortalUIPage.openFor(player, playerRef, plugin, zones);
+                            try {
+                                @SuppressWarnings("unchecked")
+                                com.hypixel.hytale.server.core.entity.entities.Player player =
+                                        (com.hypixel.hytale.server.core.entity.entities.Player)
+                                        playerRef.getComponent(
+                                                com.hypixel.hytale.server.core.entity.entities.Player.getComponentType());
+                                if (player != null) {
+                                    com.optiportal.ui.OptiPortalUIPage.openFor(player, playerRef, plugin, zones);
+                                }
+                            } catch (Exception e) {
+                                // E1: Catch and handle exceptions from World.execute()
+                                reply(context, "[OptiPortal] Failed to open UI: " + e.getMessage());
                             }
                         });
                         return done();
@@ -199,7 +204,14 @@ public class PreloadCommand extends AbstractCommand {
             entry.setWarmRadiusX(rx);
             entry.setWarmRadiusZ(rz);
             plugin.getStorage().save(entry);
-            reply(ctx, "[OptiPortal] " + id + " radius → " + rx + "x" + rz + ".");
+            if (entry.getStrategy() == com.optiportal.model.WarmStrategy.WARM) {
+                int cx = ChunkPreloader.toChunkCoord(entry.getX());
+                int cz = ChunkPreloader.toChunkCoord(entry.getZ());
+                plugin.getChunkPreloader().warmLoad(id, entry.getWorld(), cx, cz, rx, rz);
+                reply(ctx, "[OptiPortal] " + id + " radius → " + rx + "x" + rz + ". Reloading...");
+            } else {
+                reply(ctx, "[OptiPortal] " + id + " radius → " + rx + "x" + rz + ".");
+            }
             return CompletableFuture.<Void>completedFuture(null);
         }).orElseGet(() -> { reply(ctx, "[OptiPortal] Portal '" + id + "' not found."); return done(); });
     }
@@ -215,7 +227,14 @@ public class PreloadCommand extends AbstractCommand {
             entry.setWarmRadiusX(rx);
             entry.setWarmRadiusZ(rz);
             plugin.getStorage().save(entry);
-            reply(ctx, "[OptiPortal] " + id + " radius → " + rx + "x" + rz + " (deprecated: use /preload radius).");
+            if (entry.getStrategy() == com.optiportal.model.WarmStrategy.WARM) {
+                int cx = ChunkPreloader.toChunkCoord(entry.getX());
+                int cz = ChunkPreloader.toChunkCoord(entry.getZ());
+                plugin.getChunkPreloader().warmLoad(id, entry.getWorld(), cx, cz, rx, rz);
+                reply(ctx, "[OptiPortal] " + id + " radius → " + rx + "x" + rz + ". Reloading... (deprecated: use /preload radius).");
+            } else {
+                reply(ctx, "[OptiPortal] " + id + " radius → " + rx + "x" + rz + " (deprecated: use /preload radius).");
+            }
             return CompletableFuture.<Void>completedFuture(null);
         }).orElseGet(() -> { reply(ctx, "[OptiPortal] Portal '" + id + "' not found."); return done(); });
     }
@@ -339,7 +358,7 @@ public class PreloadCommand extends AbstractCommand {
                      : "nominal";
         }
 
-        reply(ctx, "[OptiPortal] Status — v1.1.6");
+        reply(ctx, "[OptiPortal] Status — v1.1.7");
         reply(ctx, String.format("  Circuit breaker : %s  (failures=%d)", cbStats.state, cbStats.failureCount));
         reply(ctx, String.format("  Load balancer   : active=%d queued=%d avgTime=%.0fms batchSize=%d",
                 lb.activeOperations, lb.queuedTasks, lb.averageExecutionTime, lb.currentBatchSize));

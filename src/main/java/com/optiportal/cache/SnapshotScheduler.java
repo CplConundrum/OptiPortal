@@ -34,7 +34,14 @@ public class SnapshotScheduler {
     }
 
     private void snapshot() {
-        // TODO: Serialize all HOT/WARM zone state to disk async
-        cacheManager.saveRegistry();
+        // A4: Make snapshot operation async to avoid blocking I/O
+        executor.execute(() -> {
+            try {
+                cacheManager.saveRegistry();
+            } catch (Exception e) {
+                java.util.logging.Logger.getLogger("OptiPortal").warning(
+                    "[OptiPortal] Snapshot failed: " + e.getMessage());
+            }
+        });
     }
 }

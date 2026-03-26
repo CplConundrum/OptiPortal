@@ -83,23 +83,32 @@ public class KeepaliveManager {
         if (config.isKeepaliveHot()) {
             int interval = config.getKeepaliveHotIntervalMinutes();
             hotTask = executor.scheduleWithFixedDelay(
-                    () -> pingTier(CacheTier.HOT, "HOT"),
+                    () -> safeping(CacheTier.HOT, "HOT"),
                     interval, interval, TimeUnit.MINUTES);
-            LOG.info("[OptiPortal] Keepalive HOT scheduled every " + interval + "m");
+            LOG.info(() -> String.format("[OptiPortal] Keepalive HOT scheduled every %dm", interval));
         }
         if (config.isKeepaliveWarm()) {
             int interval = config.getKeepaliveWarmIntervalMinutes();
             warmTask = executor.scheduleWithFixedDelay(
-                    () -> pingTier(CacheTier.WARM, "WARM"),
+                    () -> safeping(CacheTier.WARM, "WARM"),
                     interval, interval, TimeUnit.MINUTES);
-            LOG.info("[OptiPortal] Keepalive WARM scheduled every " + interval + "m");
+            LOG.info(() -> String.format("[OptiPortal] Keepalive WARM scheduled every %dm", interval));
         }
         if (config.isKeepaliveCold()) {
             int interval = config.getKeepaliveColdIntervalMinutes();
             coldTask = executor.scheduleWithFixedDelay(
-                    () -> pingTier(CacheTier.COLD, "COLD"),
+                    () -> safeping(CacheTier.COLD, "COLD"),
                     interval, interval, TimeUnit.MINUTES);
-            LOG.info("[OptiPortal] Keepalive COLD scheduled every " + interval + "m");
+            LOG.info(() -> String.format("[OptiPortal] Keepalive COLD scheduled every %dm", interval));
+        }
+    }
+
+    // Guard wrapper used by start() so any subclass override of pingTier() is also protected.
+    private void safeping(CacheTier tier, String label) {
+        try {
+            pingTier(tier, label);
+        } catch (Exception e) {
+            LOG.warning("[OptiPortal] Keepalive " + label + ": error (scheduler preserved): " + e.getMessage());
         }
     }
 
@@ -116,6 +125,14 @@ public class KeepaliveManager {
      * but don't tick, matching how they were originally loaded.
      */
     protected void pingTier(CacheTier tier, String label) {
+        try {
+            pingTierInternal(tier, label);
+        } catch (Exception e) {
+            LOG.warning("[OptiPortal] Keepalive " + label + ": error (scheduler preserved): " + e.getMessage());
+        }
+    }
+
+    private void pingTierInternal(CacheTier tier, String label) {
         List<PortalEntry> entries = storage.loadAll();
         int zoneCount = 0;
         int chunkCount = 0;
@@ -136,11 +153,35 @@ public class KeepaliveManager {
             chunkCount += (2 * radiusX + 1) * (2 * radiusZ + 1);
             zoneCount++;
 
-            // Fire and forget — we only care that the chunk future is requested,
-            // not when it completes. getNonTickingChunkAsync resets GC reachability.
+            // U2: Confirm chunk residency before pinging
+            // Check if chunks are actually loaded before attempting to ping them
+            boolean allChunksPresent = true;
             for (int dx = -radiusX; dx <= radiusX; dx++) {
                 for (int dz = -radiusZ; dz <= radiusZ; dz++) {
-                    world.getNonTickingChunkAsync(ChunkUtil.indexChunk(cx + dx, cz + dz));
+                    long chunkIndex = ChunkUtil.indexChunk(cx + dx, cz + dz);
+                    // Use getNonTickingChunkAsync to check residency - if it returns null, chunk is not loaded
+                    if (world.getNonTickingChunkAsync(chunkIndex) == null) {
+                        allChunksPresent = false;
+                        break;
+                    }
+                }
+                if (!allChunksPresent) break;
+            }
+
+            if (allChunksPresent) {
+                // Fire and forget — we only care that the chunk future is requested,
+                // not when it completes. getNonTickingChunkAsync resets GC reachability.
+                for (int dx = -radiusX; dx <= radiusX; dx++) {
+                    for (int dz = -radiusZ; dz <= radiusZ; dz++) {
+                        world.getNonTickingChunkAsync(ChunkUtil.indexChunk(cx + dx, cz + dz));
+                    }
+                }
+            } else {
+                // Chunks not present — demote from HOT tier
+                if (tier == CacheTier.HOT) {
+                    cacheManager.setZoneTier(entry.getId(), CacheTier.WARM);
+                    LOG.info("[OptiPortal] Keepalive HOT residency check failed for " + entry.getId()
+                            + " — demoted to WARM");
                 }
             }
         }

@@ -38,10 +38,6 @@ $C.@Container {
         Style: (FontSize: 16, RenderBold: true);
         Anchor: (Width: 80);
       }
-      Label #HdrRam {
-        Style: (FontSize: 16, RenderBold: true);
-        Anchor: (Width: 100);
-      }
       Label #HdrRamMarginal {
         Style: (FontSize: 16, RenderBold: true);
         Anchor: (Width: 130);
@@ -84,10 +80,6 @@ $C.@Container {
       Label #ColRadius {
         Style: (FontSize: 14);
         Anchor: (Width: 80);
-      }
-      Label #ColRam {
-        Style: (FontSize: 14);
-        Anchor: (Width: 100);
       }
       Label #ColRamMarginal {
         Style: (FontSize: 14);

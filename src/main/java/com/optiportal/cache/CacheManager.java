@@ -316,6 +316,14 @@ public class CacheManager {
      * Periodic decay: HOT → WARM after 30s, WARM → COLD after 30min.
      */
     private void decayTiers() {
+        try {
+            decayTiersInternal();
+        } catch (Exception e) {
+            LOG.warning("[OptiPortal] CacheManager: decayTiers error (scheduler preserved): " + e.getMessage());
+        }
+    }
+
+    private void decayTiersInternal() {
         long now = System.currentTimeMillis();
         if (now < earliestDecayMs.get()) {
             return; // Nothing due yet — skip the full map iteration
@@ -404,53 +412,86 @@ public class CacheManager {
     }
 
     /**
-     * Register a zone as an owner of a chunk.
-     * Called after a chunk future completes successfully.
+     * Register a zone as an owner of a chunk (dedup path — chunk already in ChunkStore).
+     * Per-zone pinning: also dispatches addKeepLoaded() to the world thread so that this
+     * zone holds an independent keepLoaded pin, not borrowed from the first-owner zone.
      */
     public void registerOwnership(String zoneId, String world, int cx, int cz) {
         if (zoneId == null) return;
         long key = packChunkIndex(cx, cz);
-        chunkOwnership.computeIfAbsent(world, w -> new ConcurrentHashMap<>())
+        boolean added = chunkOwnership.computeIfAbsent(world, w -> new ConcurrentHashMap<>())
                       .computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet())
                       .add(zoneId);
         recordReverseOwnership(zoneId, world, key);
+        if (added) {
+            addKeepLoadedAsync(world, cx, cz);
+        }
+    }
+
+    /**
+     * Fire-and-forget world-thread dispatch to increment keepLoaded on a chunk.
+     * Mirror of tryReleaseKeepLoaded — used by the dedup registerOwnership path
+     * to give each zone its own independent keepLoaded pin.
+     */
+    private void addKeepLoadedAsync(String worldName, int cx, int cz) {
+        com.hypixel.hytale.server.core.universe.world.World world = worldRegistry.getWorld(worldName);
+        if (world == null) return;
+        long engineIndex = ChunkUtil.indexChunk(cx, cz);
+        if (world.getChunkStore().getChunkReference(engineIndex) == null) return;
+        try {
+            world.execute(() -> {
+                com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk chunk =
+                        world.getChunkIfInMemory(engineIndex);
+                if (chunk != null) {
+                    chunk.addKeepLoaded();
+                    LOG.fine(() -> "[OptiPortal] addKeepLoaded (dedup): " + worldName + ":" + cx + ":" + cz);
+                }
+            });
+        } catch (Exception e) {
+            // SkipSentryException — world shutting down, engine is cleaning up chunks
+            LOG.fine(() -> "[OptiPortal] addKeepLoadedAsync skipped (world shutting down): "
+                    + worldName + ":" + cx + ":" + cz);
+        }
     }
 
     /**
      * Register ownership and pin the chunk in memory via addKeepLoaded().
      * Call this overload when you have the WorldChunk reference from the load future.
-     * The plain registerOwnership(zoneId, world, cx, cz) remains for callers that
-     * don't have the chunk reference (e.g. dedup path in ChunkPreloader).
+     *
+     * Per-zone pinning: each zone independently increments keepLoaded when it registers
+     * and decrements it when it deregisters. This ensures that shared chunks (owned by
+     * multiple zones) remain pinned as long as ANY owning zone is still HOT/WARM, and
+     * eliminates the double-decrement race that the old single-pin model was exposed to
+     * when two zones deregistered the same chunk concurrently.
+     *
+     * addKeepLoaded() is called if and only if this zoneId was NOT already in the owner
+     * set for this chunk — prevents double-increment if the same zone re-registers a chunk
+     * it already owns (e.g. a second predictiveLoad before the first decays).
      */
     public void registerOwnership(String zoneId, String world, int cx, int cz,
                                   com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk chunk) {
         if (zoneId == null) return;
         long key = packChunkIndex(cx, cz);
-        // Use compute() so the "is this the first owner?" check and add are atomic —
-        // prevents two concurrent callers from both observing isEmpty()=true and both
-        // calling addKeepLoaded(), which would over-count the keepLoaded ref.
-        boolean[] isFirst = {false};
-        chunkOwnership
+        // ConcurrentHashMap.newKeySet().add() is atomic; returns true only if the element
+        // was newly inserted. Two concurrent callers with the same zoneId will both see
+        // the same Set (computeIfAbsent returns the existing one), and exactly one of them
+        // will get added=true — preventing double-addKeepLoaded for the same zone.
+        boolean added = chunkOwnership
                 .computeIfAbsent(world, w -> new ConcurrentHashMap<>())
-                .compute(key, (k, existingSet) -> {
-                    if (existingSet == null) {
-                        existingSet = ConcurrentHashMap.newKeySet();
-                        isFirst[0] = true;
-                    }
-                    existingSet.add(zoneId);
-                    return existingSet;
-                });
+                .computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet())
+                .add(zoneId);
         recordReverseOwnership(zoneId, world, key);
-        // Only pin on first owner — prevents double-increment
-        if (isFirst[0] && chunk != null) {
+        if (added && chunk != null) {
             chunk.addKeepLoaded();
-            LOG.fine("[OptiPortal] addKeepLoaded: " + world + ":" + cx + ":" + cz);
+            LOG.fine(() -> "[OptiPortal] addKeepLoaded: " + world + ":" + cx + ":" + cz + " (zone: " + zoneId + ")");
         }
     }
 
     /**
      * Remove a zone's ownership of all its chunks by coord range.
-     * Chunks with no remaining owners are removed from the registry.
+     * Per-zone pinning: releases this zone's keepLoaded pin for every chunk it owned,
+     * regardless of whether other zones still own the chunk. The map entry for a chunk
+     * is only removed when the last owner deregisters.
      */
     public void deregisterOwnership(String zoneId, String world, int cx, int cz, int radius) {
         ConcurrentHashMap<Long, Set<String>> worldMap = chunkOwnership.get(world);
@@ -462,10 +503,13 @@ public class CacheManager {
                 long key = packChunkIndex(cx + dx, cz + dz);
                 Set<String> owners = worldMap.get(key);
                 if (owners != null) {
-                    owners.remove(zoneId);
+                    boolean removed = owners.remove(zoneId);
+                    if (removed) {
+                        // Release this zone's own pin unconditionally (per-zone pinning).
+                        tryReleaseKeepLoaded(world, cx + dx, cz + dz);
+                    }
                     if (owners.isEmpty()) {
                         worldMap.remove(key, owners);
-                        tryReleaseKeepLoaded(world, cx + dx, cz + dz);
                     }
                 }
                 if (zoneKeys != null) zoneKeys.remove(key);
@@ -476,11 +520,16 @@ public class CacheManager {
     /**
      * Remove a zone from all chunk ownership sets it appears in.
      * Used by tier decay when a zone goes COLD — O(chunks owned by zone) via reverse index.
+     *
+     * Per-zone pinning: tryReleaseKeepLoaded is called for every chunk this zone owned,
+     * not just those where it was the last owner. Each zone independently holds a keepLoaded
+     * pin, so each deregistration must release exactly that zone's pin regardless of other
+     * zones still owning the chunk.
      */
     public void deregisterAllChunks(String zoneId) {
         ConcurrentHashMap<String, Set<Long>> worldChunks = zoneToChunks.remove(zoneId);
         if (worldChunks == null) {
-            LOG.info("[OptiPortal] Deregistered ownership for zone: " + zoneId + " (no entries)");
+            LOG.info(() -> "[OptiPortal] Deregistered ownership for zone: " + zoneId + " (no entries)");
             return;
         }
         worldChunks.forEach((worldName, keys) -> {
@@ -489,10 +538,13 @@ public class CacheManager {
             for (Long key : keys) {
                 Set<String> owners = worldMap.get(key);
                 if (owners != null) {
-                    owners.remove(zoneId);
+                    boolean removed = owners.remove(zoneId);
+                    if (removed) {
+                        // Per-zone pinning: release this zone's own pin unconditionally.
+                        tryReleaseKeepLoaded(worldName, (int)(long) key, (int)(key >>> 32));
+                    }
                     if (owners.isEmpty()) {
                         worldMap.remove(key, owners);
-                        tryReleaseKeepLoaded(worldName, (int)(long) key, (int)(key >>> 32));
                     }
                 }
             }
@@ -629,20 +681,48 @@ public class CacheManager {
     }
 
     /**
-     * Call removeKeepLoaded() on the chunk at the given coords if it is still loaded.
-     * Safe to call from any thread — addKeepLoaded/removeKeepLoaded are AtomicInteger ops.
+     * Release the engine keep-loaded pin on a chunk when the last OptiPortal zone
+     * relinquishes ownership of it.
+     *
+     * Threading: safe to call from any thread. Uses two non-blocking steps:
+     *   1. getChunkReference() — StampedLock map lookup, thread-safe, no dispatch.
+     *   2. world.execute(Runnable) — enqueues a task on the world-thread task queue and
+     *      returns immediately (fire-and-forget). The task calls getChunkIfInMemory()
+     *      on the world thread (fast path — no re-dispatch) then decrements keepLoaded.
+     *
+     * Does NOT use getChunkIfInMemory() directly off-thread because that overload calls
+     * CompletableFuture.supplyAsync(..., world).join(), which blocks the calling thread
+     * for each chunk — catastrophic when releasing a large zone during tier decay.
      */
     private void tryReleaseKeepLoaded(String worldName, int cx, int cz) {
         com.hypixel.hytale.server.core.universe.world.World world = worldRegistry.getWorld(worldName);
         if (world == null) return; // world unloaded — engine already cleaned up chunks
-        // Use the engine's native index format, not CacheManager's pack format.
-        // Use getChunkIfInMemory so non-ticking (warm) chunks are also reached.
+
         long engineIndex = ChunkUtil.indexChunk(cx, cz);
-        com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk chunk =
-                world.getChunkIfInMemory(engineIndex);
-        if (chunk != null) {
-            chunk.removeKeepLoaded();
-            LOG.fine(() -> "[OptiPortal] removeKeepLoaded: " + worldName + ":" + cx + ":" + cz);
+
+        // Fast pre-check: if the reference is absent the chunk is already evicted.
+        // getChunkReference() is thread-safe (StampedLock) and avoids an unnecessary
+        // world.execute() enqueue when there is nothing to release.
+        if (world.getChunkStore().getChunkReference(engineIndex) == null) return;
+
+        // Fire-and-forget dispatch to world thread. world.execute() just enqueues to
+        // the world's task queue — it does not block the calling thread.
+        // Wrap in try-catch: world.execute() throws SkipSentryException (RuntimeException)
+        // when acceptingTasks == false (world shutting down). In that case the engine is
+        // already cleaning up chunks, so the release is a no-op.
+        try {
+            world.execute(() -> {
+                com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk chunk =
+                        world.getChunkIfInMemory(engineIndex); // fast path — we are on world thread
+                if (chunk != null) {
+                    chunk.removeKeepLoaded();
+                    LOG.fine(() -> "[OptiPortal] removeKeepLoaded: " + worldName + ":" + cx + ":" + cz);
+                }
+            });
+        } catch (Exception e) {
+            // SkipSentryException — world is shutting down, chunks are being cleaned up by engine
+            LOG.fine(() -> "[OptiPortal] tryReleaseKeepLoaded skipped (world shutting down): "
+                    + worldName + ":" + cx + ":" + cz);
         }
     }
 

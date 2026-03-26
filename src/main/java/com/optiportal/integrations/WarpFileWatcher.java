@@ -147,7 +147,13 @@ public class WarpFileWatcher {
 
     private void checkAndSync() {
         // Try native TeleportPlugin map first — more accurate and zero file I/O
-        int nativeSynced = syncNativeWarps();
+        int nativeSynced;
+        try {
+            nativeSynced = syncNativeWarps();
+        } catch (Exception e) {
+            LOG.warning("[OptiPortal] WarpFileWatcher: native sync error (scheduler preserved): " + e.getMessage());
+            return;
+        }
         if (nativeSynced >= 0) {
             // Native path succeeded — skip file-based sync
             return;

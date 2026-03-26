@@ -56,7 +56,6 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.D
         PluginConfig      cfg   = plugin.getPluginConfig();
         int hot = 0, warm = 0, cold = 0, unvisited = 0;
         double totalRam = 0;
-        double totalActualRam = 0;
 
         // Set column headers
         cmd.set("#HdrTier.Text",   "TIER");
@@ -64,8 +63,7 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.D
         cmd.set("#HdrType.Text",   "TYPE");
         cmd.set("#HdrStrat.Text",  "STRAT");
         cmd.set("#HdrRadius.Text", "RADIUS");
-        cmd.set("#HdrRam.Text",    "EST RAM");
-        cmd.set("#HdrRamMarginal.Text", "ACTUAL RAM");
+        cmd.set("#HdrRamMarginal.Text", "RAM");
         cmd.set("#HdrPreload.Text", "PRELOAD");
         cmd.set("#HdrTTL.Text",    "TTL");
         cmd.set("#HdrStatus.Text", "STATUS");
@@ -76,7 +74,6 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.D
         StringBuilder colType   = new StringBuilder();
         StringBuilder colStrat  = new StringBuilder();
         StringBuilder colRadius = new StringBuilder();
-        StringBuilder colRam    = new StringBuilder();
         StringBuilder colRamMarginal = new StringBuilder();
         StringBuilder colPreload = new StringBuilder();
         StringBuilder colTTL    = new StringBuilder();
@@ -95,8 +92,7 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.D
                 case UNVISITED -> unvisited++;
                 default        -> {}
             }
-            totalRam += z.getRamEstimatedMB();
-            totalActualRam += z.getRamMarginalMB();
+            totalRam += z.getRamMarginalMB();
 
             String tierLabel = switch (tier) {
                 case HOT        -> "[HOT]";
@@ -143,8 +139,6 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.D
             colType.append(typeLabel).append("\n");
             colStrat.append(stratLabel).append("\n");
             colRadius.append("r=").append(radius).append("\n");
-            colRam.append(z.getRamEstimatedMB() > 0
-                    ? String.format("%.2f MB", z.getRamEstimatedMB()) : "--").append("\n");
             colRamMarginal.append(ramMarginal).append("\n");
             colPreload.append(preload).append("\n");
             colTTL.append(ttl).append("\n");
@@ -160,7 +154,6 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.D
         cmd.set("#ColType.Text",   colType.toString().trim());
         cmd.set("#ColStrat.Text",  colStrat.toString().trim());
         cmd.set("#ColRadius.Text", colRadius.toString().trim());
-        cmd.set("#ColRam.Text",    colRam.toString().trim());
         cmd.set("#ColRamMarginal.Text", colRamMarginal.toString().trim());
         cmd.set("#ColPreload.Text", colPreload.toString().trim());
         cmd.set("#ColTTL.Text",    colTTL.toString().trim());
@@ -177,8 +170,8 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.D
                 "/preload migrate <backend>   /preload backup <list|restore <date>>   /preload help");
 
         cmd.set("#WarpStats.Text", String.format(
-                "HOT %d   WARM %d   COLD %d   Unvisited %d   |   RAM Est %.1f MB   Actual %.1f MB   Shared %d chunks",
-                hot, warm, cold, unvisited, totalRam, totalActualRam, cache.getTotalSharedChunks()));
+                "HOT %d   WARM %d   COLD %d   Unvisited %d   |   RAM %.1f MB   Shared %d chunks",
+                hot, warm, cold, unvisited, totalRam, cache.getTotalSharedChunks()));
         cmd.set("#StorageBackend.Text", "Storage: " + cfg.getBackend().toUpperCase());
     }
 

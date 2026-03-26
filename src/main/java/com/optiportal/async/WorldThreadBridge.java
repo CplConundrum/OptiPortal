@@ -99,26 +99,39 @@ public class WorldThreadBridge {
         }
         
         long startTime = System.currentTimeMillis();
-        
-        // Schedule on world thread with timeout protection
-        world.execute(() -> {
-            try {
-                T result = operation.get();
-                long duration = System.currentTimeMillis() - startTime;
-         
-                circuitBreaker.recordSuccess();
-                metrics.recordWorldThreadExecution("executeOnWorldThread", duration);
-                future.complete(result);
-         
-            } catch (Exception e) {
-                long duration = System.currentTimeMillis() - startTime;
-         
-                circuitBreaker.recordFailure();
-                metrics.recordWorldThreadError("executeOnWorldThread", duration);
-                errorHandler.handleWorldThreadError(e, "executeOnWorldThread");
-                future.completeExceptionally(e);
-            }
-        });
+
+        // E1: world.execute() itself throws SkipSentryException (extends RuntimeException)
+        // synchronously when World.acceptingTasks == false (world shutting down).
+        // That throw happens before the lambda runs, so the try-catch INSIDE the lambda
+        // cannot catch it. Wrap the world.execute() call in its own try-catch so the
+        // circuit breaker records the failure and the future is completed immediately
+        // rather than hanging for the 5-second orTimeout.
+        try {
+            world.execute(() -> {
+                try {
+                    T result = operation.get();
+                    long duration = System.currentTimeMillis() - startTime;
+
+                    circuitBreaker.recordSuccess();
+                    metrics.recordWorldThreadExecution("executeOnWorldThread", duration);
+                    future.complete(result);
+
+                } catch (Exception e) {
+                    long duration = System.currentTimeMillis() - startTime;
+
+                    circuitBreaker.recordFailure();
+                    metrics.recordWorldThreadError("executeOnWorldThread", duration);
+                    errorHandler.handleWorldThreadError(e, "executeOnWorldThread");
+                    future.completeExceptionally(e);
+                }
+            });
+        } catch (Exception e) {
+            // world.execute() rejected the task — world is shutting down.
+            long duration = System.currentTimeMillis() - startTime;
+            circuitBreaker.recordFailure();
+            metrics.recordWorldThreadError("executeOnWorldThread", duration);
+            future.completeExceptionally(e);
+        }
         
         // Add timeout protection
         future.orTimeout(5, TimeUnit.SECONDS);
@@ -340,7 +353,8 @@ public class WorldThreadBridge {
             return;
         }
         
-        List<Runnable> batch = new ArrayList<>();
+        // A5: Use ArrayDeque instead of ArrayList to avoid allocation overhead
+        java.util.ArrayDeque<Runnable> batch = new java.util.ArrayDeque<>();
         for (int i = 0; i < BATCH_SIZE && !queue.isEmpty(); i++) {
             Runnable operation = queue.poll();
             if (operation != null) {
@@ -352,16 +366,26 @@ public class WorldThreadBridge {
             return;
         }
         
-        // Execute batch on world thread
-        world.execute(() -> {
-            for (Runnable operation : batch) {
-                try {
-                    operation.run();
-                } catch (Exception e) {
-                    errorHandler.handleWorldThreadError(e, "batchedOperation");
+        // Execute batch on world thread.
+        // world.execute() throws SkipSentryException (RuntimeException) if the world is
+        // shutting down. Catch it here so the scheduleAtFixedRate task does NOT propagate
+        // the exception — scheduleAtFixedRate silently cancels itself on any uncaught
+        // exception, which would permanently kill the batch processor for all worlds.
+        try {
+            world.execute(() -> {
+                for (Runnable operation : batch) {
+                    try {
+                        operation.run();
+                    } catch (Exception e) {
+                        errorHandler.handleWorldThreadError(e, "batchedOperation");
+                    }
                 }
-            }
-        });
+            });
+        } catch (Exception e) {
+            LOG.fine(() -> "[OptiPortal] processBatch: world.execute() rejected for '"
+                    + world.getName() + "' (shutting down) — discarding " + batch.size() + " ops");
+            operationQueues.remove(world, queue);
+        }
     }
     
     /**

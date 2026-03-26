@@ -38,10 +38,12 @@ public class AsyncLoadBalancer {
     private final AtomicInteger currentBatchSize = new AtomicInteger(DEFAULT_BATCH_SIZE);
     private final AtomicInteger totalQueuedCount = new AtomicInteger(0);
     
-    // EMA for execution time — α=0.1 gives ~95% weight to last 29 samples
+    // A2: Lock-free EMA stored as raw bits in an AtomicLong.
+    // Avoids DoubleAdder+AtomicInteger pair whose integer counter would overflow
+    // after ~2 billion operations on a long-running server.
+    // CAS loop converges quickly under contention; α=0.1 weights recent samples.
+    private final AtomicLong emaBits = new AtomicLong(Double.doubleToLongBits(0.0));
     private static final double EMA_ALPHA = 0.1;
-    private volatile double emaExecutionTimeMs = 0.0;
-    private final Object emaLock = new Object();
     
     // Priority queues
     private final ConcurrentHashMap<AsyncMetrics.AsyncTaskPriority, ConcurrentLinkedDeque<Supplier<CompletableFuture<Void>>>> pendingTasks =
@@ -259,10 +261,15 @@ public class AsyncLoadBalancer {
             activeOperations.decrementAndGet();
             totalExecutionTime.addAndGet(duration);  // keep for LoadStats.totalOperations context
 
-            // Update EMA — synchronized to prevent non-atomic read-modify-write races
-            synchronized (emaLock) {
-                emaExecutionTimeMs = EMA_ALPHA * duration + (1.0 - EMA_ALPHA) * emaExecutionTimeMs;
-            }
+            // A2: Update EMA using lock-free CAS loop on emaBits.
+            // α=0.1: new = 0.1*sample + 0.9*previous. Seed from 0 on first sample.
+            long prevBits, nextBits;
+            do {
+                prevBits = emaBits.get();
+                double prev = Double.longBitsToDouble(prevBits);
+                double next = (prev == 0.0) ? duration : EMA_ALPHA * duration + (1.0 - EMA_ALPHA) * prev;
+                nextBits = Double.doubleToLongBits(next);
+            } while (!emaBits.compareAndSet(prevBits, nextBits));
 
             if (metrics != null) {
                 metrics.recordAsyncTaskComplete(priority, duration);
@@ -355,27 +362,21 @@ public class AsyncLoadBalancer {
     }
     
     /**
-     * Get average execution time using EMA.
-     * 
-     * @return EMA of execution time in milliseconds
+     * Get average execution time as a lock-free EMA (α=0.1).
+     * Returns 0.0 until the first sample is recorded.
      */
     private double getAverageExecutionTime() {
-        synchronized (emaLock) {
-            return emaExecutionTimeMs;
-        }
+        return Double.longBitsToDouble(emaBits.get());
     }
     
     /**
      * Get total queued task count.
-     * 
+     * A1: Now O(1) using counter instead of O(n) iteration
+     *
      * @return Total number of queued tasks
      */
     private int getQueuedTaskCount() {
-        int total = 0;
-        for (ConcurrentLinkedDeque<Supplier<CompletableFuture<Void>>> queue : pendingTasks.values()) {
-            total += queue.size(); // ConcurrentLinkedDeque.size() is O(n), but called rarely
-        }
-        return total;
+        return totalQueuedCount.get();
     }
     
     /**

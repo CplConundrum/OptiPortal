@@ -10,11 +10,16 @@ import com.hypixel.hytale.server.core.universe.world.World;
 import com.optiportal.preload.WorldRegistry;
 
 /**
- * Monitors server TPS by sampling World.getTick() at a fixed interval.
+ * Observes server TPS by sampling World.getTick() at a fixed interval.
  *
- * World.getTick() returns a monotonically increasing long that increments
- * each server tick. At 20 TPS nominal, it increases by 20 per second.
- * By sampling twice and dividing delta-ticks / delta-seconds we get TPS.
+ * This monitor is READ-ONLY — it never controls or limits the server tick rate.
+ * The server's actual TPS is determined entirely by the Hytale engine and can
+ * exceed HYTALE_TARGET_TPS (e.g. during catch-up bursts). OptiPortal uses the
+ * observed TPS only to throttle its own chunk-preload backpressure; it does not
+ * cap, slow, or otherwise influence the engine's tick rate.
+ *
+ * World.getTick() returns a monotonically increasing long that increments each
+ * server tick. Dividing delta-ticks / delta-seconds gives the observed TPS.
  *
  * If multiple worlds are loaded, we use the MINIMUM TPS across all ticking
  * worlds (most conservative for backpressure decisions).
@@ -26,8 +31,18 @@ public class WorldTpsMonitor {
 
     private static final Logger LOG = Logger.getLogger("OptiPortal");
 
-    /** Nominal tick rate for Hytale. */
-    public static final double NOMINAL_TPS = 20.0;
+    /**
+     * Hytale's standard target tick rate. Used as a reference for load-factor
+     * calculations and backpressure thresholds only — OptiPortal does not
+     * enforce or limit the server to this value.
+     */
+    public static final double HYTALE_TARGET_TPS = 20.0;
+
+    /**
+     * @deprecated Use {@link #HYTALE_TARGET_TPS}. Kept for binary compatibility.
+     */
+    @Deprecated
+    public static final double NOMINAL_TPS = HYTALE_TARGET_TPS;
 
     /** TPS below this triggers minimum batch size. */
     public static final double TPS_LOW_THRESHOLD = 18.0;
@@ -35,8 +50,23 @@ public class WorldTpsMonitor {
     /** TPS below this triggers queue-all mode. */
     public static final double TPS_CRITICAL_THRESHOLD = 12.0;
 
-    /** Sample interval in seconds. */
-    private static final int SAMPLE_INTERVAL_SECONDS = 2;
+    /** Sample interval in seconds. Shorter interval + EMA smoothing gives faster response
+     *  with less noise than a longer raw window. */
+    private static final int SAMPLE_INTERVAL_SECONDS = 1;
+
+    /**
+     * EMA smoothing factor. Higher = reacts faster but noisier; lower = smoother but slower.
+     * At alpha=0.25 with 1s samples, a sustained drop to 15 TPS registers at ~95% after
+     * ~4 samples (~4 seconds) — fast enough for backpressure, slow enough to ignore blips.
+     */
+    private static final double EMA_ALPHA = 0.25;
+
+    /**
+     * Maximum fraction by which the elapsed window may deviate from the expected interval
+     * before the sample is discarded. Scheduler jitter (e.g. GC pause during the window)
+     * distorts deltaTicks/elapsedSeconds — skip those windows rather than publish bad data.
+     */
+    private static final double MAX_JITTER_FRACTION = 0.30;
 
     private final WorldRegistry worldRegistry;
     private final ScheduledExecutorService executor;
@@ -45,7 +75,7 @@ public class WorldTpsMonitor {
     private final java.util.concurrent.ConcurrentHashMap<String, AtomicLong> lastTickCounts =
             new java.util.concurrent.ConcurrentHashMap<>();
     private final AtomicLong lastSampleNanos = new AtomicLong(0);
-    private volatile double currentTps = NOMINAL_TPS;
+    private volatile double currentTps = HYTALE_TARGET_TPS;
 
     public WorldTpsMonitor(WorldRegistry worldRegistry, ScheduledExecutorService executor) {
         this.worldRegistry = worldRegistry;
@@ -101,6 +131,17 @@ public class WorldTpsMonitor {
 
         if (elapsedSeconds <= 0.0) return; // Guard against clock anomaly
 
+        // Jitter guard: if the scheduler fired significantly late or early (e.g. GC pause
+        // spanning most of the window), the deltaTicks/elapsedSeconds ratio is misleading.
+        // Skip the sample and keep the last EMA value rather than publishing bad data.
+        double expected = SAMPLE_INTERVAL_SECONDS;
+        if (elapsedSeconds < expected * (1.0 - MAX_JITTER_FRACTION)
+                || elapsedSeconds > expected * (1.0 + MAX_JITTER_FRACTION)) {
+            LOG.fine("[OptiPortal] WorldTpsMonitor: skipping jittered sample (elapsed="
+                    + String.format("%.3f", elapsedSeconds) + "s, expected=" + expected + "s)");
+            return;
+        }
+
         Collection<World> worlds = worldRegistry.getWorlds();
         if (worlds.isEmpty()) {
             // No worlds loaded yet — keep currentTps at nominal
@@ -128,8 +169,9 @@ public class WorldTpsMonitor {
                 }
 
                 double worldTps = deltaTicks / elapsedSeconds;
-                // Clamp to [0, NOMINAL_TPS] — avoid spurious high readings on world load
-                worldTps = Math.min(worldTps, NOMINAL_TPS);
+                // Clamp to [0, 1.5×NOMINAL] — cap clearly-bogus spikes (e.g. tick counter
+                // reset on world load) while allowing legitimate above-20 readings.
+                worldTps = Math.min(worldTps, HYTALE_TARGET_TPS * 1.5);
                 worldTps = Math.max(worldTps, 0.0);
 
                 minTps = Math.min(minTps, worldTps);
@@ -141,7 +183,10 @@ public class WorldTpsMonitor {
         }
 
         if (sampledCount > 0) {
-            currentTps = minTps;
+            // EMA smoothing: blend the new raw reading with the running average.
+            // thenRun/thenRunAsync callbacks won't fire on failed futures so transient
+            // scheduler jitter doesn't cause false backpressure decisions.
+            currentTps = EMA_ALPHA * minTps + (1.0 - EMA_ALPHA) * currentTps;
             if (minTps < TPS_LOW_THRESHOLD) {
                 LOG.fine("[OptiPortal] WorldTpsMonitor: TPS=" + String.format("%.1f", minTps)
                         + " (below low threshold " + TPS_LOW_THRESHOLD + ")");
@@ -154,7 +199,7 @@ public class WorldTpsMonitor {
      * Get current TPS (minimum across all sampled worlds).
      * Thread-safe volatile read.
      *
-     * @return current TPS, clamped to [0.0, 20.0]
+     * @return current TPS, clamped to [0.0, 30.0]
      */
     public double getCurrentTps() {
         return currentTps;
@@ -170,14 +215,16 @@ public class WorldTpsMonitor {
     }
 
     /**
-     * Returns a load factor between 0.0 (no load) and 1.0 (completely lagged).
-     * Formula: max(0, (20.0 - tps) / 20.0)
-     * At 20 TPS → 0.0; at 10 TPS → 0.5; at 0 TPS → 1.0.
+     * Returns a load factor between 0.0 (at or above target) and 1.0 (completely lagged).
+     * Formula: max(0, (targetTps - tps) / targetTps)
+     * At target TPS (20) or above → 0.0; at 10 TPS → 0.5; at 0 TPS → 1.0.
+     * Returns 0.0 for servers running above 20 TPS — OptiPortal interprets any
+     * reading at or above the target as "no load", not as a speed cap.
      *
      * @return load factor in [0.0, 1.0]
      */
     public double getLoadFactor() {
-        return Math.max(0.0, (NOMINAL_TPS - currentTps) / NOMINAL_TPS);
+        return Math.max(0.0, (HYTALE_TARGET_TPS - currentTps) / HYTALE_TARGET_TPS);
     }
 
     /**

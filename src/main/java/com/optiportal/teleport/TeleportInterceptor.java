@@ -257,9 +257,17 @@ public class TeleportInterceptor {
             } else if (!entry.isInstanced() && entry.getStrategy() == WarmStrategy.WARM) {
                 com.optiportal.model.CacheTier current = plugin.getCacheManager().getZoneTier(normalizedZone);
                 if (current != com.optiportal.model.CacheTier.HOT) {
-                    plugin.getCacheManager().setZoneTier(normalizedZone, com.optiportal.model.CacheTier.HOT);
-                    LOG.fine(() -> "[OptiPortal] Zone discovery HOT: " + normalizedZone
-                            + " (was " + current + ")");
+                    if (plugin.getCacheManager().getOwnedChunkCount(normalizedZone) > 0) {
+                        plugin.getCacheManager().setZoneTier(normalizedZone, com.optiportal.model.CacheTier.HOT);
+                        LOG.fine(() -> "[OptiPortal] Zone discovery HOT: " + normalizedZone
+                                + " (was " + current + ")");
+                    } else {
+                        // Zone has no owned/pinned chunks — load failed or not yet completed.
+                        // Re-trigger warm load; setZoneTier(HOT) will be called on completion.
+                        LOG.fine(() -> "[OptiPortal] Zone discovery: WARM zone '" + normalizedZone
+                                + "' has no owned chunks — re-triggering warm load");
+                        warmZoneManager.loadWarmZone(entry);
+                    }
                 }
                 matched = true;
             }
@@ -285,9 +293,15 @@ public class TeleportInterceptor {
                 } else if (!entry.isInstanced() && entry.getStrategy() == WarmStrategy.WARM) {
                     com.optiportal.model.CacheTier current = plugin.getCacheManager().getZoneTier(zoneName);
                     if (current != com.optiportal.model.CacheTier.HOT) {
-                        plugin.getCacheManager().setZoneTier(zoneName, com.optiportal.model.CacheTier.HOT);
-                        LOG.fine(() -> "[OptiPortal] Zone discovery HOT (raw): " + zoneName
-                                + " (was " + current + ")");
+                        if (plugin.getCacheManager().getOwnedChunkCount(zoneName) > 0) {
+                            plugin.getCacheManager().setZoneTier(zoneName, com.optiportal.model.CacheTier.HOT);
+                            LOG.fine(() -> "[OptiPortal] Zone discovery HOT (raw): " + zoneName
+                                    + " (was " + current + ")");
+                        } else {
+                            LOG.fine(() -> "[OptiPortal] Zone discovery (raw): WARM zone '" + zoneName
+                                    + "' has no owned chunks — re-triggering warm load");
+                            warmZoneManager.loadWarmZone(entry);
+                        }
                     }
                     matched = true;
                 }
@@ -397,8 +411,8 @@ public class TeleportInterceptor {
                                         for (PortalEntry pe : getAllPortalEntries()) {
                                             if (pe.isInstanced() || pe.getId().contains(":")) continue;
                                             if (!pe.getWorld().equals(jWorld)) continue;
-                                            double d = Math.sqrt(Math.pow(pe.getX() - dstX, 2)
-                                                               + Math.pow(pe.getZ() - dstZ, 2));
+                                            // D2: Use Math.hypot instead of Math.sqrt for better performance
+                                            double d = Math.hypot(pe.getX() - dstX, pe.getZ() - dstZ);
                                             if (d < bestD) { bestD = d; best = pe; }
                                         }
                                         if (best != null) {
@@ -423,7 +437,7 @@ public class TeleportInterceptor {
                             executor.execute(() -> checkProximityAndPreload(fUuid2, curWorld, cx, cy, cz));
                         }
                     } catch (Exception e) {
-                        LOG.warning("[OptiPortal] poll error: " + e);
+                        LOG.warning(() -> "[OptiPortal] poll error: " + e);
                     }
                 });
             } catch (Exception e) {
@@ -490,7 +504,8 @@ public class TeleportInterceptor {
             double dy = Math.abs(py - entry.getY());
             double toX = entry.getX() - px;
             double toZ = entry.getZ() - pz;
-            double horizDist = Math.sqrt(toX * toX + toZ * toZ);
+            // D2: Use Math.hypot instead of Math.sqrt for better performance
+            double horizDist = Math.hypot(toX, toZ);
             if (dy > vertBound) continue;
             if (horizDist > maxDist) continue;
 
@@ -504,10 +519,17 @@ public class TeleportInterceptor {
                 com.optiportal.cache.CacheManager cm = plugin.getCacheManager();
                 com.optiportal.model.CacheTier current = cm.getZoneTier(id);
                 if (current != com.optiportal.model.CacheTier.HOT) {
-                    cm.setZoneTier(id, com.optiportal.model.CacheTier.HOT);
-                    LOG.fine("[OptiPortal] Proximity HOT: " + id
-                        + " dist=" + String.format("%.1f", horizDist)
-                        + " (was " + current + ")");
+                    if (cm.getOwnedChunkCount(id) > 0) {
+                        cm.setZoneTier(id, com.optiportal.model.CacheTier.HOT);
+                        LOG.fine(() -> "[OptiPortal] Proximity HOT: " + id
+                            + " dist=" + String.format("%.1f", horizDist)
+                            + " (was " + current + ")");
+                    } else {
+                        // Zone not yet loaded — re-trigger; HOT will be set on load completion
+                        LOG.fine(() -> "[OptiPortal] Proximity: WARM zone '" + id
+                            + "' has no owned chunks — re-triggering warm load");
+                        warmZoneManager.loadWarmZone(entry);
+                    }
                 }
             } else {
                 // PREDICTIVE: cooldown guards chunk load
@@ -517,7 +539,7 @@ public class TeleportInterceptor {
                         .resolveWorld(entry.getDestinationWorldUuid(), worldName);
                 if (!com.optiportal.preload.WarmZoneManager.isPortalWorldUsable(destWorld)) continue;
                 recordCooldown(null, id);
-                LOG.fine("[OptiPortal] Proximity PREDICTIVE: " + id
+                LOG.fine(() -> "[OptiPortal] Proximity PREDICTIVE: " + id
                     + " dist=" + String.format("%.1f", horizDist) + " → load cx=" + cx + " cz=" + cz);
                 predictiveLoadWithRam(id, worldName, cx, cz, radius);
             }
@@ -533,7 +555,7 @@ public class TeleportInterceptor {
                         int lcx = ChunkPreloader.toChunkCoord(linked.getX());
                         int lcz = ChunkPreloader.toChunkCoord(linked.getZ());
                         int lradius = resolveRadius(linked);
-                        LOG.fine("[OptiPortal] Linked preload: " + linkedId
+                        LOG.fine(() -> "[OptiPortal] Linked preload: " + linkedId
                             + " (linked to " + id + ") cx=" + lcx + " cz=" + lcz);
                         predictiveLoadWithRam(linkedId, linked.getWorld(), lcx, lcz, lradius);
                     });
@@ -553,6 +575,12 @@ public class TeleportInterceptor {
      * that's the destination warp. Then preloads it so the return trip is hot.
      */
     protected void reversePreloadOrigin(UUID playerUuid, String originId, String sourceWorld, String destWorld, double dx, double dy, double dz, double[] srcPos) {
+        // D1: Guard against race condition where srcPos is null or position not yet captured
+        if (srcPos == null) {
+            LOG.fine(() -> "[OptiPortal] Reverse preload skipped: no source position available for " + playerUuid);
+            return;
+        }
+
         PortalEntry destEntry = null;
         double bestDist = Double.MAX_VALUE;
 
@@ -560,7 +588,8 @@ public class TeleportInterceptor {
             if (entry.isInstanced()) continue;
             if (!entry.getWorld().equals(destWorld)) continue;
             if (entry.getId().contains(":")) continue;
-            double dist = Math.sqrt(Math.pow(entry.getX() - dx, 2) + Math.pow(entry.getZ() - dz, 2));
+            // D2: Use Math.hypot instead of Math.sqrt for better performance
+            double dist = Math.hypot(entry.getX() - dx, entry.getZ() - dz);
 
             // Exact match (within 1 block) — teleporter lands the player precisely on the warp coords
             if (dist <= 1.0) {
@@ -580,9 +609,7 @@ public class TeleportInterceptor {
         // Learn portal hotspot so future approaches pre-warm this destination.
         // srcPos is captured at the call site before the world thread advances lastKnownPosition
         // to the destination — reading lastKnownPosition here would give the wrong position.
-        if (srcPos != null) {
-            learnPortalHotspot(sourceWorld, srcPos[0], srcPos[2], destEntry.getId());
-        }
+        learnPortalHotspot(sourceWorld, srcPos[0], srcPos[2], destEntry.getId());
 
         // Record the learned link if origin is known and both IDs are plain portal names
         if (originId != null && !originId.equals(destEntry.getId())
@@ -615,7 +642,8 @@ public class TeleportInterceptor {
             if (entry.isInstanced()) continue;
             if (!entry.getWorld().equals(worldName)) continue;
             if (entry.getId().contains(":")) continue;
-            double dist = Math.sqrt(Math.pow(entry.getX() - px, 2) + Math.pow(entry.getZ() - pz, 2));
+            // D2: Use Math.hypot instead of Math.sqrt for better performance
+            double dist = Math.hypot(entry.getX() - px, entry.getZ() - pz);
             if (dist <= bestDist) {
                 bestDist = dist;
                 best = entry.getId();
@@ -627,13 +655,18 @@ public class TeleportInterceptor {
     protected void lingerOriginZone(UUID playerUuid) {
         double[] prePos = lastKnownPosition.get(playerUuid);
         if (prePos == null) return;
-        // Find nearest portal to pre-teleport position across all worlds
+        // D3: Only consider portals in the same world as the pre-teleport position
+        String worldName = getWorldNameFromPosition(prePos);
+        if (worldName == null) return;
+        
         String prevZoneId = null;
         double bestDist = Double.MAX_VALUE;
         for (PortalEntry entry : getAllPortalEntries()) {
             if (entry.isInstanced()) continue;
             if (entry.getId().contains(":")) continue;
-            double dist = Math.sqrt(Math.pow(entry.getX() - prePos[0], 2) + Math.pow(entry.getZ() - prePos[2], 2));
+            if (!entry.getWorld().equals(worldName)) continue; // Only consider portals in the same world
+            // D2: Use Math.hypot instead of Math.sqrt for better performance
+            double dist = Math.hypot(entry.getX() - prePos[0], entry.getZ() - prePos[2]);
             if (dist < bestDist) {
                 bestDist = dist;
                 prevZoneId = entry.getId();
@@ -641,9 +674,28 @@ public class TeleportInterceptor {
         }
         if (prevZoneId == null || bestDist > config.getActivationDistance()) return;
         final String lingerZoneId = prevZoneId;
-        plugin.getCacheManager().setZoneTier(lingerZoneId, com.optiportal.model.CacheTier.HOT);
-        LOG.fine(() -> "[OptiPortal] Linger HOT: " + lingerZoneId + " (30s decay will clean up)");
+        // Guard: only linger-HOT if the zone's chunks are actually owned/pinned in memory.
+        // If owned chunk count is 0, the zone was never loaded — setting HOT would be a false
+        // promotion with no keepLoaded backing it.
+        if (plugin.getCacheManager().getOwnedChunkCount(lingerZoneId) > 0) {
+            plugin.getCacheManager().setZoneTier(lingerZoneId, com.optiportal.model.CacheTier.HOT);
+            LOG.fine(() -> "[OptiPortal] Linger HOT: " + lingerZoneId + " (30s decay will clean up)");
+        }
     }
+
+   /** Helper method to get world name from position data */
+   private String getWorldNameFromPosition(double[] position) {
+       // position format: [x, z, worldMsb, worldLsb]
+       if (position.length < 4) return null;
+       long worldMsb = (long) position[2];
+       long worldLsb = (long) position[3];
+       return java.util.UUID.nameUUIDFromBytes(new byte[] {
+           (byte) (worldMsb >>> 56), (byte) (worldMsb >>> 48), (byte) (worldMsb >>> 40), (byte) (worldMsb >>> 32),
+           (byte) (worldMsb >>> 24), (byte) (worldMsb >>> 16), (byte) (worldMsb >>> 8), (byte) worldMsb,
+           (byte) (worldLsb >>> 56), (byte) (worldLsb >>> 48), (byte) (worldLsb >>> 40), (byte) (worldLsb >>> 32),
+           (byte) (worldLsb >>> 24), (byte) (worldLsb >>> 16), (byte) (worldLsb >>> 8), (byte) worldLsb
+       }).toString();
+   }
 
     /**
      * Player client is fully ready (spawned, UI loaded).
@@ -932,23 +984,28 @@ public class TeleportInterceptor {
     protected void predictiveLoadWithRam(String zoneId, String worldName, int cx, int cz, int radius) {
         int chunkCount = (2 * radius + 1) * (2 * radius + 1);
 
-        // Use configurable bytesPerChunk instead of hardcoded 65536.
-        // Keep the 1.5x overhead multiplier for entity/metadata overhead estimate.
-        // config.getBytesPerChunk() default = 262144 (256 KB).
-        double estimatedMB = (chunkCount * (double) config.getBytesPerChunk() * 1.5)
+        // bytesPerChunk already includes the 1.5x overhead factor — do not multiply again.
+        double estimatedMB = (chunkCount * (double) config.getBytesPerChunk())
                              / (1024.0 * 1024.0);
 
         chunkPreloader.predictiveLoad(zoneId, worldName, cx, cz, radius)
-                .thenRun(() -> {
+                // D4: thenRunAsync dispatches storage I/O to the plugin executor instead of
+                //     running on whichever thread completed the chunk future (may be world thread).
+                .thenRunAsync(() -> {
                     var opt = storage.loadById(zoneId);
                     if (opt.isPresent()) {
                         com.optiportal.model.PortalEntry e = opt.get();
                         e.setRamEstimatedMB(estimatedMB);
                         e.setLastActive(java.time.Instant.now());
-                        // updateEntryStats sets ramMarginalMB from config.getBytesPerChunk() too
-                        chunkPreloader.updateEntryStats(e, chunkCount);
                         storage.save(e);
                     }
+                }, executor)
+                .exceptionally(ex -> {
+                    if (!(ex instanceof com.optiportal.preload.ChunkLoadAbortedException)
+                            && !(ex.getCause() instanceof com.optiportal.preload.ChunkLoadAbortedException)) {
+                        LOG.warning("[OptiPortal] predictiveLoadWithRam error for " + zoneId + ": " + ex.getMessage());
+                    }
+                    return null;
                 });
     }
 

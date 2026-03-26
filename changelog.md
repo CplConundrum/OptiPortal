@@ -2,6 +2,48 @@
 
 ---
 
+## [1.1.7] - 2026-03-24
+
+### Fixed
+
+- **BUG FIX — Multiple players approaching the same portal simultaneously each triggered a full independent load**: When several players walked toward the same portal at the same time, each one triggered a separate chunk load for the destination zone, queuing duplicate sets of world-thread tasks that scaled with the number of concurrent players. At most one load now runs per zone at a time. Additional callers that arrive while a load is already in progress attach to the existing result and no extra work is queued.
+
+- **BUG FIX — Load balancer batch size could lock at maximum permanently after long uptime**: The average execution time used by the batch size controller was calculated from an unbounded sum and counter. After approximately 2 billion operations the counter would overflow and the calculated average would read as a large negative number. The controller would interpret this as excellent performance and permanently lock the batch size at its maximum regardless of actual server load. The measurement now uses a decaying average that gives more weight to recent samples and requires no counter, so it is unaffected by uptime.
+
+- **BUG FIX — World thread batch processor stopped permanently on world shutdown**: When the engine threw a shutdown error while the batch processor was dispatching a batch to a world thread, that error would propagate out of the scheduled task and silently cancel all future invocations of the processor across all worlds. The batch processor now catches shutdown errors, discards the affected batch, and continues running for all remaining worlds.
+
+- **BUG FIX — TTL cleanup, keepalive, warp sync, and tier decay could each stop permanently after a single error**: Four background tasks ran on a fixed schedule with no exception guard. If any one of them threw an unexpected error — such as a storage failure during a database hiccup, or an engine error while checking chunk residency — the Java scheduler would silently cancel that task for the lifetime of the server. TTL would stop expiring entries, keepalive would stop pinging chunks, warp sync would freeze, and tier decay would halt. Each task is now guarded so errors are logged and the schedule continues.
+
+- **BUG FIX — A concurrent failure during circuit breaker recovery could be silently masked by a success**: When a success and a failure arrived at the circuit breaker at the same moment while it was in the half-open recovery state, the success path could close the circuit after the failure had already re-opened it, hiding the failure entirely. The circuit breaker now only closes on success if it is still in the recovery state at the moment the transition is applied.
+
+- **BUG FIX — Zone shown as HOT after chunk load was cancelled by a server guard**: If a chunk load was stopped early because the server was low on memory, under chunk pressure, or lagging, the zone was still promoted to HOT as though the load had succeeded. The zone would appear active in the UI with no chunks actually held in memory. Cancelled loads now correctly suppress the HOT promotion.
+
+- **BUG FIX — Shutdown errors stalled background tasks for up to five seconds each**: A specific engine error thrown when the server begins shutting down was being caught in the wrong place, leaving background chunk tasks waiting for a timeout that would never resolve. The error is now caught at the right point and tasks complete immediately when the server is closing.
+
+- **BUG FIX — Post-load work ran on a shared JVM thread pool instead of the plugin's own**: Two internal task chains were accidentally running on the JVM's general-purpose pool rather than the pool managed by the plugin. This bypassed the plugin's own load controls and could compete with unrelated JVM work. Both now use the plugin's thread pool as intended.
+
+- **BUG FIX — Keepalive incorrectly reported HOT chunks as still loaded after eviction**: The keepalive check was using a method that loads a chunk if it is missing, so it never actually detected eviction — a missing chunk would simply be reloaded and reported as present. The check now correctly detects whether the chunk is already in memory without triggering a load. Zones whose chunks have been evicted are demoted from HOT to WARM to reflect their actual state.
+
+- **BUG FIX — Releasing a large zone stalled background tasks during COLD decay**: When a zone transitioned to COLD and its chunks were released, the release operation was blocking a background thread once per chunk while it waited for confirmation from the world thread. On zones with many chunks this froze the plugin's background work for a noticeable period. Chunk release is now fire-and-forget and does not block.
+
+- **BUG FIX — Zone shown as HOT in the UI without any chunks actually loaded**: In certain conditions — such as when a zone's initial load had previously failed — proximity triggers and portal discovery events would mark a zone HOT based on player position alone without verifying that its chunks were in memory. The tier is now only promoted if the zone has confirmed loaded chunks. If no chunks are loaded, the zone load is retried instead.
+
+- **BUG FIX — Chunks shared between two zones could be evicted while one zone was still active**: When two zones overlapped and shared chunks, those chunks could become eligible for eviction as soon as either zone became inactive, even if the other zone was still HOT or WARM. Each zone now independently holds its own memory pin on the chunks it owns. A shared chunk stays in memory as long as any zone that owns it remains active, and is only released when the last owning zone goes inactive.
+
+- **BUG FIX — PRED zone RAM and preload count always showed `--` in the zone table**: After a predictive load completed, the internal callback in ChunkPreloader called `updateEntryStats` but never saved the result to storage, so the updated values were discarded on every load. Additionally, when all chunks in a zone's footprint were already resident and shared with another zone, the stats were recorded against zero chunks rather than the full footprint, writing a RAM value of zero. Zones whose HOT tier was restored from the registry on server startup — where no player had approached them since restart — were never updated at all. RAM and preload count are now correctly recorded for all predictive loads regardless of chunk sharing or restart history.
+
+### Changed
+
+- **IMPROVEMENT — JSON storage no longer blocks reads during a write**: When a portal entry was saved or deleted, the JSON backend held its internal lock for the entire duration of the disk write — including JSON serialisation, fsync, backup copy, and atomic rename. Any concurrent read such as a zone lookup at startup or a config reload would stall until the write finished. The lock is now released immediately after updating the in-memory map; the disk write runs from a snapshot taken under the lock.
+
+- **IMPROVEMENT — Velocity-boost log line no longer allocates when fine logging is disabled**: The debug message logged when a player's movement speed triggers a larger preload radius was built unconditionally using string concatenation and number formatting, even in production where fine-level logging is off. It is now built lazily and only evaluated if the log level is active.
+
+- **IMPROVEMENT — TPS reading is now more accurate and no longer misreports servers above 20 TPS**: The server performance monitor previously capped its reading at 20 TPS and sampled less frequently, causing it to miss brief lag spikes and incorrectly show 20 TPS on servers that were running faster. Sampling is now more frequent, smoothed to reduce noise, and the cap is raised so above-20 readings are preserved. Readings distorted by garbage collection pauses are discarded rather than published. OptiPortal has never limited server TPS and the internal naming has been updated to make this clearer.
+
+- **IMPROVEMENT — Zone cache UI no longer shows a redundant RAM column**: The EST RAM and ACTUAL RAM columns always displayed identical values because the estimated and measured formulas resolved to the same number. The duplicate column has been removed and the remaining column is labelled RAM.
+
+---
+
 ## [1.1.6] - 2026-03-24
 
 ### Fixed
