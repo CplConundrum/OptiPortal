@@ -3,7 +3,9 @@ package com.optiportal.preload;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
 import com.hypixel.hytale.math.util.ChunkUtil;
@@ -46,6 +48,16 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
     /** Complexity score cache — avoids recomputing score() for already-seen chunks. */
     private final ChunkComplexityScorer.Cache complexityCache = new ChunkComplexityScorer.Cache();
 
+    /**
+     * Per-world, per-chunk retry tracker: world name → chunk index → nanos of last failure.
+     * Guards against the server's quadratic backoff (as of 2026.03.26-89796e57b) which allows
+     * retries after just 1ms on a first failure. Keyed by world name so entries are cleanly
+     * evicted on world unload.
+     */
+    private final ConcurrentHashMap<String, ConcurrentHashMap<Long, Long>> chunkFailureTimestamps =
+            new ConcurrentHashMap<>();
+    private static final long RETRY_COOLDOWN_NANOS = TimeUnit.SECONDS.toNanos(10);
+
     public EnhancedChunkPreloader(PluginConfig config,
                                   CacheManager cacheManager,
                                   WorldRegistry worldRegistry,
@@ -66,6 +78,8 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
         
         // Invalidate cached scores when a world unloads
         worldRegistry.addWorldUnloadCallback(complexityCache::clearWorld);
+        // Evict failure timestamps for the unloaded world to prevent unbounded growth
+        worldRegistry.addWorldUnloadCallback(chunkFailureTimestamps::remove);
     }
     
     /** Inject TPS monitor after construction to break circular dependency. */
@@ -317,6 +331,27 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
             }
         }
         
+        // Guard 3: GC backoff — if a GC ran on the world thread since the last tick,
+        // skip this load to avoid adding allocation pressure during recovery.
+        // consumeGCHasRun() is a one-shot flag that must be read on the world thread.
+        World gcWorld = getWorldRegistry().getWorld(worldName);
+        if (gcWorld != null && gcWorld.isTicking() && !gcWorld.isPaused()) {
+            final int finalBatchSize = batchSize;
+            return CompletableFuture.supplyAsync(gcWorld::consumeGCHasRun, gcWorld)
+                    .thenComposeAsync(gcRan -> {
+                        if (gcRan) {
+                            LOG.fine(() -> "[OptiPortal] loadChunksAsync: GC detected, deferring preload for " + worldName);
+                            return CompletableFuture.completedFuture(null);
+                        }
+                        return buildLoadChain(worldName, chunks, nonTicking, zoneId, finalBatchSize);
+                    }, executor);
+        }
+
+        return buildLoadChain(worldName, chunks, nonTicking, zoneId, batchSize);
+    }
+
+    private CompletableFuture<Void> buildLoadChain(String worldName, List<int[]> chunks,
+                                                   boolean nonTicking, String zoneId, int batchSize) {
         // Process chunks in sequential batches so each batch starts only after the previous
         // completes — prevents all batches hammering the world thread simultaneously.
         CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
@@ -328,13 +363,13 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
 
         // Ownership is registered per-chunk in loadChunkBatch
         return chain.whenComplete((result, ex) -> {
-                    if (ex == null) {
-                        LOG.fine(() -> "[OptiPortal] Enhanced chunk load completed: " + zoneId +
-                                " (" + chunks.size() + " chunks)");
-                    } else {
-                        LOG.warning(() -> "[OptiPortal] Enhanced chunk load failed for " + zoneId + ": " + ex.getMessage());
-                    }
-                });
+            if (ex == null) {
+                LOG.fine(() -> "[OptiPortal] Enhanced chunk load completed: " + zoneId +
+                        " (" + chunks.size() + " chunks)");
+            } else {
+                LOG.warning(() -> "[OptiPortal] Enhanced chunk load failed for " + zoneId + ": " + ex.getMessage());
+            }
+        });
     }
     
     /**
@@ -374,6 +409,21 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
                 continue;
             }
 
+            // Guard B: OptiPortal retry cooldown — the server's isChunkOnBackoff now uses a
+            // quadratic ramp (count²×1ms, capped at 10s) since 2026.03.26-89796e57b, so a
+            // first failure only suppresses retries for ~1ms. Enforce our own minimum cooldown
+            // to avoid hammering transiently-failing chunks on frequent preload triggers.
+            ConcurrentHashMap<Long, Long> worldFailures = chunkFailureTimestamps.get(worldName);
+            if (worldFailures != null) {
+                Long lastFailed = worldFailures.get(chunkIndex);
+                if (lastFailed != null && System.nanoTime() - lastFailed < RETRY_COOLDOWN_NANOS) {
+                    LOG.fine(() -> "[OptiPortal] loadChunkBatch: skipping (" + cx + ", " + cz
+                            + ") — OptiPortal retry cooldown active");
+                    chunkFutures.add(CompletableFuture.completedFuture(null));
+                    continue;
+                }
+            }
+
             // Store.getComponent() requires the WorldThread — use the async API for all
             // chunks; the engine returns a completed future for already-resident chunks.
 
@@ -384,9 +434,18 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
                         if (chunk != null) {
                             cacheManager.registerOwnership(zoneId, worldName, cx, cz, chunk);
                             scoreAndRecord(chunk, zoneId, baseKbPerChunk, worldName);
+                            // Clear failure record now that this chunk loaded successfully.
+                            ConcurrentHashMap<Long, Long> wf = chunkFailureTimestamps.get(worldName);
+                            if (wf != null) {
+                                wf.remove(chunkIndex);
+                                if (wf.isEmpty()) chunkFailureTimestamps.remove(worldName, wf);
+                            }
                         }
                     }, executor)
                     .exceptionally(ex -> {
+                        // Record failure timestamp so Guard B suppresses rapid retries.
+                        chunkFailureTimestamps.computeIfAbsent(worldName, k -> new ConcurrentHashMap<>())
+                                .put(chunkIndex, System.nanoTime());
                         LOG.warning("[OptiPortal] Chunk load failed: " + cx + "," + cz
                                 + ": " + ex.getMessage());
                         return null;

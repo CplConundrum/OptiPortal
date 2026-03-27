@@ -3,14 +3,15 @@ package com.optiportal.async;
 import java.util.Collection;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Logger;
 
+import com.hypixel.hytale.metrics.metric.HistoricMetric;
 import com.hypixel.hytale.server.core.universe.world.World;
 import com.optiportal.preload.WorldRegistry;
 
 /**
- * Observes server TPS by sampling World.getTick() at a fixed interval.
+ * Observes server TPS by reading World.getBufferedTickLengthMetricSet() each
+ * sample interval and converting the most recent tick duration to TPS.
  *
  * This monitor is READ-ONLY — it never controls or limits the server tick rate.
  * The server's actual TPS is determined entirely by the Hytale engine and can
@@ -18,14 +19,11 @@ import com.optiportal.preload.WorldRegistry;
  * observed TPS only to throttle its own chunk-preload backpressure; it does not
  * cap, slow, or otherwise influence the engine's tick rate.
  *
- * World.getTick() returns a monotonically increasing long that increments each
- * server tick. Dividing delta-ticks / delta-seconds gives the observed TPS.
- *
  * If multiple worlds are loaded, we use the MINIMUM TPS across all ticking
- * worlds (most conservative for backpressure decisions).
+ * worlds (most conservative for backpressure decisions). EMA smoothing is applied
+ * to suppress single-tick spikes.
  *
- * Threading: AtomicLong for tick snapshot and nanos, volatile double for
- * currentTps. All reads are safe from any thread.
+ * Threading: volatile double for currentTps. All reads are safe from any thread.
  */
 public class WorldTpsMonitor {
 
@@ -61,20 +59,8 @@ public class WorldTpsMonitor {
      */
     private static final double EMA_ALPHA = 0.25;
 
-    /**
-     * Maximum fraction by which the elapsed window may deviate from the expected interval
-     * before the sample is discarded. Scheduler jitter (e.g. GC pause during the window)
-     * distorts deltaTicks/elapsedSeconds — skip those windows rather than publish bad data.
-     */
-    private static final double MAX_JITTER_FRACTION = 0.30;
-
     private final WorldRegistry worldRegistry;
     private final ScheduledExecutorService executor;
-
-    // Per-world state: we track tick counts per world name
-    private final java.util.concurrent.ConcurrentHashMap<String, AtomicLong> lastTickCounts =
-            new java.util.concurrent.ConcurrentHashMap<>();
-    private final AtomicLong lastSampleNanos = new AtomicLong(0);
     private volatile double currentTps = HYTALE_TARGET_TPS;
 
     public WorldTpsMonitor(WorldRegistry worldRegistry, ScheduledExecutorService executor) {
@@ -84,115 +70,56 @@ public class WorldTpsMonitor {
 
     /**
      * Start TPS sampling. Call once after construction.
-     * Records initial tick counts so the first sample has a baseline.
      */
     public void start() {
-        // Record baseline
-        sampleBaseline();
-        // Schedule periodic sampling
         executor.scheduleAtFixedRate(() -> {
             try {
                 sampleTps();
             } catch (Exception e) {
-                LOG.fine("[OptiPortal] WorldTpsMonitor: sample error: " + e.getMessage());
+                LOG.fine(() -> "[OptiPortal] WorldTpsMonitor: sample error: " + e.getMessage());
             }
         }, SAMPLE_INTERVAL_SECONDS, SAMPLE_INTERVAL_SECONDS, TimeUnit.SECONDS);
-        LOG.info("[OptiPortal] WorldTpsMonitor started (sampling every "
-                + SAMPLE_INTERVAL_SECONDS + "s)");
+        LOG.info(() -> "[OptiPortal] WorldTpsMonitor started (sampling every "
+                + SAMPLE_INTERVAL_SECONDS + "s, source: HistoricMetric)");
     }
 
     /**
-     * Record baseline tick counts without computing TPS.
-     * Called immediately on start() before the first scheduled sample.
-     */
-    private void sampleBaseline() {
-        long nowNanos = System.nanoTime();
-        lastSampleNanos.set(nowNanos);
-        Collection<World> worlds = worldRegistry.getWorlds();
-        for (World world : worlds) {
-            try {
-                lastTickCounts.put(world.getName(), new AtomicLong(world.getTick()));
-            } catch (Exception e) {
-                LOG.fine("[OptiPortal] WorldTpsMonitor: baseline error for world "
-                        + world.getName() + ": " + e.getMessage());
-            }
-        }
-    }
-
-    /**
-     * Sample current TPS from all ticking worlds.
-     * Updates currentTps with the minimum across all sampled worlds.
-     * Skipped worlds (null, paused, not ticking) are excluded.
+     * Sample current TPS from all ticking worlds using the server's own
+     * HistoricMetric tick-length data. Reads the most recent tick duration
+     * directly — no delta calculation, no jitter guard needed.
      */
     private void sampleTps() {
-        long nowNanos = System.nanoTime();
-        long prevNanos = lastSampleNanos.getAndSet(nowNanos);
-        double elapsedSeconds = (nowNanos - prevNanos) / 1_000_000_000.0;
-
-        if (elapsedSeconds <= 0.0) return; // Guard against clock anomaly
-
-        // Jitter guard: if the scheduler fired significantly late or early (e.g. GC pause
-        // spanning most of the window), the deltaTicks/elapsedSeconds ratio is misleading.
-        // Skip the sample and keep the last EMA value rather than publishing bad data.
-        double expected = SAMPLE_INTERVAL_SECONDS;
-        if (elapsedSeconds < expected * (1.0 - MAX_JITTER_FRACTION)
-                || elapsedSeconds > expected * (1.0 + MAX_JITTER_FRACTION)) {
-            LOG.fine("[OptiPortal] WorldTpsMonitor: skipping jittered sample (elapsed="
-                    + String.format("%.3f", elapsedSeconds) + "s, expected=" + expected + "s)");
-            return;
-        }
-
         Collection<World> worlds = worldRegistry.getWorlds();
-        if (worlds.isEmpty()) {
-            // No worlds loaded yet — keep currentTps at nominal
-            return;
-        }
+        if (worlds.isEmpty()) return;
 
         double minTps = Double.MAX_VALUE;
         int sampledCount = 0;
 
         for (World world : worlds) {
             try {
-                // Skip paused or non-ticking worlds
-                if (!world.isTicking() || world.isPaused()) {
-                    continue;
-                }
-                long currentTick = world.getTick();
-                AtomicLong lastTick = lastTickCounts.computeIfAbsent(
-                        world.getName(), k -> new AtomicLong(currentTick));
-                long prevTick = lastTick.getAndSet(currentTick);
-                long deltaTicks = currentTick - prevTick;
-
-                if (deltaTicks < 0) {
-                    // Counter wrapped or world restarted — skip this sample
-                    continue;
-                }
-
-                double worldTps = deltaTicks / elapsedSeconds;
-                // Clamp to [0, 1.5×NOMINAL] — cap clearly-bogus spikes (e.g. tick counter
-                // reset on world load) while allowing legitimate above-20 readings.
-                worldTps = Math.min(worldTps, HYTALE_TARGET_TPS * 1.5);
+                if (!world.isTicking() || world.isPaused()) continue;
+                HistoricMetric tickLen = world.getBufferedTickLengthMetricSet();
+                long lastTickNanos = tickLen.getLastValue();
+                if (lastTickNanos <= 0) continue;
+                // Convert tick duration → TPS; clamp to [0, 1.5×NOMINAL].
+                double worldTps = Math.min(1_000_000_000.0 / lastTickNanos, HYTALE_TARGET_TPS * 1.5);
                 worldTps = Math.max(worldTps, 0.0);
-
                 minTps = Math.min(minTps, worldTps);
                 sampledCount++;
             } catch (Exception e) {
-                LOG.fine("[OptiPortal] WorldTpsMonitor: error sampling world "
+                LOG.fine(() -> "[OptiPortal] WorldTpsMonitor: error sampling world "
                         + world.getName() + ": " + e.getMessage());
             }
         }
 
         if (sampledCount > 0) {
-            // EMA smoothing: blend the new raw reading with the running average.
-            // thenRun/thenRunAsync callbacks won't fire on failed futures so transient
-            // scheduler jitter doesn't cause false backpressure decisions.
             currentTps = EMA_ALPHA * minTps + (1.0 - EMA_ALPHA) * currentTps;
             if (minTps < TPS_LOW_THRESHOLD) {
-                LOG.fine("[OptiPortal] WorldTpsMonitor: TPS=" + String.format("%.1f", minTps)
+                final double logTps = minTps;
+                LOG.fine(() -> "[OptiPortal] WorldTpsMonitor: TPS=" + String.format("%.1f", logTps)
                         + " (below low threshold " + TPS_LOW_THRESHOLD + ")");
             }
         }
-        // If sampledCount == 0, all worlds were paused/non-ticking — keep previous value
     }
 
     /**

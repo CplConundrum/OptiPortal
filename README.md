@@ -146,7 +146,9 @@ The plugin exposes async methods for programmatic access:
 
 OptiPortal monitors server health and adapts automatically:
 
-- **TPS monitoring** — Tracks the world thread tick rate. Below `tpsLowThreshold` (default 15.0 TPS), batch sizes are reduced. Below `tpsCriticalThreshold` (default 12.0 TPS), non-critical operations are queued.
+- **TPS monitoring** — Reads tick duration directly from the engine's `HistoricMetric` each second. Below 18.0 TPS, batch sizes are halved. Below 12.0 TPS, non-critical operations are queued. Thresholds are hardcoded constants, not configurable at runtime.
+- **GC guard** — Before building each preload batch, the engine's one-shot GC flag (`consumeGCHasRun`) is checked on the world thread. If a GC ran since the last tick, the batch is deferred immediately without waiting for the TPS monitor to catch up.
+- **Chunk retry cooldown** — Chunks that recently failed to load are suppressed for 10 seconds regardless of the engine's internal backoff state. Records are cleared on success and evicted when the world unloads.
 - **Loaded chunk pressure** — Monitors `ChunkStore.getLoadedChunksCount()` and proportionally reduces batch sizes when the count exceeds `maxLoadedChunksPressureThreshold` (default 2000, set to -1 to disable).
 - **Circuit breaker** — Automatically backs off when the world thread failure rate exceeds a threshold, cycling through CLOSED → OPEN → HALF_OPEN states to prevent cascading overload.
 
@@ -300,8 +302,8 @@ To switch backends, update `backend` in `config.json` and restart. Use `/preload
 | Key | Default | Hot-reload | Notes |
 |---|---|---|---|
 | `async.tpsMonitorEnabled` | `true` | Yes | |
-| `async.tpsLowThreshold` | `15.0` | Yes | Reduces batch sizes below this |
-| `async.tpsCriticalThreshold` | `12.0` | Yes | Queues non-critical ops below this |
+| `async.tpsLowThreshold` | `15.0` | — | Present in config.json but not currently read — thresholds are hardcoded at 18.0/12.0 in `WorldTpsMonitor` |
+| `async.tpsCriticalThreshold` | `12.0` | — | See above |
 | `async.maxLoadedChunksPressureThreshold` | `2000` | Yes | `-1` to disable |
 
 ### Warps
