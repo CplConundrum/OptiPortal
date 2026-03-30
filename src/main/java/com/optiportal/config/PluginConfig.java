@@ -126,6 +126,8 @@ public class PluginConfig {
 
     // Async TPS monitor
     private boolean tpsMonitorEnabled = true;
+    private double tpsLowThreshold = 18.0;
+    private double tpsCriticalThreshold = 12.0;
 
     // Corridor prioritization (Phase 4)
     private boolean corridorPrioritizationEnabled = true;
@@ -363,6 +365,13 @@ public class PluginConfig {
             if (rebuild.has("enabled")) rebuildFromChunksOnCorruption = rebuild.get("enabled").getAsBoolean();
             if (rebuild.has("intervalHours")) scheduledRebuildIntervalHours = rebuild.get("intervalHours").getAsInt();
         }
+
+        if (json.has("tpsMonitor")) {
+            JsonObject tps = json.getAsJsonObject("tpsMonitor");
+            if (tps.has("enabled")) tpsMonitorEnabled = tps.get("enabled").getAsBoolean();
+            if (tps.has("lowThreshold")) tpsLowThreshold = tps.get("lowThreshold").getAsDouble();
+            if (tps.has("criticalThreshold")) tpsCriticalThreshold = tps.get("criticalThreshold").getAsDouble();
+        }
     }
 
     private static void migrateConfig(File configFile) {
@@ -488,6 +497,7 @@ public class PluginConfig {
         root.add("rebuildFromChunks", rebuild);
         root.add("keepalive", keepalive);
 
+        configFile.getParentFile().mkdirs();
         try (FileWriter writer = new FileWriter(configFile)) {
             writer.write(root.toString());
         } catch (IOException e) {
@@ -621,6 +631,8 @@ public class PluginConfig {
     public boolean isRebuildFromChunksOnCorruption() { return rebuildFromChunksOnCorruption; }
     public int getScheduledRebuildIntervalHours() { return scheduledRebuildIntervalHours; }
     public boolean isTpsMonitorEnabled() { return tpsMonitorEnabled; }
+    public double getTpsLowThreshold() { return tpsLowThreshold; }
+    public double getTpsCriticalThreshold() { return tpsCriticalThreshold; }
     public boolean isCorridorPrioritizationEnabled() { return corridorPrioritizationEnabled; }
     public int getCorridorRadiusChunks() { return corridorRadiusChunks; }
     public int getPortalLinksConfidenceThreshold() { return portalLinksConfidenceThreshold; }

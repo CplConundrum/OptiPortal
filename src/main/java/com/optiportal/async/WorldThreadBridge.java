@@ -322,9 +322,9 @@ public class WorldThreadBridge {
                 if (ex instanceof Exception) {
                     errorHandler.handleChunkLoadError((Exception) ex, world, cx, cz);
                 } else if (ex instanceof Error) {
-                    LOG.severe(() -> "[OptiPortal] Severe error loading chunk ("
-                            + world.getName() + ", " + cx + ", " + cz + "): " + ex.getMessage());
-                    ex.printStackTrace();
+                    LOG.log(java.util.logging.Level.SEVERE, ex,
+                            () -> "[OptiPortal] Severe error loading chunk ("
+                            + world.getName() + ", " + cx + ", " + cz + ")");
                 }
             } else {
                 metrics.recordChunkLoadSuccess(cx, cz, duration);

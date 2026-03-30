@@ -152,10 +152,11 @@ public class RetryPolicy {
                         });
                 }, delayMs, java.util.concurrent.TimeUnit.MILLISECONDS);
             } catch (Exception e) {
+                defaultExecutor.shutdownNow();
                 future.completeExceptionally(e);
             }
         }
-        
+
         return future;
     }
     
@@ -331,10 +332,11 @@ public class RetryPolicy {
                             });
                     }, delayMs, java.util.concurrent.TimeUnit.MILLISECONDS);
                 } catch (Exception e) {
+                    defaultExecutor.shutdownNow();
                     future.completeExceptionally(e);
                 }
             }
-           
+
            return future;
        }
    }

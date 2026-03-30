@@ -50,8 +50,6 @@ public class PreloadCommand extends AbstractCommand {
                     com.hypixel.hytale.server.core.universe.world.World world =
                             plugin.getChunkPreloader().getWorldRegistry().getWorldForPlayer(playerRef);
                     if (world != null) {
-                        // Fetch storage data off the world thread to avoid blocking it
-                        List<com.optiportal.model.PortalEntry> zones = plugin.getStorage().loadAll();
                         world.execute(() -> {
                             try {
                                 @SuppressWarnings("unchecked")
@@ -60,7 +58,7 @@ public class PreloadCommand extends AbstractCommand {
                                         playerRef.getComponent(
                                                 com.hypixel.hytale.server.core.entity.entities.Player.getComponentType());
                                 if (player != null) {
-                                    com.optiportal.ui.OptiPortalUIPage.openFor(player, playerRef, plugin, zones);
+                                    com.optiportal.ui.OptiPortalUIPage.openFor(player, playerRef, plugin);
                                 }
                             } catch (Exception e) {
                                 // E1: Catch and handle exceptions from World.execute()

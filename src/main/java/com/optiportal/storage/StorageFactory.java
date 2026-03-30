@@ -4,6 +4,8 @@ import com.optiportal.config.PluginConfig;
 
 import java.io.File;
 import java.nio.file.Files;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
  * Creates and initializes the appropriate StorageBackend.
@@ -18,6 +20,8 @@ import java.nio.file.Files;
  */
 public class StorageFactory {
 
+    private static final Logger LOG = Logger.getLogger("OptiPortal");
+
     public static StorageBackend create(PluginConfig config) {
         File metaFile = new File(config.getDataFolder(), "meta.txt");
         String configured = config.getBackend().toUpperCase();
@@ -26,7 +30,7 @@ public class StorageFactory {
         // Attempt to initialize the configured backend
         StorageBackend newBackend = tryInit(configured, config);
         if (newBackend == null) {
-            System.err.println("[OptiPortal] Could not initialize configured backend (" + configured
+            LOG.warning("[OptiPortal] Could not initialize configured backend (" + configured
                     + "), falling back to JSON.");
             newBackend = forceJson(config);
         }
@@ -43,7 +47,7 @@ public class StorageFactory {
         }
 
         // Backend changed — attempt migration
-        System.out.println("[OptiPortal] Backend change detected: " + previous + " → " + newBackend.getBackendType());
+        LOG.info("[OptiPortal] Backend change detected: " + previous + " → " + newBackend.getBackendType());
         boolean migrated = StorageMigrator.migrate(previous, newBackend, config);
 
         if (migrated) {
@@ -51,11 +55,11 @@ public class StorageFactory {
             return newBackend;
         } else {
             // Migration failed — close the new (empty) backend and fall back to old
-            System.err.println("[OptiPortal] Migration failed. Reverting to previous backend: " + previous);
+            LOG.severe("[OptiPortal] Migration failed. Reverting to previous backend: " + previous);
             newBackend.close();
             StorageBackend fallback = tryInit(previous, config);
             if (fallback == null) {
-                System.err.println("[OptiPortal] Could not re-open previous backend either. Using JSON.");
+                LOG.severe("[OptiPortal] Could not re-open previous backend either. Using JSON.");
                 fallback = forceJson(config);
                 writeMeta(metaFile, "JSON");
             }
@@ -75,8 +79,10 @@ public class StorageFactory {
             backend.init();
             return backend;
         } catch (Exception e) {
-            System.err.println("[OptiPortal] Failed to init " + type + " backend: " + e.getMessage());
-            try { backend.close(); } catch (Exception ignored) {}
+            LOG.log(Level.WARNING, "[OptiPortal] Failed to init " + type + " backend", e);
+            try { backend.close(); } catch (Exception closeEx) {
+                LOG.fine("[OptiPortal] Could not close backend after failed init: " + closeEx.getMessage());
+            }
             return null;
         }
     }
@@ -102,7 +108,7 @@ public class StorageFactory {
             metaFile.getParentFile().mkdirs();
             Files.writeString(metaFile.toPath(), backendType);
         } catch (Exception e) {
-            System.err.println("[OptiPortal] Could not write meta.txt: " + e.getMessage());
+            LOG.log(Level.WARNING, "[OptiPortal] Could not write meta.txt", e);
         }
     }
 }

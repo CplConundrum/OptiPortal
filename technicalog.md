@@ -6,6 +6,210 @@ mirror the version numbers in `changelog.md`.
 
 ---
 
+## [1.1.8] - 2026-03-26
+
+---
+
+### HistoricMetric — TPS monitor replaced tick-delta polling with server tick-length data
+
+**File:** `WorldTpsMonitor.java`
+
+**Root cause:**
+The previous implementation sampled `World.getTick()` on a background thread at a 1-second
+interval and computed TPS as `deltaTicks / elapsedSeconds`. This introduced two failure modes:
+
+1. **GC distortion.** A GC pause spanning part of the sampling window compresses `deltaTicks`
+   relative to `elapsedSeconds`, producing a false low-TPS reading. The jitter guard
+   (`|elapsed − expected| / expected > 0.30`) discarded these samples, but a pause shorter
+   than 300ms (30% of 1s) would still be published as a bad sample and engage backpressure
+   unnecessarily.
+
+2. **One-second lag.** A sudden server stall was only visible to OptiPortal's backpressure
+   logic after the next sample fired, up to one second later.
+
+**Fix:**
+`World` exposes `getBufferedTickLengthMetricSet()` returning a `HistoricMetric` that the
+engine populates with the actual nanosecond duration of every tick as it completes. Reading
+`tickLen.getLastValue()` gives the most recent tick duration without any elapsed-time
+arithmetic, and converting to TPS is simply `1_000_000_000.0 / lastTickNanos`.
+
+Because the value already represents a real tick duration, GC-induced distortion is
+impossible — a GC pause extends the tick duration naturally and is reflected accurately.
+The jitter guard and `lastSampleNanos`/`lastTickCounts` state are no longer needed and have
+been removed. EMA smoothing over the 1-second sample interval is retained to suppress
+single-tick spikes.
+
+**Threading:** `HistoricMetric` is written on the world thread per tick and read from the
+sampling thread without synchronisation. The read may observe a value one tick behind but
+this is acceptable for backpressure decisions, matching the off-thread safety already
+accepted by the previous `world.getTick()` call.
+
+**Removed state:**
+
+| Field / constant | Reason for removal |
+|---|---|
+| `lastTickCounts` (`ConcurrentHashMap<String, AtomicLong>`) | No longer sampling delta ticks |
+| `lastSampleNanos` (`AtomicLong`) | No longer measuring elapsed wall time |
+| `MAX_JITTER_FRACTION` | Jitter guard removed |
+| `sampleBaseline()` | Baseline tick count no longer needed |
+
+---
+
+### GC guard — preload deferred when consumeGCHasRun() fires
+
+**File:** `EnhancedChunkPreloader.java`
+
+**Root cause:**
+`WorldTpsMonitor` could theoretically detect GC via the jitter guard discarding a distorted
+sample, but that required the GC pause to span >30% of the 1-second sample window. Short
+collections (minor GCs) would not be caught, yet those are exactly the events that spike
+allocation pressure. Preload batches submitted during or immediately after a GC increase
+heap pressure on a JVM that may already be in a fragile state.
+
+**Fix:**
+`World` (via `TickingThread`) maintains a one-shot `boolean gcHasRun` flag set by a JVM
+`GarbageCollectorMXBean` notification listener. `consumeGCHasRun()` reads and atomically
+clears it.
+
+In `loadChunksAsync`, after the existing heap and chunk-pressure guards, the world is
+resolved and `consumeGCHasRun()` is dispatched to the world thread via
+`CompletableFuture.supplyAsync(gcWorld::consumeGCHasRun, gcWorld)`. If the flag was set,
+the entire preload returns a completed future immediately. If not, the load chain is built
+and returned via `buildLoadChain()`, which was extracted from the inline chain construction
+to keep the async branching clean.
+
+**One-shot consumption:** `consumeGCHasRun()` clears the flag on read. The server's own
+logging path in `ChunkPreLoadProcessEvent.processEvent()` also calls this method to annotate
+slow hook warnings. OptiPortal consuming the flag first means the server's annotation for
+that hook cycle will miss the GC, which affects only the server's log verbosity — not
+correctness.
+
+**Threading:** `consumeGCHasRun()` is dispatched to the world thread via the world's
+`Executor` interface. `buildLoadChain` is called inside `thenComposeAsync(..., executor)`
+so that after the world-thread flag read completes, the continuation runs on the plugin
+executor — not on the world thread. See the *Guard 3 world-thread continuation* entry below
+for the bug this fixed.
+
+---
+
+### Retry tracker — per-chunk OptiPortal cooldown for quadratic backoff
+
+**File:** `EnhancedChunkPreloader.java`
+
+**Root cause:**
+As of Hytale 2026.03.26-89796e57b, `ChunkStore.isChunkOnBackoff(long index, long maxNanos)`
+changed its internal formula from a flat comparison to a quadratic ramp:
+
+```java
+// Before (inferred from behaviour):
+return nanosSince < maxFailureBackoffNanos;
+
+// After:
+return nanosSince < Math.min(maxFailureBackoffNanos, count * count * FAILURE_BACKOFF_NANOS);
+// where FAILURE_BACKOFF_NANOS = TimeUnit.MILLISECONDS.toNanos(1)
+```
+
+At `count = 1` (first failure), the effective backoff is `min(10s, 1ms) = 1ms`. The cap
+passed by OptiPortal (`ChunkStore.MAX_FAILURE_BACKOFF_NANOS = 10s`) is irrelevant at low
+failure counts — the binding constraint is `count² × 1ms`. A chunk that fails once is
+therefore suppressed for only ~1ms regardless of what cap is passed.
+
+On a zone with a transiently-failing chunk and frequent preload triggers (e.g. player
+hovering near a portal), OptiPortal could attempt that chunk thousands of times per second.
+Increasing the cap constant does not help because the cap is not the binding term.
+
+**Fix:**
+`chunkFailureTimestamps: ConcurrentHashMap<String, ConcurrentHashMap<Long, Long>>`
+maps `worldName → chunkIndex → nanos of last failure`. The outer key is `worldName` so
+entries can be cleanly evicted on world unload via `worldRegistry.addWorldUnloadCallback`.
+
+Guard B is placed immediately after Guard A (the engine backoff check) in the `loadChunkBatch`
+loop:
+
+```java
+ConcurrentHashMap<Long, Long> worldFailures = chunkFailureTimestamps.get(worldName);
+if (worldFailures != null) {
+    Long lastFailed = worldFailures.get(chunkIndex);
+    if (lastFailed != null && System.nanoTime() - lastFailed < RETRY_COOLDOWN_NANOS) {
+        // skip
+    }
+}
+```
+
+`RETRY_COOLDOWN_NANOS = TimeUnit.SECONDS.toNanos(10)` matches the old flat-comparison
+behaviour of the engine's backoff (before quadratic ramp), restoring equivalent suppression
+for first failures.
+
+On success, `thenAcceptAsync` removes the entry and evicts the inner map if it becomes
+empty to prevent unbounded outer-map growth on long-running servers:
+```java
+ConcurrentHashMap<Long, Long> wf = chunkFailureTimestamps.get(worldName);
+if (wf != null) {
+    wf.remove(chunkIndex);
+    if (wf.isEmpty()) chunkFailureTimestamps.remove(worldName, wf);
+}
+```
+The two-arg `remove(key, value)` is used so an inner map that received a concurrent new
+failure between the `isEmpty()` check and the remove call is not accidentally evicted.
+
+On failure, `exceptionally` records the timestamp via `computeIfAbsent` to lazily create
+the inner map only when a failure actually occurs — the map stays empty under normal
+operation.
+
+**Memory:** entries are `Long → Long` pairs (16 bytes each on a compressed-oops JVM).
+Inner maps are only created on failure. The world-unload callback drops the entire inner
+map. In the steady state (no failures) the outer map is populated but all inner maps are
+empty or absent.
+
+**Interaction with Guard A:** Guard A (`isChunkOnBackoff`) remains in place. For chunks
+with high `failedCounter` (many consecutive failures), the engine's quadratic term eventually
+exceeds `RETRY_COOLDOWN_NANOS` (at `count ≥ 100`, `count² × 1ms ≥ 10s`), so Guard A
+becomes the binding check. Guard B is only needed to cover the low-count range where the
+engine's ramp has not yet reached the 10s threshold.
+
+---
+
+### Guard 3 world-thread continuation — buildLoadChain was running on world thread
+
+**File:** `EnhancedChunkPreloader.java` — `loadChunksAsync`
+
+**Root cause:**
+`CompletableFuture.thenCompose(fn)` inherits the completing thread. The Guard 3 check:
+```java
+CompletableFuture.supplyAsync(gcWorld::consumeGCHasRun, gcWorld)
+    .thenCompose(gcRan -> { ... return buildLoadChain(...); });
+```
+completes `supplyAsync` on the world thread (via `gcWorld` as executor). The `thenCompose`
+continuation therefore also ran on the world thread: `buildLoadChain` was called on the
+world thread, and the first `thenCompose` inside `buildLoadChain` was also triggered
+synchronously on the world thread because its seed future (`completedFuture(null)`) was
+already done at the call site. This caused `loadChunkBatch` — and within it,
+`WorldThreadBridge.getChunkAsync` → `World.getNonTickingChunkAsync` — to execute on the
+world thread.
+
+Spark profiling captured the exact frame:
+```
+WorldThread - default
+  EnhancedChunkPreloader.lambda$loadChunksAsync$2()   ← thenCompose lambda
+  EnhancedChunkPreloader.buildLoadChain()
+  EnhancedChunkPreloader.lambda$buildLoadChain$0()    ← first batch thenCompose
+  EnhancedChunkPreloader.loadChunkBatch()
+  WorldThreadBridge.getChunkAsync()
+  World.getNonTickingChunkAsync()
+  libjvm.so InterpreterRuntime::resolve_invokedynamic  ← first-call lambda bootstrap
+```
+The `resolve_invokedynamic` chain is a one-time JVM cost (lambda call-site bootstrap),
+not a recurring issue, but it surfaced here because the first call to
+`getNonTickingChunkAsync` was occurring on the world thread rather than the plugin executor.
+
+**Fix:**
+Changed `.thenCompose(fn)` to `.thenComposeAsync(fn, executor)` where `executor` is the
+plugin's `ScheduledExecutorService`. The world thread now does exactly one thing: reads and
+clears `gcHasRun`. All subsequent work — chain building, batch dispatch, and the
+`getNonTickingChunkAsync` call-site initialisation — moves to the plugin executor.
+
+---
+
 ## [1.1.7] - 2026-03-24
 
 ---

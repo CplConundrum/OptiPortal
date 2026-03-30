@@ -145,7 +145,7 @@ public class OptiPortal extends JavaPlugin {
 
             // TPS monitor — must come after worldRegistry, before loadBalancer and worldBridge
             if (config.isTpsMonitorEnabled()) {
-                tpsMonitor = new WorldTpsMonitor(worldRegistry, executor);
+                tpsMonitor = new WorldTpsMonitor(worldRegistry, executor, config);
                 tpsMonitor.start();
             }
 
@@ -193,7 +193,7 @@ public class OptiPortal extends JavaPlugin {
             }
 
             // PortalChunkListener — auto-detects PortalDevice blocks and promotes COLD zones
-            portalChunkListener = new PortalChunkListener(storage, cacheManager, warmZoneManager, config);
+            portalChunkListener = new PortalChunkListener(storage, cacheManager, warmZoneManager, config, executor);
 
             // Register AllWorldsLoadedEvent listener — actual chunk loading is gated on this
             warmZoneManager.registerWorldsLoadedListener(getEventRegistry());
@@ -285,8 +285,7 @@ public class OptiPortal extends JavaPlugin {
             getLogger().at(Level.INFO).log("[OptiPortal] Enabled successfully.");
 
         } catch (Exception e) {
-            getLogger().at(Level.SEVERE).log("[OptiPortal] Failed to enable: " + e.getMessage());
-            e.printStackTrace();
+            getLogger().at(Level.SEVERE).withCause(e).log("[OptiPortal] Failed to enable: " + e.getMessage());
         }
     }
 

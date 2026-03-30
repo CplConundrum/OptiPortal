@@ -10,6 +10,8 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 import com.google.gson.Gson;
 import com.optiportal.model.CacheTier;
@@ -23,6 +25,7 @@ import com.zaxxer.hikari.HikariDataSource;
  */
 public abstract class AbstractSqlStorageBackend implements StorageBackend {
 
+    private static final Logger LOG = Logger.getLogger("OptiPortal");
     private static final Gson GSON = new Gson();
     protected HikariDataSource dataSource;
 
@@ -111,7 +114,7 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
                 result.add(mapRow(rs));
             }
         } catch (SQLException e) {
-            System.err.println("[OptiPortal] SQL loadAll error: " + e.getMessage());
+            LOG.log(Level.WARNING, "[OptiPortal] SQL loadAll error", e);
         }
         return result;
     }
@@ -126,7 +129,7 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
                 if (rs.next()) return Optional.of(mapRow(rs));
             }
         } catch (SQLException e) {
-            System.err.println("[OptiPortal] SQL loadById error: " + e.getMessage());
+            LOG.log(Level.WARNING, "[OptiPortal] SQL loadById error", e);
         }
         return Optional.empty();
     }
@@ -147,7 +150,7 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
             bindEntry(ps, entry);
             ps.executeUpdate();
         } catch (SQLException e) {
-            System.err.println("[OptiPortal] SQL save error: " + e.getMessage());
+            LOG.log(Level.WARNING, "[OptiPortal] SQL save error", e);
         }
         // Notify cache updater
         if (cacheUpdater != null) {
@@ -178,7 +181,7 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
                 conn.setAutoCommit(true);
             }
         } catch (SQLException e) {
-            System.err.println("[OptiPortal] SQL saveAll error: " + e.getMessage());
+            LOG.log(Level.WARNING, "[OptiPortal] SQL saveAll error", e);
         }
         // Notify cache updater
         if (cacheUpdater != null) {
@@ -194,7 +197,7 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
             ps.setString(1, id);
             ps.executeUpdate();
         } catch (SQLException e) {
-            System.err.println("[OptiPortal] SQL delete error: " + e.getMessage());
+            LOG.log(Level.WARNING, "[OptiPortal] SQL delete error", e);
         }
         // Notify cache updater
         if (cacheUpdater != null) {

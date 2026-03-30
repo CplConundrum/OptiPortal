@@ -2,12 +2,18 @@ package com.optiportal.ui;
 
 import java.util.List;
 
+import com.hypixel.hytale.codec.Codec;
+import com.hypixel.hytale.codec.KeyedCodec;
 import com.hypixel.hytale.codec.builder.BuilderCodec;
+import com.hypixel.hytale.codec.codecs.EnumCodec;
 import com.hypixel.hytale.component.Ref;
 import com.hypixel.hytale.component.Store;
 import com.hypixel.hytale.protocol.packets.interface_.CustomPageLifetime;
+import com.hypixel.hytale.protocol.packets.interface_.CustomUIEventBindingType;
+import com.hypixel.hytale.server.core.Message;
 import com.hypixel.hytale.server.core.entity.entities.Player;
 import com.hypixel.hytale.server.core.entity.entities.player.pages.InteractiveCustomUIPage;
+import com.hypixel.hytale.server.core.ui.builder.EventData;
 import com.hypixel.hytale.server.core.ui.builder.UICommandBuilder;
 import com.hypixel.hytale.server.core.ui.builder.UIEventBuilder;
 import com.hypixel.hytale.server.core.universe.PlayerRef;
@@ -19,168 +25,264 @@ import com.optiportal.config.PluginConfig;
 import com.optiportal.model.CacheTier;
 import com.optiportal.model.PortalEntry;
 import com.optiportal.model.WarmStrategy;
+import javax.annotation.Nonnull;
 
-public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.Data> {
-
-    private static final String UI_FILE = "OptiPortalUI.ui";
+public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.PageData> {
 
     private final OptiPortal plugin;
-    private final List<PortalEntry> zones;
+    private String selectedZoneId = null;
 
-    public OptiPortalUIPage(PlayerRef playerRef, OptiPortal plugin, List<PortalEntry> zones) {
-        super(playerRef, CustomPageLifetime.CanDismiss, Data.CODEC);
+    public OptiPortalUIPage(PlayerRef playerRef, OptiPortal plugin) {
+        super(playerRef, CustomPageLifetime.CanDismiss, PageData.CODEC);
         this.plugin = plugin;
-        this.zones = zones;
     }
 
-    public static class Data {
-        public static final BuilderCodec<Data> CODEC = BuilderCodec
-            .builder(Data.class, Data::new)
+    // -------------------------------------------------------------------------
+    // Event data
+
+    public enum Action { Select, Flush, Delete }
+
+    public static class PageData {
+        public static final BuilderCodec<PageData> CODEC = BuilderCodec
+            .builder(PageData.class, PageData::new)
+            .append(new KeyedCodec<>("Action", new EnumCodec<>(Action.class)), (o, v) -> o.action = v, o -> o.action).add()
+            .append(new KeyedCodec<>("ZoneId", Codec.STRING),                  (o, v) -> o.zoneId = v, o -> o.zoneId).add()
             .build();
+
+        public Action action;
+        public String zoneId;
     }
+
+    // -------------------------------------------------------------------------
+    // Build (initial render) — uses Pages/PluginListPage.ui as the root container.
+    // This is a builtin Hytale page the client already has; we repurpose its elements:
+    //   #PluginList         → zone list (left panel)
+    //   #PluginName         → zone ID title (right panel header)
+    //   #PluginIdentifier   → tier/strategy summary
+    //   #PluginVersion      → radius/RAM/preload info
+    //   #PluginDescription  → detail text
+    //   #DescriptiveOnlyOption → cleared and reused for Flush/Delete buttons
 
     @Override
-    public void build(Ref<EntityStore> ref, UICommandBuilder cmd, UIEventBuilder evt,
-                      Store<EntityStore> store) {
-        cmd.append(UI_FILE);
-        render(cmd);
+    public void build(@Nonnull Ref<EntityStore> ref, @Nonnull UICommandBuilder cmd,
+                      @Nonnull UIEventBuilder evt, @Nonnull Store<EntityStore> store) {
+        cmd.append("Pages/PluginListPage.ui");
+        List<PortalEntry> zones = plugin.getStorage().loadAll();
+        renderZoneList(cmd, evt, zones);
+        renderDetailPanel(cmd, evt);
     }
+
+    // -------------------------------------------------------------------------
+    // Event handling
 
     @Override
-    public void handleDataEvent(Ref<EntityStore> ref, Store<EntityStore> store, Data data) {
-        // no-op
-    }
-
-    private void render(UICommandBuilder cmd) {
-        CacheManager      cache = plugin.getCacheManager();
-        PluginConfig      cfg   = plugin.getPluginConfig();
-        int hot = 0, warm = 0, cold = 0, unvisited = 0;
-        double totalRam = 0;
-
-        // Set column headers
-        cmd.set("#HdrTier.Text",   "TIER");
-        cmd.set("#HdrName.Text",   "NAME");
-        cmd.set("#HdrType.Text",   "TYPE");
-        cmd.set("#HdrStrat.Text",  "STRAT");
-        cmd.set("#HdrRadius.Text", "RADIUS");
-        cmd.set("#HdrRamMarginal.Text", "RAM");
-        cmd.set("#HdrPreload.Text", "PRELOAD");
-        cmd.set("#HdrTTL.Text",    "TTL");
-        cmd.set("#HdrStatus.Text", "STATUS");
-
-        // Build each column as a separate multi-line string
-        StringBuilder colTier   = new StringBuilder();
-        StringBuilder colName   = new StringBuilder();
-        StringBuilder colType   = new StringBuilder();
-        StringBuilder colStrat  = new StringBuilder();
-        StringBuilder colRadius = new StringBuilder();
-        StringBuilder colRamMarginal = new StringBuilder();
-        StringBuilder colPreload = new StringBuilder();
-        StringBuilder colTTL    = new StringBuilder();
-        StringBuilder colStatus = new StringBuilder();
-
-        for (PortalEntry z : zones) {
-            CacheTier tier   = cache.getZoneTier(z.getId());
-            int       radius = z.getWarmRadius() > 0 ? z.getWarmRadius()
-                    : (z.getStrategy() == WarmStrategy.WARM
-                        ? cfg.getDefaultWarmRadius() : cfg.getPredictiveRadius());
-
-            switch (tier) {
-                case HOT       -> hot++;
-                case WARM      -> warm++;
-                case COLD      -> cold++;
-                case UNVISITED -> unvisited++;
-                default        -> {}
+    public void handleDataEvent(@Nonnull Ref<EntityStore> ref, @Nonnull Store<EntityStore> store,
+                                @Nonnull PageData data) {
+        switch (data.action) {
+            case Select -> {
+                selectedZoneId = data.zoneId;
+                refresh();
             }
-            totalRam += z.getRamMarginalMB();
-
-            String tierLabel = switch (tier) {
-                case HOT        -> "[HOT]";
-                case WARM       -> "[WARM]";
-                case COLD       -> "[COLD]";
-                case REBUILDING -> "[REBUILD]";
-                case UNVISITED  -> "[--]";
-                default         -> "[-]";
-            };
-
-            String statusLabel = switch (tier) {
-                case HOT        -> "Active";
-                case WARM       -> "Warm";
-                case COLD       -> "Cold";
-                case REBUILDING -> "Rebuilding";
-                case UNVISITED  -> "Unvisited";
-                default         -> "Unknown";
-            };
-
-            // Entry type label
-            String typeLabel = switch (z.getType()) {
-                case PORTAL -> "PORTAL";
-                case BED    -> "BED";
-                case DEATH  -> "DEATH";
-                case MANUAL -> "MANUAL";
-            };
-
-            // Strategy label
-            String stratLabel = z.getStrategy() == WarmStrategy.WARM ? "WARM" : "PRED";
-
-            // RAM marginal info
-            String ramMarginal = z.getRamMarginalMB() > 0
-                    ? String.format("%.2f MB", z.getRamMarginalMB()) : "--";
-
-            // Preload count
-            String preload = z.getPreloadCount() > 0 ? String.valueOf(z.getPreloadCount()) : "--";
-
-            // Cache TTL info
-            String ttl = z.getCacheTTLDays() != null && z.getCacheTTLDays() > 0
-                    ? z.getCacheTTLDays() + "d" : "--";
-
-            colTier.append(tierLabel).append("\n");
-            colName.append(z.getId()).append("\n");
-            colType.append(typeLabel).append("\n");
-            colStrat.append(stratLabel).append("\n");
-            colRadius.append("r=").append(radius).append("\n");
-            colRamMarginal.append(ramMarginal).append("\n");
-            colPreload.append(preload).append("\n");
-            colTTL.append(ttl).append("\n");
-            colStatus.append(statusLabel).append("\n");
+            case Flush -> {
+                plugin.getCacheManager().releaseZoneChunks(data.zoneId);
+                plugin.getCacheManager().setZoneTier(data.zoneId, CacheTier.COLD);
+                refresh();
+            }
+            case Delete -> {
+                String id = data.zoneId;
+                plugin.getCacheManager().deregisterAllChunks(id);
+                plugin.getCacheManager().removeTierEntry(id);
+                var pcl = plugin.getPortalChunkListener();
+                if (pcl != null) pcl.removeFromIndex(id);
+                plugin.getPortalLinkRegistry().removeLink(id);
+                plugin.getStorage().delete(id);
+                plugin.getTeleportInterceptor().refreshPortalCache();
+                selectedZoneId = null;
+                refresh();
+            }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Refresh (subsequent updates — does NOT re-append the root page)
+
+    private void refresh() {
+        List<PortalEntry> zones = plugin.getStorage().loadAll();
+        UICommandBuilder cmd = new UICommandBuilder();
+        UIEventBuilder   evt = new UIEventBuilder();
+        renderZoneList(cmd, evt, zones);
+        renderDetailPanel(cmd, evt);
+        sendUpdate(cmd, evt, false);
+    }
+
+    // -------------------------------------------------------------------------
+    // Render helpers
+
+    private void renderZoneList(UICommandBuilder cmd, UIEventBuilder evt, List<PortalEntry> zones) {
+        CacheManager cache = plugin.getCacheManager();
+        cmd.clear("#PluginList");
 
         if (zones.isEmpty()) {
-            colName.append("No zones registered.");
+            cmd.appendInline("#PluginList",
+                    "Label { Style: (FontSize: 13, Alignment: Center); Anchor: (Horizontal: 6, Top: 8, Bottom: 8); }");
+            cmd.set("#PluginList[0].Text", "No zones registered.");
+            return;
         }
 
-        cmd.set("#ColTier.Text",   colTier.toString().trim());
-        cmd.set("#ColName.Text",   colName.toString().trim());
-        cmd.set("#ColType.Text",   colType.toString().trim());
-        cmd.set("#ColStrat.Text",  colStrat.toString().trim());
-        cmd.set("#ColRadius.Text", colRadius.toString().trim());
-        cmd.set("#ColRamMarginal.Text", colRamMarginal.toString().trim());
-        cmd.set("#ColPreload.Text", colPreload.toString().trim());
-        cmd.set("#ColTTL.Text",    colTTL.toString().trim());
-        cmd.set("#ColStatus.Text", colStatus.toString().trim());
+        for (int i = 0; i < zones.size(); i++) {
+            PortalEntry z    = zones.get(i);
+            CacheTier   tier = cache.getZoneTier(z.getId());
+            boolean     sel  = z.getId().equals(selectedZoneId);
+            String      text = tierLabel(tier) + "  " + (sel ? "> " + z.getId() : z.getId());
 
-        cmd.set("#CommandRef1.Text",
-                "/preload list   /preload strategy <id> <WARM|PRED>   /preload shape <id> <ELLIPSOID|CYLINDER|BOX>   " +
-                "/preload radius <id> <n>   /preload radiusxz <id> <rx> <rz>");
-        cmd.set("#CommandRef2.Text",
-                "/preload setwarm <id> [r]   /preload unsetwarm <id>   /preload activation <id> <dist>   " +
-                "/preload ttl <id> <days>   /preload zone <id>   /preload delete <id>");
-        cmd.set("#CommandRef3.Text",
-                "/preload ram   /preload refresh warps   /preload reload   /preload flush   /preload links   " +
-                "/preload migrate <backend>   /preload backup <list|restore <date>>   /preload help");
-
-        cmd.set("#WarpStats.Text", String.format(
-                "HOT %d   WARM %d   COLD %d   Unvisited %d   |   RAM %.1f MB   Shared %d chunks",
-                hot, warm, cold, unvisited, totalRam, cache.getTotalSharedChunks()));
-        cmd.set("#StorageBackend.Text", "Storage: " + cfg.getBackend().toUpperCase());
+            // BasicTextButton is a root button — text via .TextSpans, binding directly on the index element
+            cmd.append("#PluginList", "Pages/BasicTextButton.ui");
+            cmd.set("#PluginList[" + i + "].TextSpans", Message.raw(text));
+            evt.addEventBinding(CustomUIEventBindingType.Activating, "#PluginList[" + i + "]",
+                    EventData.of("Action", Action.Select.name()).append("ZoneId", z.getId()), false);
+        }
     }
 
-    public static void openFor(Player player, PlayerRef playerRef, OptiPortal plugin,
-                               List<PortalEntry> zones) {
-        World world = plugin.getChunkPreloader().getWorldRegistry().getAnyWorld();
+    private void renderDetailPanel(UICommandBuilder cmd, UIEventBuilder evt) {
+        if (selectedZoneId == null) {
+            cmd.set("#PluginName.Text", "OptiPortal  —  Zone Manager");
+            cmd.set("#PluginIdentifier.Text", "Select a zone from the list to view details.");
+            cmd.set("#PluginVersion.Text", "");
+            cmd.set("#PluginDescription.Text",
+                    "/preload list\n" +
+                    "/preload setwarm <id> [radius]\n" +
+                    "/preload unsetwarm <id>\n" +
+                    "/preload strategy <id> <WARM|PREDICTIVE>\n" +
+                    "/preload radius <id> <X> [Z]\n" +
+                    "/preload activation <id> <dist|reset>\n" +
+                    "/preload shape <id> <ELLIPSOID|CYLINDER|BOX>\n" +
+                    "/preload ttl <id> <days|-1|reset>\n" +
+                    "/preload preload <id>\n" +
+                    "/preload zone <id>\n" +
+                    "/preload delete <id>\n" +
+                    "/preload flush\n" +
+                    "/preload ram\n" +
+                    "/preload status\n" +
+                    "/preload links [remove <id>|clear-pending]\n" +
+                    "/preload refresh warps\n" +
+                    "/preload reload\n" +
+                    "/preload migrate <JSON|SQLITE|H2|MYSQL>\n" +
+                    "/preload backup <list|restore <date>>\n" +
+                    "/preload help");
+            cmd.clear("#DescriptiveOnlyOption");
+            cmd.appendInline("#DescriptiveOnlyOption",
+                    "Label { Style: (FontSize: 11); FlexWeight: 1; }");
+            cmd.set("#DescriptiveOnlyOption[0].Text", overallStats());
+            return;
+        }
+
+        var found = plugin.getStorage().loadById(selectedZoneId);
+        if (found.isEmpty()) {
+            cmd.set("#PluginName.Text", "Zone not found");
+            cmd.set("#PluginIdentifier.Text", selectedZoneId);
+            cmd.set("#PluginVersion.Text", "");
+            cmd.set("#PluginDescription.Text", "The selected zone no longer exists.");
+            cmd.clear("#DescriptiveOnlyOption");
+            selectedZoneId = null;
+            return;
+        }
+
+        PortalEntry  entry = found.get();
+        CacheManager cache = plugin.getCacheManager();
+        PluginConfig cfg   = plugin.getPluginConfig();
+        CacheTier    tier  = cache.getZoneTier(entry.getId());
+        int radius = entry.getWarmRadius() > 0 ? entry.getWarmRadius()
+                : (entry.getStrategy() == WarmStrategy.WARM
+                        ? cfg.getDefaultWarmRadius() : cfg.getPredictiveRadius());
+
+        cmd.set("#PluginName.Text", entry.getId());
+        cmd.set("#PluginIdentifier.Text", String.format("%s  |  %s  |  Type: %s  |  World: %s",
+                tierLabel(tier),
+                entry.getStrategy() == WarmStrategy.WARM ? "WARM" : "PRED",
+                entry.getType().name(),
+                entry.getWorld() != null ? entry.getWorld() : "--"));
+        cmd.set("#PluginVersion.Text", String.format(
+                "Radius: %s  |  RAM: %s  |  Preloads: %d  |  Shared chunks: %d",
+                radius > 0 ? String.valueOf(radius) : "--",
+                entry.getRamMarginalMB() > 0 ? String.format("%.2f MB", entry.getRamMarginalMB()) : "--",
+                entry.getPreloadCount(),
+                cache.getTotalSharedChunks()));
+
+        StringBuilder detail = new StringBuilder();
+        if (entry.getWarmRadiusX() != null)
+            detail.append("Radius X override: ").append(entry.getWarmRadiusX()).append("\n");
+        if (entry.getWarmRadiusZ() != null)
+            detail.append("Radius Z override: ").append(entry.getWarmRadiusZ()).append("\n");
+        if (entry.getActivationDistanceHorizontal() != null)
+            detail.append("Activation dist: ").append(entry.getActivationDistanceHorizontal()).append("\n");
+        if (entry.getCacheTTLDays() != null)
+            detail.append("TTL (days): ").append(entry.getCacheTTLDays()).append("\n");
+        if (entry.getActivationShape() != null)
+            detail.append("Shape: ").append(entry.getActivationShape()).append("\n");
+        if (detail.length() == 0) detail.append("No overrides set.");
+        cmd.set("#PluginDescription.Text", detail.toString().trim());
+
+        // Bottom bar: stats label (FlexWeight: 1 pushes it left) + Flush + Delete buttons
+        cmd.clear("#DescriptiveOnlyOption");
+        cmd.appendInline("#DescriptiveOnlyOption",
+                "Label { Style: (FontSize: 11); FlexWeight: 1; }");
+        cmd.set("#DescriptiveOnlyOption[0].Text", overallStats());
+        cmd.append("#DescriptiveOnlyOption", "Pages/BasicTextButton.ui");
+        cmd.set("#DescriptiveOnlyOption[1].TextSpans", Message.raw("[ Flush ]"));
+        evt.addEventBinding(CustomUIEventBindingType.Activating, "#DescriptiveOnlyOption[1]",
+                EventData.of("Action", Action.Flush.name()).append("ZoneId", entry.getId()), false);
+        cmd.append("#DescriptiveOnlyOption", "Pages/BasicTextButton.ui");
+        cmd.set("#DescriptiveOnlyOption[2].TextSpans", Message.raw("[ Delete ]"));
+        evt.addEventBinding(CustomUIEventBindingType.Activating, "#DescriptiveOnlyOption[2]",
+                EventData.of("Action", Action.Delete.name()).append("ZoneId", entry.getId()), false);
+    }
+
+    // -------------------------------------------------------------------------
+    // Utilities
+
+    private String overallStats() {
+        CacheManager cache = plugin.getCacheManager();
+        PluginConfig cfg   = plugin.getPluginConfig();
+        List<PortalEntry> all = plugin.getStorage().loadAll();
+        int hot = 0, warm = 0, cold = 0, unvisited = 0;
+        double totalRam = 0;
+        for (PortalEntry z : all) {
+            switch (cache.getZoneTier(z.getId())) {
+                case HOT        -> hot++;
+                case WARM       -> warm++;
+                case COLD       -> cold++;
+                case UNVISITED  -> unvisited++;
+                default         -> {}
+            }
+            totalRam += z.getRamMarginalMB();
+        }
+        return String.format("HOT %d  WARM %d  COLD %d  Unvisited %d  |  RAM %.1f MB  Shared %d chunks  |  Storage: %s",
+                hot, warm, cold, unvisited, totalRam,
+                cache.getTotalSharedChunks(), cfg.getBackend().toUpperCase());
+    }
+
+    private String tierLabel(CacheTier tier) {
+        return switch (tier) {
+            case HOT        -> "[HOT]";
+            case WARM       -> "[WARM]";
+            case COLD       -> "[COLD]";
+            case REBUILDING -> "[REBUILD]";
+            case UNVISITED  -> "[--]";
+            default         -> "[-]";
+        };
+    }
+
+    // -------------------------------------------------------------------------
+    // Static open helper
+
+    public static void openFor(Player player, PlayerRef playerRef, OptiPortal plugin) {
+        World world = plugin.getChunkPreloader().getWorldRegistry().getWorldForPlayer(playerRef);
+        if (world == null) world = plugin.getChunkPreloader().getWorldRegistry().getAnyWorld();
         if (world == null) return;
-        Ref<EntityStore>   ref   = playerRef.getReference();
+        Ref<EntityStore> ref = playerRef.getReference();
+        if (ref == null) return;
         Store<EntityStore> store = world.getEntityStore().getStore();
-        player.getPageManager().openCustomPage(ref, store, new OptiPortalUIPage(playerRef, plugin, zones));
+        player.getPageManager().openCustomPage(ref, store,
+                new OptiPortalUIPage(playerRef, plugin));
     }
 }

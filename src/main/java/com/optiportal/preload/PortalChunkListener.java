@@ -39,6 +39,7 @@ public class PortalChunkListener {
     private final CacheManager cacheManager;
     private final WarmZoneManager warmZoneManager;
     private final PluginConfig config;
+    private final java.util.concurrent.Executor executor;
 
     /**
      * Reverse index: worldName → (packed chunkIndex → zoneId).
@@ -48,12 +49,21 @@ public class PortalChunkListener {
     private final ConcurrentHashMap<String, ConcurrentHashMap<Long, String>> reverseIndex
             = new ConcurrentHashMap<>();
 
+    /**
+     * In-memory cache of PortalEntry objects keyed by zone ID.
+     * Eliminates storage.loadById() calls on the hot chunk-load event path.
+     * Populated at construction, kept in sync on save/delete.
+     */
+    private final ConcurrentHashMap<String, PortalEntry> entryCache = new ConcurrentHashMap<>();
+
     public PortalChunkListener(StorageBackend storage, CacheManager cacheManager,
-                               WarmZoneManager warmZoneManager, PluginConfig config) {
+                               WarmZoneManager warmZoneManager, PluginConfig config,
+                               java.util.concurrent.Executor executor) {
         this.storage = storage;
         this.cacheManager = cacheManager;
         this.warmZoneManager = warmZoneManager;
         this.config = config;
+        this.executor = executor;
         buildReverseIndex();
     }
 
@@ -72,6 +82,7 @@ public class PortalChunkListener {
         int defaultRadius = config.getDefaultWarmRadius();
         for (PortalEntry entry : storage.loadAll()) {
             if (entry.isInstanced()) continue;
+            entryCache.put(entry.getId(), entry);
             int cx = ChunkPreloader.toChunkCoord(entry.getX());
             int cz = ChunkPreloader.toChunkCoord(entry.getZ());
             int rx = entry.resolvedRadiusX(defaultRadius);
@@ -168,12 +179,12 @@ public class PortalChunkListener {
         String zoneId = "portaldevice:" + world.getName() + ":" + chunkX + ":" + chunkZ;
 
         // If already registered, backfill destination UUID if not yet persisted
-        java.util.Optional<PortalEntry> existing = storage.loadById(zoneId);
-        if (existing.isPresent()) {
-            PortalEntry existingEntry = existing.get();
+        PortalEntry existingEntry = entryCache.get(zoneId);
+        if (existingEntry != null) {
             if (existingEntry.getDestinationWorldUuid() == null && device.getDestinationWorldUuid() != null) {
                 existingEntry.setDestinationWorldUuid(device.getDestinationWorldUuid());
-                storage.save(existingEntry);
+                entryCache.put(zoneId, existingEntry);
+                executor.execute(() -> storage.save(existingEntry));
                 LOG.fine(() -> "[OptiPortal] Backfilled destination UUID for existing zone: " + zoneId);
             }
             return;
@@ -185,7 +196,8 @@ public class PortalChunkListener {
         if (device.getDestinationWorldUuid() != null) {
             entry.setDestinationWorldUuid(device.getDestinationWorldUuid());
         }
-        storage.save(entry);
+        entryCache.put(zoneId, entry);
+        executor.execute(() -> storage.save(entry));
 
         // Keep reverse index in sync with new auto-registered zone (full footprint, not just centre)
         int defaultRadius = config.getDefaultWarmRadius();
@@ -229,15 +241,16 @@ public class PortalChunkListener {
         if (zoneId == null) return;
 
         // Guard against stale entries left by zones deleted without calling removeFromIndex
-        java.util.Optional<PortalEntry> entryOpt = storage.loadById(zoneId);
-        if (entryOpt.isEmpty()) {
+        PortalEntry entry = entryCache.get(zoneId);
+        if (entry == null) {
             worldIndex.remove(key);
             return;
         }
-        PortalEntry entry = entryOpt.get();
 
         // H2: read PortalDevice component directly to confirm/update destination UUID
-        if (entry.getType() == PortalEntry.EntryType.PORTAL) {
+        // Only scan when destination UUID is not yet known (Issue 3 optimization)
+        if (entry.getType() == PortalEntry.EntryType.PORTAL
+                && entry.getDestinationWorldUuid() == null) {
             try {
                 PortalDevice device = (PortalDevice) BlockModule.getComponent(
                         PortalDevice.getComponentType(),
@@ -247,9 +260,10 @@ public class PortalChunkListener {
                         (int) entry.getZ());
                 if (device != null) {
                     java.util.UUID destUuid = device.getDestinationWorldUuid();
-                    if (destUuid != null && !destUuid.equals(entry.getDestinationWorldUuid())) {
+                    if (destUuid != null) {
                         entry.setDestinationWorldUuid(destUuid);
-                        storage.save(entry);
+                        entryCache.put(entry.getId(), entry);
+                        executor.execute(() -> storage.save(entry));   // async — does not stall event handler
                         LOG.info("[OptiPortal] Updated destination UUID for zone " + zoneId + " → " + destUuid);
                     }
                     World destWorld = device.getDestinationWorld();
@@ -276,6 +290,7 @@ public class PortalChunkListener {
      * @param zoneId Zone ID to remove
      */
     public void removeFromIndex(String zoneId) {
+        entryCache.remove(zoneId);
         for (ConcurrentHashMap<Long, String> worldIndex : reverseIndex.values()) {
             worldIndex.entrySet().removeIf(entry -> entry.getValue().equals(zoneId));
         }

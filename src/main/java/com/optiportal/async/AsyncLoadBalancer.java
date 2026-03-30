@@ -34,7 +34,6 @@ public class AsyncLoadBalancer {
     // State tracking
     private final AtomicInteger activeOperations = new AtomicInteger(0);
     private final AtomicLong totalOperations = new AtomicLong(0);
-    private final AtomicLong totalExecutionTime = new AtomicLong(0);
     private final AtomicInteger currentBatchSize = new AtomicInteger(DEFAULT_BATCH_SIZE);
     private final AtomicInteger totalQueuedCount = new AtomicInteger(0);
     
@@ -259,7 +258,6 @@ public class AsyncLoadBalancer {
         return operation.get().whenComplete((result, ex) -> {
             long duration = System.currentTimeMillis() - startTime;
             activeOperations.decrementAndGet();
-            totalExecutionTime.addAndGet(duration);  // keep for LoadStats.totalOperations context
 
             // A2: Update EMA using lock-free CAS loop on emaBits.
             // α=0.1: new = 0.1*sample + 0.9*previous. Seed from 0 on first sample.

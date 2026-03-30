@@ -1,0 +1,14 @@
+Group {
+  LayoutMode: Left;
+  Anchor: (Horizontal: 6, Top: 3, Bottom: 3);
+
+  Label #EntryTier {
+    Style: (FontSize: 12, RenderBold: true);
+    Anchor: (Width: 70);
+  }
+
+  Label #EntryName {
+    Style: (FontSize: 13);
+    FlexWeight: 1;
+  }
+}

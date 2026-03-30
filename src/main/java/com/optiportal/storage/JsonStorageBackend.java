@@ -52,6 +52,9 @@ public class JsonStorageBackend implements StorageBackend {
     // In-memory map for fast access
     private final Map<String, PortalEntry> entries = new LinkedHashMap<>();
 
+    // Volatile cached snapshot for lock-free reads (Issue 2 optimization)
+    private volatile List<PortalEntry> cachedList = java.util.Collections.emptyList();
+
     // Optional cache updater for async invalidation
     private CacheUpdater cacheUpdater;
 
@@ -87,6 +90,8 @@ public class JsonStorageBackend implements StorageBackend {
             // Fresh install - write empty structure
             flush(List.of());
         }
+        // Initialize cachedList after loading
+        cachedList = java.util.Collections.unmodifiableList(new ArrayList<>(entries.values()));
     }
 
     private void loadFromDisk() {
@@ -124,6 +129,11 @@ public class JsonStorageBackend implements StorageBackend {
     }
 
     @Override
+    public List<PortalEntry> loadAllCached() {
+        return cachedList;
+    }
+
+    @Override
     public synchronized Optional<PortalEntry> loadById(String id) {
         return Optional.ofNullable(entries.get(id));
     }
@@ -135,6 +145,7 @@ public class JsonStorageBackend implements StorageBackend {
             entries.put(entry.getId(), entry);
             snapshot = new ArrayList<>(entries.values());
         }
+        cachedList = java.util.Collections.unmodifiableList(snapshot);
         flush(snapshot);
         if (cacheUpdater != null) {
             cacheUpdater.onUpdate(snapshot);
@@ -150,6 +161,7 @@ public class JsonStorageBackend implements StorageBackend {
             }
             snapshot = new ArrayList<>(entries.values());
         }
+        cachedList = java.util.Collections.unmodifiableList(snapshot);
         flush(snapshot);
         if (cacheUpdater != null) {
             cacheUpdater.onUpdate(snapshot);
@@ -165,6 +177,7 @@ public class JsonStorageBackend implements StorageBackend {
             }
         }
         if (snapshot != null) {
+            cachedList = java.util.Collections.unmodifiableList(snapshot);
             flush(snapshot);
             if (cacheUpdater != null) {
                 cacheUpdater.onUpdate(snapshot);
@@ -183,6 +196,7 @@ public class JsonStorageBackend implements StorageBackend {
         synchronized (this) {
             snapshot = new ArrayList<>(entries.values());
         }
+        cachedList = java.util.Collections.unmodifiableList(snapshot);
         flush(snapshot);
     }
 

@@ -16,6 +16,9 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
 import com.optiportal.config.PluginConfig;
 
 /**
@@ -25,6 +28,8 @@ import com.optiportal.config.PluginConfig;
  * SQLite/H2/MySQL have native WAL - this is mainly for JSON safety.
  */
 public class WalManager {
+
+    private static final Logger LOG = Logger.getLogger("OptiPortal");
 
     private final File walDir;
     private final File dataFolder;
@@ -41,7 +46,7 @@ public class WalManager {
         try {
             new File(walDir, sanitize(key) + ".wal").createNewFile();
         } catch (IOException e) {
-            System.err.println("[OptiPortal] WAL write failed for " + key + ": " + e.getMessage());
+            LOG.log(Level.WARNING, "[OptiPortal] WAL write failed for " + key, e);
         }
     }
 
@@ -121,10 +126,10 @@ public class WalManager {
                 File target = new File(dataFolder, bak.getName().replace(".bak", ""));
                 try {
                     Files.copy(bak.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
-                    System.out.println("[OptiPortal] Restored backup " + bak.getName() + " → " + target.getName());
+                    LOG.info("[OptiPortal] Restored backup " + bak.getName() + " → " + target.getName());
                     return true;
                 } catch (IOException e) {
-                    System.err.println("[OptiPortal] Backup restore failed: " + e.getMessage());
+                    LOG.log(Level.WARNING, "[OptiPortal] Backup restore failed", e);
                     return false;
                 }
             }

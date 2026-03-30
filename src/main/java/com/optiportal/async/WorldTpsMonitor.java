@@ -7,6 +7,7 @@ import java.util.logging.Logger;
 
 import com.hypixel.hytale.metrics.metric.HistoricMetric;
 import com.hypixel.hytale.server.core.universe.world.World;
+import com.optiportal.config.PluginConfig;
 import com.optiportal.preload.WorldRegistry;
 
 /**
@@ -42,10 +43,10 @@ public class WorldTpsMonitor {
     @Deprecated
     public static final double NOMINAL_TPS = HYTALE_TARGET_TPS;
 
-    /** TPS below this triggers minimum batch size. */
+    /** Default TPS threshold below which minimum batch size is used. Configurable via config.json tpsMonitor.lowThreshold. */
     public static final double TPS_LOW_THRESHOLD = 18.0;
 
-    /** TPS below this triggers queue-all mode. */
+    /** Default TPS threshold below which queue-all mode is used. Configurable via config.json tpsMonitor.criticalThreshold. */
     public static final double TPS_CRITICAL_THRESHOLD = 12.0;
 
     /** Sample interval in seconds. Shorter interval + EMA smoothing gives faster response
@@ -61,11 +62,24 @@ public class WorldTpsMonitor {
 
     private final WorldRegistry worldRegistry;
     private final ScheduledExecutorService executor;
+    private final double tpsLowThreshold;
+    private final double tpsCriticalThreshold;
     private volatile double currentTps = HYTALE_TARGET_TPS;
 
     public WorldTpsMonitor(WorldRegistry worldRegistry, ScheduledExecutorService executor) {
+        this(worldRegistry, executor, TPS_LOW_THRESHOLD, TPS_CRITICAL_THRESHOLD);
+    }
+
+    public WorldTpsMonitor(WorldRegistry worldRegistry, ScheduledExecutorService executor, PluginConfig config) {
+        this(worldRegistry, executor, config.getTpsLowThreshold(), config.getTpsCriticalThreshold());
+    }
+
+    private WorldTpsMonitor(WorldRegistry worldRegistry, ScheduledExecutorService executor,
+                            double tpsLowThreshold, double tpsCriticalThreshold) {
         this.worldRegistry = worldRegistry;
         this.executor = executor;
+        this.tpsLowThreshold = tpsLowThreshold;
+        this.tpsCriticalThreshold = tpsCriticalThreshold;
     }
 
     /**
@@ -114,10 +128,10 @@ public class WorldTpsMonitor {
 
         if (sampledCount > 0) {
             currentTps = EMA_ALPHA * minTps + (1.0 - EMA_ALPHA) * currentTps;
-            if (minTps < TPS_LOW_THRESHOLD) {
+            if (minTps < tpsLowThreshold) {
                 final double logTps = minTps;
                 LOG.fine(() -> "[OptiPortal] WorldTpsMonitor: TPS=" + String.format("%.1f", logTps)
-                        + " (below low threshold " + TPS_LOW_THRESHOLD + ")");
+                        + " (below low threshold " + tpsLowThreshold + ")");
             }
         }
     }
@@ -134,11 +148,10 @@ public class WorldTpsMonitor {
 
     /**
      * Returns true if the server is under load (TPS below low threshold).
-     *
-     * @return true if TPS < 18.0
+     * Threshold defaults to {@link #TPS_LOW_THRESHOLD} but can be overridden via config.
      */
     public boolean isServerUnderLoad() {
-        return currentTps < TPS_LOW_THRESHOLD;
+        return currentTps < tpsLowThreshold;
     }
 
     /**
@@ -155,12 +168,11 @@ public class WorldTpsMonitor {
     }
 
     /**
-     * Returns true if TPS is critically low (below 12.0) and all new chunk
-     * load operations should be queued rather than executed immediately.
-     *
-     * @return true if TPS < 12.0
+     * Returns true if TPS is critically low and all new chunk load operations
+     * should be queued rather than executed immediately.
+     * Threshold defaults to {@link #TPS_CRITICAL_THRESHOLD} but can be overridden via config.
      */
     public boolean isCriticallyLoaded() {
-        return currentTps < TPS_CRITICAL_THRESHOLD;
+        return currentTps < tpsCriticalThreshold;
     }
 }

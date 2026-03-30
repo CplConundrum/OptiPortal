@@ -133,7 +133,7 @@ public class KeepaliveManager {
     }
 
     private void pingTierInternal(CacheTier tier, String label) {
-        List<PortalEntry> entries = storage.loadAll();
+        List<PortalEntry> entries = storage.loadAllCached();
         int zoneCount = 0;
         int chunkCount = 0;
 
@@ -153,14 +153,14 @@ public class KeepaliveManager {
             chunkCount += (2 * radiusX + 1) * (2 * radiusZ + 1);
             zoneCount++;
 
-            // U2: Confirm chunk residency before pinging
-            // Check if chunks are actually loaded before attempting to ping them
+            // U2: Confirm chunk residency before pinging.
+            // Use CacheManager ownership as the residency signal — if OptiPortal's keepLoaded
+            // pin is still registered for a chunk, the chunk is engine-resident. If any chunk
+            // has lost its pin (e.g. evicted via onChunkEvicted), allChunksPresent goes false.
             boolean allChunksPresent = true;
             for (int dx = -radiusX; dx <= radiusX; dx++) {
                 for (int dz = -radiusZ; dz <= radiusZ; dz++) {
-                    long chunkIndex = ChunkUtil.indexChunk(cx + dx, cz + dz);
-                    // Use getNonTickingChunkAsync to check residency - if it returns null, chunk is not loaded
-                    if (world.getNonTickingChunkAsync(chunkIndex) == null) {
+                    if (!cacheManager.isChunkOwned(worldName, cx + dx, cz + dz)) {
                         allChunksPresent = false;
                         break;
                     }

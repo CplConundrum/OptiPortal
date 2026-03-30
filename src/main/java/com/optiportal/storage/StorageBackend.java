@@ -51,4 +51,13 @@ public interface StorageBackend {
      * Flush and close all connections/files cleanly.
      */
     void close();
+
+    /**
+     * Load all portal entries from a cached snapshot (no-lock read).
+     * Default implementation falls back to loadAll() for backends that don't cache.
+     * JsonStorageBackend overrides this to return a volatile cached snapshot.
+     */
+    default List<PortalEntry> loadAllCached() {
+        return loadAll();
+    }
 }

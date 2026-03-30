@@ -8,6 +8,8 @@ import java.io.IOException;
 import java.nio.file.*;
 import java.time.Instant;
 import java.util.List;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
  * Migrates portal data between storage backends.
@@ -27,6 +29,8 @@ import java.util.List;
  */
 public class StorageMigrator {
 
+    private static final Logger LOG = Logger.getLogger("OptiPortal");
+
     /**
      * Migrate all data from the previous backend into the already-initialized newBackend.
      *
@@ -38,27 +42,26 @@ public class StorageMigrator {
     public static boolean migrate(String previousType, StorageBackend newBackend, PluginConfig config) {
         StorageBackend oldBackend = StorageFactory.tryInit(previousType, config);
         if (oldBackend == null) {
-            System.err.println("[OptiPortal] Could not open previous backend (" + previousType
+            LOG.warning("[OptiPortal] Could not open previous backend (" + previousType
                     + ") — skipping migration, starting fresh.");
             return true; // treat as success so meta.txt gets updated
         }
 
         try {
             List<PortalEntry> entries = oldBackend.loadAll();
-            System.out.println("[OptiPortal] Migrating " + entries.size() + " entries from "
+            LOG.info("[OptiPortal] Migrating " + entries.size() + " entries from "
                     + previousType + " → " + newBackend.getBackendType() + "...");
 
             newBackend.saveAll(entries);
 
             backupOldData(previousType, config);
 
-            System.out.println("[OptiPortal] Migration complete. "
+            LOG.info("[OptiPortal] Migration complete. "
                     + entries.size() + " entries migrated to " + newBackend.getBackendType() + ".");
             return true;
 
         } catch (Exception e) {
-            System.err.println("[OptiPortal] Migration FAILED: " + e.getMessage());
-            e.printStackTrace();
+            LOG.log(Level.SEVERE, "[OptiPortal] Migration FAILED", e);
             return false;
         } finally {
             try { oldBackend.close(); } catch (Exception ignored) {}
@@ -84,10 +87,10 @@ public class StorageMigrator {
             case "H2"     -> safeCopy(new File(dir, "portal-data-h2.mv.db"),
                                       new File(dir, "portal-data-h2." + ts + ".migration-bak.mv.db"));
             case "MYSQL"  -> {
-                System.out.println("[OptiPortal] NOTE: MySQL remote database was NOT modified.");
-                System.out.println("[OptiPortal] Clean up the remote 'portal_entries' table manually if desired.");
+                LOG.info("[OptiPortal] NOTE: MySQL remote database was NOT modified.");
+                LOG.info("[OptiPortal] Clean up the remote 'portal_entries' table manually if desired.");
             }
-            default -> System.out.println("[OptiPortal] No backup action defined for backend type: " + backendType);
+            default -> LOG.info("[OptiPortal] No backup action defined for backend type: " + backendType);
         }
     }
 
@@ -95,9 +98,9 @@ public class StorageMigrator {
         if (!src.exists()) return;
         try {
             Files.copy(src.toPath(), dest.toPath(), StandardCopyOption.REPLACE_EXISTING);
-            System.out.println("[OptiPortal] Old data backed up → " + dest.getName());
+            LOG.info("[OptiPortal] Old data backed up → " + dest.getName());
         } catch (IOException e) {
-            System.err.println("[OptiPortal] Could not backup old data: " + e.getMessage());
+            LOG.log(Level.WARNING, "[OptiPortal] Could not backup old data", e);
         }
     }
 }

@@ -233,10 +233,12 @@ public class CacheManager {
             for (Long key : keys) {
                 Set<String> owners = worldMap.get(key);
                 if (owners != null) {
-                    owners.remove(zoneId);
+                    boolean removed = owners.remove(zoneId);
+                    if (removed) {
+                        tryReleaseKeepLoaded(worldName, (int)(long) key, (int)(key >>> 32));
+                    }
                     if (owners.isEmpty()) {
                         worldMap.remove(key, owners);
-                        tryReleaseKeepLoaded(worldName, (int)(long) key, (int)(key >>> 32));
                     }
                 }
             }
@@ -355,7 +357,8 @@ public class CacheManager {
                 } else {
                     zoneTiers.put(zoneId, CacheTier.COLD);
                     tierTimestamps.remove(zoneId);
-                    deregisterAllChunks(zoneId);
+                    final String decayedZone = zoneId;
+                    executor.submit(() -> deregisterAllChunks(decayedZone));   // non-blocking
                     LOG.fine(() -> "[OptiPortal] Tier decay: " + zoneId + " WARM → COLD");
                 }
             } else {
@@ -451,6 +454,63 @@ public class CacheManager {
             // SkipSentryException — world shutting down, engine is cleaning up chunks
             LOG.fine(() -> "[OptiPortal] addKeepLoadedAsync skipped (world shutting down): "
                     + worldName + ":" + cx + ":" + cz);
+        }
+    }
+
+    /**
+     * Batch variant of addKeepLoadedAsync — submits a single world.execute() task
+     * that calls addKeepLoaded() on multiple chunks. Reduces task submission overhead
+     * during zone registration when many chunks are already loaded.
+     */
+    private void addKeepLoadedBatchAsync(String worldName, java.util.List<Long> engineIndexes) {
+        com.hypixel.hytale.server.core.universe.world.World world = worldRegistry.getWorld(worldName);
+        if (world == null) return;
+        // Pre-filter to chunks that are actually in the store, before hitting the world thread
+        java.util.List<Long> present = new java.util.ArrayList<>(engineIndexes.size());
+        for (long idx : engineIndexes) {
+            if (world.getChunkStore().getChunkReference(idx) != null) {
+                present.add(idx);
+            }
+        }
+        if (present.isEmpty()) return;
+        try {
+            world.execute(() -> {
+                for (long idx : present) {
+                    com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk chunk =
+                            world.getChunkIfInMemory(idx);
+                    if (chunk != null) chunk.addKeepLoaded();
+                }
+            });
+        } catch (Exception e) {
+            // world shutting down
+        }
+    }
+
+    /**
+     * Batch variant of registerOwnership — registers ownership for multiple chunks
+     * in a single call, reducing world-thread task submissions. Used by ChunkPreloader
+     * when claiming already-loaded chunks during warm/predictive loads.
+     *
+     * @param zoneId Zone ID to register as owner
+     * @param world World name
+     * @param chunkCoords List of chunk coordinates [cx, cz] to register
+     */
+    public void registerOwnershipBatch(String zoneId, String world, java.util.List<int[]> chunkCoords) {
+        if (zoneId == null || chunkCoords == null || chunkCoords.isEmpty()) return;
+        
+        java.util.List<Long> engineIndexes = new java.util.ArrayList<>(chunkCoords.size());
+        for (int[] coord : chunkCoords) {
+            long key = packChunkIndex(coord[0], coord[1]);
+            boolean added = chunkOwnership.computeIfAbsent(world, w -> new ConcurrentHashMap<>())
+                                      .computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet())
+                                      .add(zoneId);
+            recordReverseOwnership(zoneId, world, key);
+            if (added) {
+                engineIndexes.add(ChunkUtil.indexChunk(coord[0], coord[1]));
+            }
+        }
+        if (!engineIndexes.isEmpty()) {
+            addKeepLoadedBatchAsync(world, engineIndexes);
         }
     }
 

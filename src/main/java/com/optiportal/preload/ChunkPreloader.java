@@ -189,13 +189,18 @@ public class ChunkPreloader {
             // Use density-sorted list so resident chunks are claimed first at zero IO cost (H5)
             List<int[]> allChunks = buildChunkListWithDensity(worldName, cx, cz, radius);
             List<int[]> toLoad = new ArrayList<>();
+            List<int[]> alreadyOwned = new ArrayList<>();
             for (int[] coord : allChunks) {
                 if (cacheManager.isChunkOwned(worldName, coord[0], coord[1])) {
-                    // Already loaded by another zone — just claim ownership
-                    if (zoneId != null) cacheManager.registerOwnership(zoneId, worldName, coord[0], coord[1]);
+                    // Already loaded by another zone — collect for batched ownership claim
+                    alreadyOwned.add(coord);
                 } else {
                     toLoad.add(coord);
                 }
+            }
+            // Batch-register ownership for already-owned chunks (Issue 4 fix)
+            if (zoneId != null && !alreadyOwned.isEmpty()) {
+                cacheManager.registerOwnershipBatch(zoneId, worldName, alreadyOwned);
             }
             int skipped = allChunks.size() - toLoad.size();
             if (skipped > 0 && toLoad.size() > 0) LOG.info(() -> "[OptiPortal] predictiveLoad " + zoneId + ": skipped " + skipped + " already-owned chunks");
@@ -320,12 +325,18 @@ public class ChunkPreloader {
         // Dedup: claim already-owned chunks, only load new ones
         List<int[]> allChunks = buildChunkListAsymmetric(cx, cz, radiusX, radiusZ);
         List<int[]> toLoad = new ArrayList<>();
+        List<int[]> alreadyOwned = new ArrayList<>();
         for (int[] coord : allChunks) {
             if (cacheManager.isChunkOwned(worldName, coord[0], coord[1])) {
-                if (zoneId != null) cacheManager.registerOwnership(zoneId, worldName, coord[0], coord[1]);
+                // Collect for batched ownership claim (Issue 4 fix)
+                alreadyOwned.add(coord);
             } else {
                 toLoad.add(coord);
             }
+        }
+        // Batch-register ownership for already-owned chunks (Issue 4 fix)
+        if (zoneId != null && !alreadyOwned.isEmpty()) {
+            cacheManager.registerOwnershipBatch(zoneId, worldName, alreadyOwned);
         }
         int skipped = allChunks.size() - toLoad.size();
         if (skipped > 0) LOG.info(() -> "[OptiPortal] warmLoad " + zoneId + ": skipped " + skipped + " already-owned chunks");

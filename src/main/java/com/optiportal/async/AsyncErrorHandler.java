@@ -137,8 +137,7 @@ public class AsyncErrorHandler {
      * @param operation The operation that failed
      */
     private void handleGenericWorldThreadError(Exception e, String operation) {
-        LOG.severe("World thread error for operation " + operation + ": " + e.getMessage());
-        e.printStackTrace();
+        LOG.log(java.util.logging.Level.SEVERE, e, () -> "World thread error for operation " + operation);
         
         circuitBreaker.recordFailure();
     }

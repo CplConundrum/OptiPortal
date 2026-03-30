@@ -2,6 +2,34 @@
 
 ---
 
+## [1.1.9] - 2026-03-27
+
+### Fixed
+
+- **BUG FIX — First-run startup failed with `FileNotFoundException` when the mod data folder did not exist**: On a fresh install, the plugin attempted to write a default `config.json` into `mods/Cpl_OptiPortal/` before that directory existed. `FileWriter` does not create missing parent directories, so the write failed immediately and the server could not start. The data folder is now created with `mkdirs()` before the file is written.
+
+---
+
+## [1.1.8] - 2026-03-26
+
+**Hytale Version `2026.03.26-89796e57b`**
+
+### Fixed
+
+- **BUG FIX — Retry failure map left empty inner entries in memory until world unload**: When all chunks in a preload zone recovered from failure and their individual failure records were cleared, the now-empty inner map for that world remained in the outer failure-timestamp map until the world was unloaded. On servers with many preload cycles over a long uptime this caused slow accumulation of empty map objects. Empty inner maps are now evicted from the outer map immediately when the last entry is removed.
+
+- **BUG FIX — Chunk load chain was executing on the world thread after the GC guard check**: When Guard 3 (GC detection) was active, the GC flag was read on the world thread as required, but the continuation that built and executed the load chain was also inheriting the world thread rather than handing off to the plugin executor. Spark profiling confirmed `buildLoadChain` and `loadChunkBatch` executing on `WorldThread - default`. The world thread was doing batch-building work and dispatching `getNonTickingChunkAsync` calls — work that belongs entirely on the plugin executor. The continuation now explicitly hands off to the plugin executor after the world-thread GC read, leaving the world thread free immediately after the one-shot flag is consumed.
+
+### Changed
+
+- **IMPROVEMENT — TPS monitor now reads actual tick duration directly from the server instead of inferring it from tick count samples**: Previously, the server performance monitor sampled `World.getTick()` on a background thread every second and divided the change in tick count by elapsed time to estimate TPS. This required a jitter guard to discard samples distorted by garbage collection pauses, and introduced up to one second of lag before a load spike was reflected in backpressure decisions. The monitor now reads the server's own tick-length measurement directly from the engine's `HistoricMetric`, which records the actual duration of each tick as it completes. The background sampling interval is retained for EMA smoothing across worlds, but the jitter guard, delta-tick arithmetic, and per-world tick count tracking have been removed.
+
+- **IMPROVEMENT — Chunk preloading is now deferred when a garbage collection ran on the world thread since the last tick**: Large GC pauses are one of the most common causes of sudden tick lag. Previously, a GC event would eventually be reflected in the TPS monitor after the next sample interval, and preloads triggered in that window could still submit chunk load tasks to an already-recovering world thread. The server's own GC detection flag is now checked before each preload batch is submitted. If it indicates a GC has run, the batch is deferred immediately without waiting for the TPS monitor to catch up.
+
+- **IMPROVEMENT — Preloading now enforces its own retry cooldown for recently-failed chunks**: As of Hytale 2026.03.26-89796e57b the server's internal chunk failure backoff uses a quadratic ramp, meaning a chunk that fails once is only suppressed for approximately one millisecond before the engine permits another load attempt. On servers where a preload zone contains a transiently-failing chunk, frequent portal approaches could cause OptiPortal to retry that chunk many times per second. OptiPortal now records the timestamp of each chunk load failure and skips that chunk for ten seconds after its last failure regardless of the engine's own backoff state. The record is cleared as soon as the chunk loads successfully and is evicted in full when its world unloads.
+
+---
+
 ## [1.1.7] - 2026-03-24
 
 ### Fixed
