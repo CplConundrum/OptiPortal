@@ -62,6 +62,9 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
 
     // Round-robin cursor for fair player batch selection
     private final AtomicInteger batchCursor = new AtomicInteger(0);
+
+    // Handle for the staggered position update task — cancelled in stop()
+    private volatile java.util.concurrent.ScheduledFuture<?> positionUpdateTask;
     
     public AsyncTeleportInterceptor(OptiPortal plugin, PluginConfig config,
                                    WarmZoneManager warmZoneManager,
@@ -174,13 +177,20 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
      * Start staggered position updates to reduce world thread impact.
      */
     private void startStaggeredPositionUpdates() {
-        getExecutor().scheduleAtFixedRate(() -> {
+        positionUpdateTask = getExecutor().scheduleAtFixedRate(() -> {
             try {
                 updatePlayerPositionsBatch();
             } catch (Exception e) {
-                LOG.warning("Error in staggered position update: " + e.getMessage());
+                LOG.warning(() -> "Error in staggered position update: " + e.getMessage());
             }
         }, 0, POSITION_UPDATE_INTERVAL_MS, TimeUnit.MILLISECONDS);
+    }
+
+    /** Cancel the staggered position update task. Call from plugin shutdown before executor.shutdown(). */
+    @Override
+    public void stop() {
+        java.util.concurrent.ScheduledFuture<?> task = positionUpdateTask;
+        if (task != null) task.cancel(false);
     }
     
     /**
@@ -222,7 +232,7 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
         // Advance cursor by one batch each call for round-robin fairness
         int start = Math.floorMod(batchCursor.getAndAdd(POSITION_UPDATE_BATCH_SIZE), total);
 
-        Queue<UUID> batch = new ArrayDeque<>(POSITION_UPDATE_BATCH_SIZE);
+        List<UUID> batch = new ArrayList<>(POSITION_UPDATE_BATCH_SIZE);
         for (int i = 0; i < total && batch.size() < POSITION_UPDATE_BATCH_SIZE; i++) {
             UUID playerId = allPlayers.get((start + i) % total);
             PlayerPositionCache cache = positionCaches.get(playerId);
@@ -231,7 +241,7 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
             }
         }
 
-        return new ArrayList<>(batch);
+        return batch;
     }
     
     /**
@@ -315,9 +325,6 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
                             if (best != null) {
                                 final PortalEntry fBest = best;
                                 learnPortalHotspot(wName, srcX, srcZ, fBest.getId());
-                                LOG.info(() -> "[OptiPortal] Async portal hotspot learned: ("
-                                        + (int) srcX + ", " + (int) srcZ + ") → "
-                                        + fBest.getId() + " in " + wName);
                             }
                         }, getExecutor()).exceptionally(ex -> null);
 

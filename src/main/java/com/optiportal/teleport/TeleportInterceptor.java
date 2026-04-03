@@ -6,6 +6,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
@@ -107,9 +108,15 @@ public class TeleportInterceptor {
      * Entries graduate to portalHotspots after HOTSPOT_CONFIDENCE_THRESHOLD observations.
      * Prevents one-off teleports (/tp home, admin commands) from creating false hotspots.
      */
-    private final ConcurrentHashMap<String, Integer> pendingHotspotCounts = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, PendingHotspot> pendingHotspotCounts = new ConcurrentHashMap<>();
 
-    private static final int HOTSPOT_CONFIDENCE_THRESHOLD = 3;
+    private ScheduledFuture<?> pollTask;
+    private ScheduledFuture<?> cleanupTask;
+
+    private static final int  HOTSPOT_CONFIDENCE_THRESHOLD  = 3;
+    private static final long PENDING_HOTSPOT_TTL_MS        = 7L  * 24 * 60 * 60 * 1000;
+    private static final long CONFIRMED_HOTSPOT_TTL_MS      = 30L * 24 * 60 * 60 * 1000;
+    private static final long HOTSPOT_CLEANUP_INTERVAL_H    = 24;
 
 
     public TeleportInterceptor(OptiPortal plugin, PluginConfig config,
@@ -132,7 +139,11 @@ public class TeleportInterceptor {
         // Poll TeleportRecord every second to detect walk-through portal teleports.
         // No portal-use event exists in Hytale for zone-trigger portals.
         int pollInterval = config.getPollIntervalSeconds();
-        executor.scheduleWithFixedDelay(this::pollTeleportRecords, pollInterval, pollInterval, TimeUnit.SECONDS);
+        pollTask = executor.scheduleWithFixedDelay(
+                this::pollTeleportRecords, pollInterval, pollInterval, TimeUnit.SECONDS);
+        cleanupTask = executor.scheduleWithFixedDelay(
+                this::cleanupStaleHotspots,
+                HOTSPOT_CLEANUP_INTERVAL_H, HOTSPOT_CLEANUP_INTERVAL_H, TimeUnit.HOURS);
     }
 
     // Protected getters for subclass access
@@ -418,9 +429,6 @@ public class TeleportInterceptor {
                                         if (best != null) {
                                             final PortalEntry fBest = best;
                                             learnPortalHotspot(jWorld, srcX, srcZ, fBest.getId());
-                                            LOG.info(() -> "[OptiPortal] Jump hotspot learned: ("
-                                                    + (int) srcX + ", " + (int) srcZ + ") → "
-                                                    + fBest.getId() + " in " + jWorld);
                                         } else {
                                             LOG.fine(() -> "[OptiPortal] Jump detected but no zone"
                                                     + " near (" + (int)dstX + ", " + (int)dstZ
@@ -860,11 +868,16 @@ public class TeleportInterceptor {
         ISpawnProvider spawnProvider = world.getWorldConfig().getSpawnProvider();
         if (spawnProvider == null) return;
 
+        // Guard against null UUID - ISpawnProvider.getSpawnPoint is a non-null API contract
+        if (playerUuid == null) {
+            LOG.fine(() -> "[OptiPortal] onPlayerConnect: null UUID, skipping spawn prewarm");
+            return;
+        }
+        // getSpawnPoint may throw if spawn not configured
         Transform spawnTransform;
         try {
             spawnTransform = spawnProvider.getSpawnPoint(world, playerUuid);
         } catch (Exception e) {
-            // getSpawnPoint may throw if playerUuid is null or spawn not configured
             return;
         }
         if (spawnTransform == null || spawnTransform.getPosition() == null) return;
@@ -893,9 +906,6 @@ public class TeleportInterceptor {
     }
 
     /**
-     * Remove a player's cached ref on disconnect.
-     */
-    /**
      * Look up a cached PlayerRef by UUID (populated on PlayerReadyEvent).
      * Returns null if the player is not online or not yet ready.
      */
@@ -903,11 +913,84 @@ public class TeleportInterceptor {
         return playerRefs.get(uuid);
     }
 
+    /** Cancel scheduled teleport polling and hotspot cleanup tasks. Subclasses that add their own resources should call super.stop(). */
+    public void stop() {
+        if (pollTask != null) {
+            pollTask.cancel(false);
+            pollTask = null;
+        }
+        if (cleanupTask != null) {
+            cleanupTask.cancel(false);
+            cleanupTask = null;
+        }
+    }
+
+    /**
+     * Called when a world is removed. Clears world-scoped hotspot state.
+     * @param worldName The name of the removed world
+     */
+    public void onWorldRemoved(String worldName) {
+        // Remove all confirmed hotspots for this world
+        portalHotspots.remove(worldName);
+        // Remove all pending hotspot keys that start with this world name
+        pendingHotspotCounts.keySet().removeIf(key -> key.startsWith(worldName + ":"));
+        LOG.fine(() -> "[OptiPortal] Cleared hotspot state for removed world: " + worldName);
+    }
+
+    /**
+     * Called when a portal is deleted. Removes related hotspot state.
+     * @param portalId The ID of the deleted portal
+     */
+    public void onPortalDeleted(String portalId) {
+        // Remove any pending hotspot keys that reference this portal as destination
+        pendingHotspotCounts.keySet().removeIf(key -> key.endsWith(":" + portalId));
+
+        // Remove confirmed hotspot entries that target this deleted portal
+        portalHotspots.forEach((world, list) ->
+                list.removeIf(h -> h.destZoneId.equals(portalId)));
+
+        // Drop empty world buckets so they do not accumulate after portal deletion.
+        portalHotspots.entrySet().removeIf(e -> e.getValue().isEmpty());
+
+        LOG.fine(() -> "[OptiPortal] Cleared pending and confirmed hotspot state for deleted portal: " + portalId);
+    }
+
+    /**
+     * Removes pending and confirmed hotspot entries that have not been observed
+     * within their respective TTL windows.
+     *
+     * Pending entries expire after {@value #PENDING_HOTSPOT_TTL_MS} ms.
+     * Confirmed entries expire after {@value #CONFIRMED_HOTSPOT_TTL_MS} ms.
+     *
+     * Both values use {@code lastSeenMs} — a real wall-clock timestamp updated
+     * on every observation — not observation counts.
+     *
+     * Scheduled automatically; also safe to call manually for testing.
+     */
+    public void cleanupStaleHotspots() {
+        long now             = System.currentTimeMillis();
+        long pendingCutoff   = now - PENDING_HOTSPOT_TTL_MS;
+        long confirmedCutoff = now - CONFIRMED_HOTSPOT_TTL_MS;
+
+        pendingHotspotCounts.entrySet().removeIf(e -> e.getValue().lastSeenMs < pendingCutoff);
+
+        portalHotspots.forEach((world, list) ->
+                list.removeIf(h -> h.lastSeenMs < confirmedCutoff));
+
+        // Drop empty world buckets so they do not accumulate for removed worlds.
+        portalHotspots.entrySet().removeIf(e -> e.getValue().isEmpty());
+
+        LOG.fine(() -> "[OptiPortal] Hotspot TTL cleanup complete:"
+                + " pending=" + pendingHotspotCounts.size()
+                + ", confirmed=" + portalHotspots.values().stream().mapToInt(java.util.List::size).sum());
+    }
+
     public void removePlayerRef(UUID uuid) {
         playerRefs.remove(uuid);
         cooldowns.remove(uuid);
         lastKnownPosition.remove(uuid);
         lastSeenTeleportNanos.remove(uuid);
+        pendingRespawnCapture.remove(uuid);
     }
 
     /**
@@ -1015,11 +1098,8 @@ public class TeleportInterceptor {
 
     /**
      * Record a source-portal position that links to a destination zone.
-     * Confirmed on first observation — tier promotion (WARM→HOT) is cheap and
-     * reversible, so no confidence threshold is needed here (unlike PortalLinkRegistry
-     * which gates persistent chunk loads behind 5 observations).
-     * Deduplicates by chunk bucket so position jitter across multiple runs doesn't
-     * add redundant entries.
+     * Hotspots are tracked by chunk bucket and require multiple observations before
+     * confirmation to filter one-off teleports and noisy position jumps.
      */
     protected void learnPortalHotspot(String sourceWorld, double sx, double sz, String destZoneId) {
         int chunkX = ChunkPreloader.toChunkCoord(sx);
@@ -1032,14 +1112,27 @@ public class TeleportInterceptor {
             for (PortalHotspot h : list) {
                 if (!h.destZoneId.equals(destZoneId)) continue;
                 if (ChunkPreloader.toChunkCoord(h.x) == chunkX
-                        && ChunkPreloader.toChunkCoord(h.z) == chunkZ) return;
+                        && ChunkPreloader.toChunkCoord(h.z) == chunkZ) {
+                    // Refresh staleness timer on re-observation of a confirmed hotspot.
+                    h.lastSeenMs = System.currentTimeMillis();
+                    LOG.fine(() -> "[OptiPortal] Hotspot re-observed: chunk (" + chunkX + ", " + chunkZ
+                            + ") in " + sourceWorld + " → " + destZoneId);
+                    return;
+                }
             }
         }
 
         // Require HOTSPOT_CONFIDENCE_THRESHOLD observations before confirming.
         // Prevents one-off teleports (/tp home, admin commands) from creating false hotspots.
         String key = sourceWorld + ":" + chunkX + ":" + chunkZ + ":" + destZoneId;
-        int count = pendingHotspotCounts.merge(key, 1, Integer::sum);
+        long now = System.currentTimeMillis();
+        PendingHotspot pending = pendingHotspotCounts.compute(key, (k, existing) -> {
+            if (existing == null) return new PendingHotspot(now);
+            existing.count++;
+            existing.lastSeenMs = now;
+            return existing;
+        });
+        int count = pending.count;
         if (count < HOTSPOT_CONFIDENCE_THRESHOLD) {
             LOG.fine(() -> "[OptiPortal] Hotspot pending: " + destZoneId
                     + " chunk (" + chunkX + ", " + chunkZ + ") in " + sourceWorld
@@ -1051,7 +1144,7 @@ public class TeleportInterceptor {
         pendingHotspotCounts.remove(key);
         portalHotspots.computeIfAbsent(sourceWorld,
                         k -> new java.util.concurrent.CopyOnWriteArrayList<>())
-                .add(new PortalHotspot(sx, sz, destZoneId));
+                .add(new PortalHotspot(sx, sz, destZoneId, System.currentTimeMillis()));
         LOG.info(() -> "[OptiPortal] Confirmed portal hotspot: chunk (" + chunkX + ", " + chunkZ
                 + ") in " + sourceWorld + " → " + destZoneId);
     }
@@ -1082,14 +1175,26 @@ public class TeleportInterceptor {
     // -------------------------------------------------------------------------
 
     /** Lightweight record of a learned source-portal position → destination zone mapping. */
+    private static final class PendingHotspot {
+        int  count;
+        long lastSeenMs;
+
+        PendingHotspot(long lastSeenMs) {
+            this.count      = 1;
+            this.lastSeenMs = lastSeenMs;
+        }
+    }
+
     private static class PortalHotspot {
         final double x, z;
         final String destZoneId;
+        volatile long lastSeenMs;
 
-        PortalHotspot(double x, double z, String destZoneId) {
-            this.x = x;
-            this.z = z;
+        PortalHotspot(double x, double z, String destZoneId, long lastSeenMs) {
+            this.x          = x;
+            this.z          = z;
             this.destZoneId = destZoneId;
+            this.lastSeenMs = lastSeenMs;
         }
     }
 

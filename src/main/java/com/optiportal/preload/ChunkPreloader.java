@@ -8,6 +8,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.logging.Logger;
 
@@ -148,7 +149,10 @@ public class ChunkPreloader {
             return relay;
         }
         // We own the slot — start the actual load and wire it to the relay.
-        CompletableFuture<Void> actual = loader.get();
+        // orTimeout ensures stale entries are evicted from inflightLoads if the
+        // world thread stalls and the load future never completes.
+        CompletableFuture<Void> actual = loader.get()
+                .orTimeout(120, TimeUnit.SECONDS);
         actual.whenComplete((v, ex) -> {
             if (ex != null) relay.completeExceptionally(ex);
             else relay.complete(null);
@@ -203,7 +207,7 @@ public class ChunkPreloader {
                 cacheManager.registerOwnershipBatch(zoneId, worldName, alreadyOwned);
             }
             int skipped = allChunks.size() - toLoad.size();
-            if (skipped > 0 && toLoad.size() > 0) LOG.info(() -> "[OptiPortal] predictiveLoad " + zoneId + ": skipped " + skipped + " already-owned chunks");
+            if (skipped > 0 && toLoad.size() > 0) LOG.fine(() -> "[OptiPortal] predictiveLoad " + zoneId + ": skipped " + skipped + " already-owned chunks");
 
             CompletableFuture<Void> future = toLoad.isEmpty()
                     ? CompletableFuture.completedFuture(null)
@@ -220,7 +224,7 @@ public class ChunkPreloader {
                 CompletableFuture<Void> chainedFuture = future.thenRunAsync(() -> {
                     cacheManager.setZoneTier(zid, com.optiportal.model.CacheTier.HOT);
                     if (loadedCount > 0) {
-                        LOG.info(() -> "[OptiPortal] predictiveLoad complete: " + zid + " → HOT (loaded=" + loadedCount + " shared=" + skipped + ")");
+                        LOG.fine(() -> "[OptiPortal] predictiveLoad complete: " + zid + " → HOT (loaded=" + loadedCount + " shared=" + skipped + ")");
                     }
                     // Update entry stats using total chunk count (not just newly loaded),
                     // so shared-chunk loads still record correct RAM and preload count.
@@ -339,7 +343,7 @@ public class ChunkPreloader {
             cacheManager.registerOwnershipBatch(zoneId, worldName, alreadyOwned);
         }
         int skipped = allChunks.size() - toLoad.size();
-        if (skipped > 0) LOG.info(() -> "[OptiPortal] warmLoad " + zoneId + ": skipped " + skipped + " already-owned chunks");
+        if (skipped > 0) LOG.fine(() -> "[OptiPortal] warmLoad " + zoneId + ": skipped " + skipped + " already-owned chunks");
 
         CompletableFuture<Void> future = toLoad.isEmpty()
                 ? CompletableFuture.completedFuture(null)
@@ -352,7 +356,7 @@ public class ChunkPreloader {
             final long startTime = System.nanoTime();
             // D4 + U1: thenRunAsync dispatches to executor; does not fire on failed future.
             CompletableFuture<Void> chainedFuture = future.thenRunAsync(() -> {
-                LOG.info(() -> "[OptiPortal] warmLoad complete: " + zid + " (loaded=" + loadedCount + " shared=" + skipped + ")");
+                LOG.fine(() -> "[OptiPortal] warmLoad complete: " + zid + " (loaded=" + loadedCount + " shared=" + skipped + ")");
                 // Update entry stats using total chunk count so shared-chunk loads
                 // still record correct RAM. Save so the UI reflects updated values.
                 Optional<PortalEntry> entryOpt = storage.loadById(zid);
@@ -406,8 +410,16 @@ public class ChunkPreloader {
     // --- Enhanced predictive loading using density functions ---
 
     /**
-     * Enhanced predictive load using density functions for better chunk prioritization.
-     * This method sorts chunks by terrain complexity to load more important areas first.
+     * Fire-and-forget predictive load using density-priority ordering.
+     *
+     * Chunks are sorted by {@link #buildChunkListWithDensity} (Chebyshev distance,
+     * already-resident first, backoff-blocked last) and passed directly to
+     * {@link #loadChunks}. Unlike {@link #predictiveLoad}, this method does NOT
+     * register a zoneId, so no ownership pin, zone tier, or entry stats are updated.
+     * It is appropriate for unkeyed speculative loads where ownership tracking is
+     * unnecessary (e.g. corridor pre-warming by topology, not by zone).
+     *
+     * Callers that need ownership tracking should use {@link #predictiveLoad} instead.
      */
     public CompletableFuture<Void> enhancedPredictiveLoad(String worldName, int cx, int cz, int radius) {
         World world = worldRegistry.getWorld(worldName);
@@ -511,19 +523,6 @@ public class ChunkPreloader {
     // -------------------------------------------------------------------------
     // Internal ring-loading logic
     // -------------------------------------------------------------------------
-
-    /** Build the full flat list of chunk coords within radius (no ring split). */
-    private List<int[]> buildChunkList(int cx, int cz, int radius) {
-        List<int[]> list = new ArrayList<>((2 * radius + 1) * (2 * radius + 1));
-        for (int dx = -radius; dx <= radius; dx++) {
-            for (int dz = -radius; dz <= radius; dz++) {
-                list.add(new int[]{cx + dx, cz + dz});
-            }
-        }
-        // Sort centre-outward
-        list.sort(Comparator.comparingInt(c -> Math.abs(c[0] - cx) + Math.abs(c[1] - cz)));
-        return list;
-    }
 
     /** Build the full flat list of chunk coords within asymmetric X/Z radii. */
     private List<int[]> buildChunkListAsymmetric(int cx, int cz, int radiusX, int radiusZ) {

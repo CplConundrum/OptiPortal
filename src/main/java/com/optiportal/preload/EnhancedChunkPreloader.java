@@ -88,26 +88,32 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
     }
 
     /**
-     * TPS-adaptive batch size: halves under low TPS to avoid amplifying server load.
+     * TPS-adaptive batch size with three tiers:
+     *   critical  (TPS < criticalThreshold): batch = 1  — server is struggling, go minimal
+     *   low       (TPS < lowThreshold):      batch / 2  — server under load, ease off
+     *   normal    (TPS >= lowThreshold):     full batch
      */
     @Override
     protected int getEffectiveBatchSize(String worldName) {
         WorldTpsMonitor mon = this.tpsMonitor;
-        if (mon != null && mon.isServerUnderLoad()) {
-            return Math.max(1, getConfig().getWarmBatchSize() / 2);
-        }
+        if (mon == null) return getConfig().getWarmBatchSize();
+        if (mon.isCriticallyLoaded()) return 1;
+        if (mon.isServerUnderLoad()) return Math.max(1, getConfig().getWarmBatchSize() / 2);
         return getConfig().getWarmBatchSize();
     }
 
     /**
-     * TPS-adaptive inter-batch delay: doubles under low TPS to give the server breathing room.
+     * TPS-adaptive inter-batch delay with three tiers:
+     *   critical  (TPS < criticalThreshold): delay × 4  — server is struggling, slow way down
+     *   low       (TPS < lowThreshold):      delay × 2  — server under load, give breathing room
+     *   normal    (TPS >= lowThreshold):     base delay
      */
     @Override
     protected int getEffectiveBatchDelay(String worldName) {
         WorldTpsMonitor mon = this.tpsMonitor;
-        if (mon != null && mon.isServerUnderLoad()) {
-            return getConfig().getWarmBatchDelayMs() * 2;
-        }
+        if (mon == null) return getConfig().getWarmBatchDelayMs();
+        if (mon.isCriticallyLoaded()) return getConfig().getWarmBatchDelayMs() * 4;
+        if (mon.isServerUnderLoad()) return getConfig().getWarmBatchDelayMs() * 2;
         return getConfig().getWarmBatchDelayMs();
     }
 

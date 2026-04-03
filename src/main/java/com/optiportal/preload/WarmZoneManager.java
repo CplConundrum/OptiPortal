@@ -6,7 +6,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
@@ -59,9 +58,6 @@ public class WarmZoneManager {
     private final AtomicBoolean worldsReady = new AtomicBoolean(false);
     // Guards runStagedLoad — only one execution allowed, ever.
     private final AtomicBoolean stagedLoadStarted = new AtomicBoolean(false);
-
-    // Pending zones to load once worlds become ready (if startStagedLoad fires early)
-    private final List<PortalEntry> pendingLoad = new CopyOnWriteArrayList<>();
 
     public WarmZoneManager(PluginConfig config, StorageBackend storage,
                            CacheManager cacheManager, ScheduledExecutorService executor) {
@@ -313,7 +309,7 @@ public class WarmZoneManager {
         int radiusX = resolveRadiusX(entry);
         int radiusZ = resolveRadiusZ(entry);
 
-        LOG.info(() -> "[OptiPortal] Loading WARM zone: " + entry.getId()
+        LOG.fine(() -> "[OptiPortal] Loading WARM zone: " + entry.getId()
                 + " world=" + entry.getWorld()
                 + " cx=" + cx + " cz=" + cz + " rx=" + radiusX + " rz=" + radiusZ);
 
@@ -332,10 +328,10 @@ public class WarmZoneManager {
                     boolean isEternal = zoneWorld != null && !zoneWorld.getWorldConfig().canUnloadChunks();
                     if (isEternal) {
                         cacheManager.markNoDecay(entry.getId());
-                        LOG.info(() -> "[OptiPortal] Zone '" + entry.getId() + "' in eternal world — no-decay exempted.");
+                        LOG.fine(() -> "[OptiPortal] Zone '" + entry.getId() + "' in eternal world — no-decay exempted.");
                     } else if (entry.getStrategy() == WarmStrategy.WARM) {
                         cacheManager.markWarmFloor(entry.getId());
-                        LOG.info(() -> "[OptiPortal] Zone '" + entry.getId() + "' marked WARM floor (strategy=WARM).");
+                        LOG.fine(() -> "[OptiPortal] Zone '" + entry.getId() + "' marked WARM floor (strategy=WARM).");
                     }
                     // Heap-delta measurement is unreliable on a live server (GC + other plugins).
                     // Use estimate for both fields; TODO: instrument via chunk object sizing.
@@ -345,7 +341,7 @@ public class WarmZoneManager {
                         chunkPreloader.updateEntryStats(loaded, chunkCount);
                         storage.save(loaded);
                     });
-                    LOG.info(() -> "[OptiPortal] WARM zone loaded: " + entry.getId()
+                    LOG.fine(() -> "[OptiPortal] WARM zone loaded: " + entry.getId()
                             + " est=" + String.format("%.1f", estimatedMB) + "MB");
                 }, executor)
                 .exceptionally(ex -> {
@@ -367,8 +363,6 @@ public class WarmZoneManager {
         storage.save(entry);
         if (worldsReady.get()) {
             loadWarmZone(entry);
-        } else {
-            pendingLoad.add(entry);
         }
     }
 

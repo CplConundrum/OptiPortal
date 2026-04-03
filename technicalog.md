@@ -6,6 +6,567 @@ mirror the version numbers in `changelog.md`.
 
 ---
 
+## [1.2.0] - 2026-03-29
+
+---
+
+### Per-zone pin model not applied to releaseZoneChunks
+
+**File:** `CacheManager.java`
+
+**Root cause:**
+`deregisterAllChunks` was updated to per-zone pinning: each zone holds its own independent
+`addKeepLoaded` pin and must call `tryReleaseKeepLoaded` when it deregisters, regardless of
+whether other zones still own the same chunk. `releaseZoneChunks` — the path used when a zone
+is explicitly deleted — was not updated to match. It called `owners.remove(zoneId)` without
+capturing the return value, then only called `tryReleaseKeepLoaded` when `owners.isEmpty()`.
+This is the old single-pin model. A deleted zone's pin was only released if it happened to be
+the last owner, leaving phantom pins that kept chunks in memory past their intended lifetime.
+A secondary issue: if a zone was double-deleted, `owners.remove()` would return false (zone
+already absent) but `owners.isEmpty()` could be true for unrelated reasons, causing a spurious
+`tryReleaseKeepLoaded` on a chunk the zone never owned.
+
+**Fix:**
+Capture `boolean removed = owners.remove(zoneId)` and call `tryReleaseKeepLoaded` when
+`removed == true`. `worldMap.remove(key, owners)` is unchanged and still fires when the set
+becomes empty — these two conditions are now independent.
+
+**Threading:** `ConcurrentHashMap.newKeySet().remove()` is atomic. `worldMap.remove(key, owners)`
+is the CAS overload and only removes the entry if the value reference still matches, preventing
+accidental removal of a replacement set added by a concurrent `registerOwnership`.
+
+---
+
+### RetryPolicy leaked a thread pool when schedule() threw
+
+**File:** `RetryPolicy.java` — base class and `CustomRetryPolicy` inner class (two identical sites)
+
+**Root cause:**
+When no external `ScheduledExecutorService` is provided, the code creates a local one-thread
+pool per retry delay. The pool is shut down inside the `whenComplete` callback after the
+retried operation finishes. If `schedule()` itself throws (e.g. `RejectedExecutionException`),
+execution jumps directly to the catch block, which called `future.completeExceptionally(e)`
+and returned. The local pool was never shut down. Repeated retry failures at the scheduling
+stage accumulated one abandoned thread per attempt indefinitely.
+
+**Fix:**
+Added `defaultExecutor.shutdownNow()` as the first statement in both catch blocks. `shutdownNow`
+is used rather than `shutdown` because if `schedule()` threw, no task was ever submitted, so
+there is nothing to wait for.
+
+**Threading:** No race with the happy-path `shutdown()` inside `whenComplete` — if `schedule()`
+threw, the Runnable was never submitted and `whenComplete` will never fire on this executor.
+
+---
+
+### KeepaliveManager residency check always evaluated to true
+
+**File:** `KeepaliveManager.java`
+
+**Root cause:**
+The residency check loop called `world.getNonTickingChunkAsync(chunkIndex)` and compared the
+result to `null`. `getNonTickingChunkAsync` returns a `CompletableFuture<WorldChunk>` — the
+future object itself is never null (it either resolves to the chunk or to null, but the
+reference to the future is always non-null). The `== null` check was therefore always false,
+`allChunksPresent` was always true, and the HOT→WARM demotion branch (which fires when any
+chunk in the zone is no longer resident) never executed. HOT zones with evicted chunks were
+never demoted.
+
+**Fix:**
+Replaced the API call with `cacheManager.isChunkOwned(worldName, cx + dx, cz + dz)`.
+OptiPortal's ownership map is the correct residency signal: `onChunkEvicted` removes chunks
+from the map when the engine evicts them, so `isChunkOwned` returning false means the chunk
+is no longer engine-resident. This avoids a world API call entirely and reads only
+ConcurrentHashMap state.
+
+**Threading:** `isChunkOwned` reads `chunkOwnership` via ConcurrentHashMap, safe from any
+thread. `onChunkEvicted` removes the entry under the assumption that it runs on the world
+thread; the two operations do not hold a common lock and a brief window where `isChunkOwned`
+returns true for a chunk that is being evicted is acceptable — it results in a missed demotion
+on this tick, caught on the next keepalive cycle.
+
+---
+
+### Dead code: totalExecutionTime accumulated but never read
+
+**File:** `AsyncLoadBalancer.java`
+
+**Root cause:**
+`totalExecutionTime` (AtomicLong) was incremented on every async task completion. The comment
+claimed it fed `LoadStats.totalOperations`, which is incorrect — `totalOperations` is a
+separate `AtomicLong` incremented via `totalOperations.incrementAndGet()`. `totalExecutionTime`
+had no getter, was not included in `LoadStats`, and was not logged anywhere. It consumed a
+CAS operation on every task completion with no observable effect.
+
+**Fix:** Field and usage removed entirely.
+
+---
+
+### storage.loadById() called on every chunk-load event for known zones
+
+**File:** `PortalChunkListener.java`
+
+**Root cause:**
+`promoteColdZones()` is invoked from `onChunkPreLoad` for every chunk that loads anywhere in
+a registered world. After the reverse-index lookup resolved a zone ID, the code called
+`storage.loadById(zoneId)` as a stale-entry guard. `loadById` acquires a `synchronized` lock
+on the storage backend's `LinkedHashMap`. On a busy server where many chunks load per second
+in portal-zone areas, this lock was acquired on every such event. Additionally, when
+`promoteColdZones` needed to persist a destination UUID update, it called `storage.save()`
+synchronously, which includes an fsync to disk. This stalled the chunk-load event handler for
+the full duration of the disk write.
+
+`autoRegisterPortalDevice()` had the same pattern: `storage.loadById()` to check for an
+existing registration, and a synchronous `storage.save()` on the registration path.
+
+**Fix:**
+Added an `entryCache` (`ConcurrentHashMap<String, PortalEntry>`) populated at construction
+from `storage.loadAll()` and kept in sync on all mutation paths (`autoRegisterPortalDevice`,
+`removeFromIndex`). `promoteColdZones` and `autoRegisterPortalDevice` now call
+`entryCache.get()` — a single `ConcurrentHashMap.get()` with no lock. All `storage.save()`
+calls on the event-handler path are dispatched to a background executor.
+
+**Threading:** `entryCache` is a `ConcurrentHashMap` — all get/put/remove operations are
+atomic. Mutations to a `PortalEntry` object (e.g. `setDestinationWorldUuid`) happen on the
+event thread before `entryCache.put` makes the updated reference visible; the async
+`storage.save` captures the entry reference and reads it on the background thread after the
+mutation is complete.
+
+---
+
+### BlockModule.getComponent() scanned on every load of a portal-zone chunk
+
+**File:** `PortalChunkListener.java`
+
+**Root cause:**
+Inside `promoteColdZones`, the `BlockModule.getComponent()` call to read the `PortalDevice`
+component fired unconditionally for every chunk load that hit a PORTAL-type zone, regardless
+of whether the destination UUID was already known. Once the UUID is stored on the `PortalEntry`,
+the scan can never produce new information — the destination does not change in normal
+operation.
+
+**Fix:**
+The `BlockModule.getComponent()` call is now guarded by
+`entry.getDestinationWorldUuid() == null`. Once the UUID is recorded (either at first load or
+via the async save path), all subsequent chunk-load events skip the block scan entirely.
+
+---
+
+### storage.loadAll() called on every keepalive cycle
+
+**File:** `KeepaliveManager.java`, `JsonStorageBackend.java`, `StorageBackend.java`
+
+**Root cause:**
+`pingTierInternal()` called `storage.loadAll()` at the start of every HOT, WARM, and COLD
+keepalive tick. `JsonStorageBackend.loadAll()` acquires a `synchronized` lock and copies the
+entire `LinkedHashMap` into a new `ArrayList`. The lock contends with any concurrent
+`save()` or `loadById()` call for the full copy duration.
+
+**Fix:**
+Added `volatile List<PortalEntry> cachedList` to `JsonStorageBackend`, initialised at startup
+and updated to `Collections.unmodifiableList(snapshot)` inside every write method (`save`,
+`saveAll`, `delete`, `close`) immediately after the snapshot is taken — before the disk flush,
+while the snapshot reference is still on the stack. `loadAllCached()` returns the volatile
+field directly with no lock and no allocation. `StorageBackend` interface exposes a default
+`loadAllCached()` that falls back to `loadAll()` for SQL backends. `KeepaliveManager` uses
+`loadAllCached()`.
+
+**Threading:** The volatile write in `save()` (and other mutating methods) is performed after
+the `synchronized` block, so the new list is always a complete, consistent snapshot. A reader
+calling `loadAllCached()` concurrently with a write may see either the old or new snapshot —
+both are valid immutable lists. Missing a single write by one keepalive cycle has no
+correctness consequence.
+
+---
+
+### addKeepLoaded submitted one world-thread task per chunk during zone registration
+
+**File:** `CacheManager.java`, `ChunkPreloader.java`
+
+**Root cause:**
+When a new zone claimed chunks that were already loaded in memory (the dedup path),
+`registerOwnership(zoneId, world, cx, cz)` was called once per chunk. Each call submitted an
+independent `world.execute()` task containing a single `chunk.addKeepLoaded()` call. For a
+zone with radius 10, up to 441 separate world-thread tasks were enqueued in rapid succession
+during registration. Each task involves: queue insertion, world-thread dequeue, a map lookup
+in `getChunkIfInMemory`, a counter increment, and GC-visible object allocation for the lambda.
+
+**Fix:**
+Added `addKeepLoadedBatchAsync(String worldName, List<Long> engineIndexes)` which pre-filters
+chunks via `world.getChunkStore().getChunkReference()` off the world thread, then submits one
+`world.execute()` task that loops over the filtered list. Added `registerOwnershipBatch()` as
+the public entry point that collects newly-added engine indexes and calls the batch method once.
+`ChunkPreloader`'s predictiveLoad and warmLoad dedup paths now collect already-owned chunk
+coordinates into a list and call `registerOwnershipBatch` after the loop rather than calling
+`registerOwnership` per chunk. `EnhancedChunkPreloader`'s per-chunk async completion callbacks
+retain individual calls — collecting across independent futures would require a fan-in
+coordinator and the benefit is smaller since those callbacks fire after actual IO, not in a
+tight synchronous loop.
+
+**Threading:** `world.getChunkStore().getChunkReference()` is called off the world thread in
+the pre-filter step. This is a read-only store probe and matches the same pattern used in the
+existing single-chunk `addKeepLoadedAsync`. `getChunkIfInMemory()` inside the world-thread
+lambda is the authoritative check.
+
+---
+
+### decayTiersInternal blocked the scheduler thread during bulk chunk release
+
+**File:** `CacheManager.java`
+
+**Root cause:**
+When a WARM zone decayed to COLD in `decayTiersInternal()`, `deregisterAllChunks(zoneId)` was
+called inline on the `ScheduledExecutorService` thread. `deregisterAllChunks` traverses
+`zoneToChunks` and `chunkOwnership` — O(radius²) ConcurrentHashMap operations — and calls
+`tryReleaseKeepLoaded` for every chunk, each of which dispatches a `world.execute()` task.
+On a server that had been offline for some time with many WARM zones, all zones could decay
+simultaneously on the first 10-second check after startup, blocking the scheduler thread for
+the full duration of all deregistrations sequentially.
+
+**Fix:**
+Changed the call to `executor.submit(() -> deregisterAllChunks(decayedZone))`. The tier state
+(`zoneTiers.put(zoneId, CacheTier.COLD)` and `tierTimestamps.remove(zoneId)`) is committed
+before the submit, so the next decay check will not re-process this zone. The actual chunk
+release runs on a pooled thread.
+
+**Threading:** `deregisterAllChunks` only reads and mutates `chunkOwnership`, `zoneToChunks`,
+and calls `tryReleaseKeepLoaded` — none of which are guarded by the same lock as the decay
+check. Running it on a pool thread introduces no new contention. Multiple concurrent
+deregistrations (one per decaying zone) are safe because `ConcurrentHashMap` operations are
+individually atomic and `tryReleaseKeepLoaded` dispatches to the world thread rather than
+holding any lock.
+
+---
+
+### CacheManager.setZoneTier() synchronized block caused WorldThread contention
+
+**File:** `CacheManager.java`
+
+**Root cause:**
+The fix for the `saveRegistry()` dual-map snapshot race (see below) introduced a
+`synchronized(this)` block inside `setZoneTier()`. This method is called from at least 9 hot
+paths: every teleport detection in `TeleportInterceptor` and `AsyncTeleportInterceptor`, every
+chunk load completion in `ChunkPreloader` and `EnhancedChunkPreloader`, every keepalive
+heartbeat, and every `WarmZoneManager.serializeAll()`. All of these previously ran concurrently
+on their respective threads. After the change, every caller blocked on the same monitor, turning
+concurrent zone tier updates into a serialized queue. WorldThread CPU rose from ~8-10% baseline
+to ~25% on startup and ~16-18% steady-state.
+
+**Fix:**
+Replaced `synchronized(this)` with a `ReadWriteLock` (`tierLock`). `setZoneTier()` holds
+`tierLock.readLock()` — multiple concurrent callers proceed in parallel without blocking each
+other, since each call writes to a different key in `ConcurrentHashMap`. `saveRegistry()` holds
+`tierLock.writeLock()` — it pauses new writers only for the duration of two in-memory map
+copies (~microseconds), then releases. The write lock is never held during the `walManager`
+disk write, so IO does not contribute to lock contention.
+
+**Threading note:** The name "read lock for writes" is counterintuitive but correct here. The
+`ReadWriteLock` contract is: multiple readers can hold the read lock simultaneously; the write
+lock is exclusive. `setZoneTier()` callers are "readers" in the sense that they don't need
+mutual exclusion from each other — they only need to exclude `saveRegistry()` from observing a
+half-written state. `saveRegistry()` is the "writer" that needs a stable view of both maps.
+
+**Outcome:** WorldThread CPU dropped to ~6-7% steady-state — below the pre-optimization
+baseline of ~8-10%, due to the combined effect of this fix and the SQL in-memory cache
+eliminating background DB round-trips.
+
+---
+
+### SQL storage backends called loadAll() after every write
+
+**File:** `AbstractSqlStorageBackend.java`
+
+**Root cause:**
+`save()`, `saveAll()`, and `delete()` each ended with `cacheUpdater.onUpdate(loadAll())`.
+`loadAll()` executes `SELECT * FROM portal_entries`, fetches the full result set, maps each row
+to a `PortalEntry`, and returns an `ArrayList`. This meant every single portal mutation — even
+during the migration path or bulk `saveAll()` — triggered a full table scan, regardless of how
+many rows were in the table. There was also a correctness window: another thread could write
+between the `executeUpdate()` completing and the `loadAll()` query executing, causing the cache
+to reflect a different state from what the caller just wrote.
+
+The JSON backend had already solved this with `volatile List<PortalEntry> cachedList` built from
+its in-memory `LinkedHashMap` snapshot — the SQL backends had no equivalent.
+
+**Fix:**
+Added `LinkedHashMap<String, PortalEntry> memEntries`, `ConcurrentHashMap<String, PortalEntry>
+memIndex`, and `volatile List<PortalEntry> cachedList` to `AbstractSqlStorageBackend`. A
+`hydrateMemory()` method reads the database exactly once at `init()` and populates the map.
+`save()`, `saveAll()`, and `delete()` update `memEntries` and `memIndex` inside a `synchronized`
+block, rebuild `cachedList` from the map, then pass that snapshot to `cacheUpdater.onUpdate()`.
+No additional database read occurs. `loadAllCached()` is overridden to return the volatile field
+directly. The database remains authoritative — on restart `hydrateMemory()` re-reads it.
+
+**Threading:** The `synchronized` block covers only `memEntries`, `memIndex`, and the snapshot
+rebuild — all fast in-memory operations. The database write happens before the lock is acquired,
+so IO does not block concurrent readers. The volatile write to `cachedList` after the
+`synchronized` block ensures visibility to threads calling `loadAllCached()` without a lock.
+
+---
+
+### SQL save failures silently notified the cache updater
+
+**File:** `AbstractSqlStorageBackend.java`
+
+**Root cause:**
+The `catch (SQLException e)` blocks in `save()`, `saveAll()`, and `delete()` logged the error
+and returned normally. Execution then fell through to the `cacheUpdater.onUpdate(loadAll())`
+call unconditionally. The cache was updated with the current database state (not including the
+failed write), while the caller had no indication that the write had failed. This could cause
+the in-memory state diverged from what the caller expected to be persisted.
+
+**Fix:**
+Introduced a `boolean success` flag set to `true` only when `executeUpdate()` or
+`executeBatch()`/`commit()` complete without throwing. The `cacheUpdater` block and the
+in-memory map update are guarded by `if (success)`. Failed writes produce a log warning and
+return without touching the cache.
+
+---
+
+### CacheManager.saveRegistry() snapshotted tier and timestamp maps in separate passes
+
+**File:** `CacheManager.java`
+
+**Root cause:**
+`saveRegistry()` iterated over `zoneTiers` (a `ConcurrentHashMap`) to build `tierSnapshot`,
+then copied `tierTimestamps` into `tsSnapshot`. Between these two iterations, `setZoneTier()`
+could run on another thread: it writes to `zoneTiers` first, then writes to `tierTimestamps`.
+A window existed where `tierSnapshot` contained the new tier for a zone but `tsSnapshot` was
+copied before the matching timestamp was written, resulting in a serialized snapshot where the
+tier and its timestamp are inconsistent.
+
+On restart, `loadRegistry()` reads this snapshot. A zone with a HOT or WARM tier but no
+timestamp would have a default timestamp of 0 (epoch), causing immediate decay. A zone with a
+timestamp but a stale COLD tier would never receive a decay check.
+
+**Fix:**
+Both map iterations are now inside a `synchronized (this)` block. `setZoneTier()` is also
+synchronized on the same monitor, so either the full tier+timestamp write is visible to the
+snapshot or neither is. The synchronized section contains only in-memory map operations and is
+non-blocking.
+
+**Threading:** `zoneTiers` and `tierTimestamps` are `ConcurrentHashMap`s — their individual
+operations remain atomic for callers that do not need cross-map consistency. The `synchronized`
+block is only required for the snapshot pair and the dual-write in `setZoneTier`. Reads of
+individual fields (e.g. `zoneTiers.get(id)` for tier checks) do not need the lock and are
+unaffected.
+
+---
+
+### JsonStorageBackend.loadFromDisk() could recurse indefinitely on double-corrupt data
+
+**File:** `JsonStorageBackend.java`
+
+**Root cause:**
+When `portal-data.json` failed to parse, the catch block copied `portal-data.json.bak` over the
+primary file and called `loadFromDisk()` recursively. If the backup was also corrupt, the
+recursive call would throw and enter the same catch block again. Since `bakFile.exists()` would
+still return true (the file was just copied to the primary path successfully before the parse
+failed), the recovery path would be entered again and the method would recurse without bound.
+In practice this terminates via `StackOverflowError` but the error message gives no indication
+of what happened.
+
+**Fix:**
+`loadFromDisk()` is split into a no-arg entry point and a `loadFromDisk(boolean recovering)`
+overload. The no-arg version calls `loadFromDisk(false)`. The recovery path is guarded by
+`!recovering` — if the recursive call is already a recovery attempt and also fails, the catch
+block logs "backup is also corrupt" and returns, leaving the in-memory map empty. Startup
+continues with zero portal entries.
+
+---
+
+### PortalLinkRegistry decay task was permanently cancelled after an uncaught exception
+
+**File:** `PortalLinkRegistry.java`
+
+**Root cause:**
+`scheduleDecayCleanup()` submitted a `Runnable` to `scheduleAtFixedRate`. The `Runnable`
+contained no exception handling. Per `ScheduledExecutorService` contract: if a task throws an
+unchecked exception, the executor catches it, records the exception in the `Future` returned by
+`scheduleAtFixedRate`, and permanently cancels further scheduling of that task. The executor
+itself continues running; only that one task is silently dead. No log message is produced.
+
+In practice this could be triggered by any unexpected `RuntimeException` from `removeIf` or
+`schedulePendingSave()`. After the first failure, no further pending link cleanup would occur
+for the remainder of the server uptime.
+
+**Fix:**
+Wrapped the task body in `try { ... } catch (Exception e)`. The catch logs the error at
+`WARNING` and returns normally, allowing the executor to schedule the next invocation at the
+normal 24-hour interval.
+
+---
+
+### JVM shutdown hook leaked on plugin reload
+
+**File:** `OptiPortal.java`
+
+**Root cause:**
+`doShutdown()` is called on both `/preload reload` and JVM exit. At startup, a `Thread` is
+registered via `Runtime.getRuntime().addShutdownHook(shutdownHook)`. On a reload cycle,
+`doShutdown()` ran the full shutdown sequence but never removed the hook. The next startup added
+a second hook for the new plugin instance. Over many reloads, each JVM exit would attempt to
+run all accumulated hooks simultaneously, each invoking `doShutdown()` on their respective
+(now-stopped) plugin instances.
+
+**Fix:**
+Added `unregisterShutdownHook()` called from `doShutdown()`. The method guards on
+`shutdownHook == null`, calls `Runtime.getRuntime().removeShutdownHook(shutdownHook)`, and
+catches `IllegalStateException` — the JVM throws this when shutdown is already in progress and
+hook removal is no longer possible, which is expected behaviour during a normal server stop and
+should not be logged as an error.
+
+**Threading:** `doShutdown()` is already guarded by a `shuttingDown.compareAndSet(false, true)`
+gate, so `unregisterShutdownHook()` cannot be called twice on the same instance. The
+`IllegalStateException` catch handles the case where the JVM races the plugin reload.
+
+---
+
+### Portal deletion through the UI skipped hotspot cleanup
+
+**File:** `OptiPortalUIPage.java`
+
+**Root cause:**
+The UI `Delete` action called `removeLink(id)`, then `storage.delete(id)`, then
+`refreshPortalCache()`. It did not call `onPortalDeleted(id)`. The `onPortalDeleted` method
+removes all hotspot and pending-hotspot entries keyed by the portal ID from `TeleportInterceptor`.
+Without it, confirmed hotspots and pending candidates for the deleted portal remained live in
+memory for the rest of the server uptime and could trigger preloads for a portal that no longer
+existed.
+
+**Fix:**
+Added `plugin.getTeleportInterceptor().onPortalDeleted(id)` immediately after `removeLink(id)`,
+matching the sequence already used in the command delete path.
+
+---
+
+### Warp-file sync deletion did not clear link or hotspot state
+
+**File:** `WarpFileWatcher.java`, `OptiPortal.java`
+
+**Root cause:**
+`WarpFileWatcher.syncFromFile()` compared the set of IDs currently in storage against the IDs
+present in the source warp file. For any `PORTAL`-type entry whose ID was absent from the file,
+it called `storage.delete(existingId)` and logged the removal. It did not call `removeLink`,
+`onPortalDeleted`, or trigger a portal-cache refresh. Over time, warp-managed portals that were
+deleted from the warp file accumulated stale state: orphaned link entries in
+`PortalLinkRegistry` and orphaned hotspot records in `TeleportInterceptor`. The non-portal entry
+types (`death:*`, `respawn:*`) were already excluded from deletion and remain unaffected.
+
+**Fix:**
+Added a `Consumer<String> onPortalDeleted` callback field to `WarpFileWatcher`. The callback is
+invoked inside the PORTAL-type deletion block, before `storage.delete()`. Both construction
+sites in `OptiPortal` now pass a lambda that calls `portalLinkRegistry.removeLink(id)` followed
+by `teleportInterceptor.onPortalDeleted(id)`; `onSyncComplete` (an existing callback) already
+handles the cache refresh after the full sync completes. The two existing backwards-compatible
+constructors delegate with a no-op for the new parameter.
+
+---
+
+### Hotspot staleness tracking used counts instead of timestamps
+
+**File:** `TeleportInterceptor.java`
+
+**Root cause:**
+`pendingHotspotCounts` was `ConcurrentHashMap<String, Integer>` — it stored only an observation
+count. `PortalHotspot` (confirmed entries) had no staleness metadata at all. The previous
+implementation of `cleanupStaleHotspots()` subtracted the stored integer count from
+`System.currentTimeMillis()`, producing a "timestamp" roughly equal to the current epoch
+millisecond, then removed entries based on this value. It also removed confirmed hotspots based
+on absence from `pendingHotspotCounts`, which is the expected state for any confirmed hotspot
+(the pending key is removed on graduation). Both behaviours were incorrect and would have
+deleted all confirmed hotspots and left pending entries permanently if scheduled.
+
+Additionally, when a player re-observed an already-confirmed hotspot, `learnPortalHotspot`
+returned immediately without recording that the hotspot was still active. There was no mechanism
+to distinguish a hotspot observed five minutes ago from one that had not been seen in a year.
+
+**Fix:**
+Replaced the raw `Integer` in `pendingHotspotCounts` with a `PendingHotspot` inner class
+holding `int count` and `long lastSeenMs`. The map type is now
+`ConcurrentHashMap<String, PendingHotspot>`. The `merge()` call is replaced with `compute()`,
+which atomically increments `count` and updates `lastSeenMs = System.currentTimeMillis()` on
+each observation. `PortalHotspot` gained a `volatile long lastSeenMs` field, set at graduation
+and updated whenever a player re-observes the confirmed hotspot. `cleanupStaleHotspots()` now
+removes pending entries with `lastSeenMs < now - 7 days` and confirmed entries with
+`lastSeenMs < now - 30 days`. Empty world buckets are removed from `portalHotspots` after each
+cleanup pass to prevent accumulation from removed worlds. The cleanup task is scheduled every
+24 hours via `scheduleWithFixedDelay` in the constructor and cancelled in `stop()`, which stores
+the `ScheduledFuture<?>` and sets it to null after cancellation. Subclasses that override
+`stop()` should call `super.stop()`.
+
+**Threading:** `pendingHotspotCounts.compute()` is atomic in `ConcurrentHashMap` — no external
+synchronisation needed for the count-and-timestamp update. `PortalHotspot.lastSeenMs` is
+`volatile` so re-observation updates are immediately visible to the cleanup thread without
+locking. `CopyOnWriteArrayList.removeIf()` is thread-safe; concurrent reads during cleanup
+see either the pre- or post-removal state of the list, both of which are valid.
+
+---
+
+### Deleting a portal left confirmed hotspot entries alive until TTL expiry
+
+**File:** `TeleportInterceptor.java`
+
+**Root cause:**
+The TTL redesign fixed hotspot staleness tracking but left a semantic gap in
+`onPortalDeleted(String portalId)`. The method removed pending candidates from
+`pendingHotspotCounts` by matching keys that ended in `":" + portalId`, but it never touched
+the confirmed hotspot index in `portalHotspots`. Confirmed entries are stored separately as
+`PortalHotspot` objects grouped by source world, each carrying `destZoneId` and `lastSeenMs`.
+As a result, deleting a portal through the UI, command path, or warp sync removed the portal
+record and its pending hotspot candidates, but any already-confirmed hotspot remained active
+until `cleanupStaleHotspots()` eventually evicted it 30 days later. During that window,
+`checkHotspotPromotion()` could still promote the deleted destination zone from a learned
+source position even though the portal no longer existed.
+
+**Fix:**
+Extended `onPortalDeleted` to iterate every per-world `CopyOnWriteArrayList<PortalHotspot>` in
+`portalHotspots` and remove entries whose `destZoneId.equals(portalId)`. After pruning the
+lists, the method now removes empty world buckets with `portalHotspots.entrySet().removeIf(...)`
+so the outer map does not accumulate empty lists after repeated deletions. The existing pending
+key removal remains in place; portal deletion now clears both pending and confirmed hotspot
+state immediately.
+
+**Threading:** `CopyOnWriteArrayList.removeIf()` is safe for concurrent reads from
+`checkHotspotPromotion()` and `learnPortalHotspot()`. Readers may observe either the old list
+or the new list during the copy-on-write replacement, both of which are consistent states.
+`portalHotspots.entrySet().removeIf(...)` operates on the outer `ConcurrentHashMap`; removing an
+entry for an empty list does not race incorrectly with active readers because the list contents
+have already been pruned before the bucket is removed.
+
+---
+
+### TeleportInterceptor's recurring teleport poll had no explicit lifecycle handle
+
+**File:** `TeleportInterceptor.java`
+
+**Root cause:**
+`TeleportInterceptor` scheduled two independent recurring tasks:
+
+1. the one-second teleport poll via `scheduleWithFixedDelay(this::pollTeleportRecords, ...)`
+2. the daily hotspot TTL cleanup via `scheduleWithFixedDelay(this::cleanupStaleHotspots, ...)`
+
+Only the cleanup task's `ScheduledFuture<?>` was stored. `stop()` cancelled `cleanupTask` but
+had no handle for the poll task, so explicit lifecycle ownership was asymmetric: one task was
+owned and cancellable, the other relied on shared-executor shutdown to stop. In the current
+plugin this usually worked because `OptiPortal.doShutdown()` later shuts down the executor, but
+the class itself did not fully own the resources it created. That made shutdown and reload
+reasoning harder and would have been fragile if `stop()` were ever called before executor
+shutdown or in tests using a still-live executor.
+
+**Fix:**
+Added a `ScheduledFuture<?> pollTask` field, assigned it from the constructor's
+`scheduleWithFixedDelay(this::pollTeleportRecords, ...)` call, and updated `stop()` to cancel
+both `pollTask` and `cleanupTask`, nulling each field after cancellation. `stop()` remains
+idempotent: repeated calls simply see null futures and return.
+
+**Threading:** `ScheduledFuture.cancel(false)` does not interrupt an in-flight run; it prevents
+future executions only. That matches the existing cleanup-task semantics and avoids introducing
+interrupt handling into `pollTeleportRecords()`. Nulling the fields after cancellation is safe
+because `stop()` is only a lifecycle method and the futures are not read elsewhere.
+
+---
+
 ## [1.1.8] - 2026-03-26
 
 ---

@@ -51,6 +51,7 @@ public class JsonStorageBackend implements StorageBackend {
 
     // In-memory map for fast access
     private final Map<String, PortalEntry> entries = new LinkedHashMap<>();
+    private final java.util.concurrent.ConcurrentHashMap<String, PortalEntry> entryIndex = new java.util.concurrent.ConcurrentHashMap<>();
 
     // Volatile cached snapshot for lock-free reads (Issue 2 optimization)
     private volatile List<PortalEntry> cachedList = java.util.Collections.emptyList();
@@ -90,11 +91,16 @@ public class JsonStorageBackend implements StorageBackend {
             // Fresh install - write empty structure
             flush(List.of());
         }
-        // Initialize cachedList after loading
+        // Initialize cachedList and entryIndex after loading
+        entryIndex.putAll(entries);
         cachedList = java.util.Collections.unmodifiableList(new ArrayList<>(entries.values()));
     }
 
     private void loadFromDisk() {
+        loadFromDisk(false);
+    }
+
+    private void loadFromDisk(boolean recovering) {
         try (Reader reader = new FileReader(dataFile)) {
             JsonObject root = GSON.fromJson(reader, JsonObject.class);
             if (root == null) return;
@@ -105,27 +111,29 @@ public class JsonStorageBackend implements StorageBackend {
                     PortalEntry entry = GSON.fromJson(element, PortalEntry.class);
                     if (entry != null && entry.getId() != null) {
                         entries.put(entry.getId(), entry);
+                        entryIndex.put(entry.getId(), entry);
                     }
                 }
             }
         } catch (Exception e) {
             LOG.warning("[OptiPortal] Failed to read portal-data.json: " + e.getMessage());
-            // Attempt bak recovery
-            if (bakFile.exists()) {
+            if (!recovering && bakFile.exists()) {
                 LOG.warning("[OptiPortal] Attempting recovery from backup...");
                 try {
                     Files.copy(bakFile.toPath(), dataFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
-                    loadFromDisk();
+                    loadFromDisk(true);   // one retry only — if bak is also bad, give up
                 } catch (Exception ex) {
-                    LOG.warning("[OptiPortal] Backup recovery failed: " + ex.getMessage());
+                    LOG.warning("[OptiPortal] Backup recovery also failed — starting with empty portal list: " + ex.getMessage());
                 }
+            } else if (recovering) {
+                LOG.warning("[OptiPortal] Backup is also corrupt — starting with empty portal list.");
             }
         }
     }
 
     @Override
-    public synchronized List<PortalEntry> loadAll() {
-        return new ArrayList<>(entries.values());
+    public List<PortalEntry> loadAll() {
+        return cachedList;
     }
 
     @Override
@@ -134,8 +142,8 @@ public class JsonStorageBackend implements StorageBackend {
     }
 
     @Override
-    public synchronized Optional<PortalEntry> loadById(String id) {
-        return Optional.ofNullable(entries.get(id));
+    public Optional<PortalEntry> loadById(String id) {
+        return Optional.ofNullable(entryIndex.get(id));
     }
 
     @Override
@@ -143,6 +151,7 @@ public class JsonStorageBackend implements StorageBackend {
         List<PortalEntry> snapshot;
         synchronized (this) {
             entries.put(entry.getId(), entry);
+            entryIndex.put(entry.getId(), entry);
             snapshot = new ArrayList<>(entries.values());
         }
         cachedList = java.util.Collections.unmodifiableList(snapshot);
@@ -158,6 +167,7 @@ public class JsonStorageBackend implements StorageBackend {
         synchronized (this) {
             for (PortalEntry e : newEntries) {
                 entries.put(e.getId(), e);
+                entryIndex.put(e.getId(), e);
             }
             snapshot = new ArrayList<>(entries.values());
         }
@@ -173,6 +183,7 @@ public class JsonStorageBackend implements StorageBackend {
         List<PortalEntry> snapshot = null;
         synchronized (this) {
             if (entries.remove(id) != null) {
+                entryIndex.remove(id);
                 snapshot = new ArrayList<>(entries.values());
             }
         }

@@ -69,6 +69,7 @@ public class PortalLinkRegistry {
     private final ScheduledExecutorService executor;
     private volatile ScheduledFuture<?> pendingSave;        // debounce for save()
     private volatile ScheduledFuture<?> pendingLinksSave;   // debounce for savePendingLinks()
+    private volatile ScheduledFuture<?> decayTask;          // periodic pending-link decay
     private static final long SAVE_DEBOUNCE_MS = 2_000;
 
     /**
@@ -112,7 +113,7 @@ public class PortalLinkRegistry {
      * confidence threshold (default 3 observations). This prevents false positives
      * from single accidental observations.
      */
-    public synchronized void recordLink(String originId, String destinationId) {
+    public void recordLink(String originId, String destinationId) {
         if (originId == null || destinationId == null) return;
         if (originId.equals(destinationId)) return;
         if (isPlayerDataId(originId) || isPlayerDataId(destinationId)) return;
@@ -124,18 +125,18 @@ public class PortalLinkRegistry {
         PendingLink pending = pendingLinks.computeIfAbsent(key, k -> new PendingLink());
         pending.increment();
 
-        if (pending.count >= confidenceThreshold) {
+        if (pending.count.get() >= confidenceThreshold) {
             pendingLinks.remove(key);
             // Promote to confirmed link
             links.put(originId, destinationId);
             links.put(destinationId, originId);
             LOG.info("[OptiPortal] PortalLinks: confirmed " + originId + " ↔ " + destinationId
-                    + " (observed " + pending.count + " times)");
+                    + " (observed " + pending.count.get() + " times)");
             scheduleSave();
             schedulePendingSave();
         } else {
             LOG.fine("[OptiPortal] PortalLinks: pending " + originId + " → " + destinationId
-                    + " (" + pending.count + "/" + confidenceThreshold + ")");
+                    + " (" + pending.count.get() + "/" + confidenceThreshold + ")");
             schedulePendingSave();
         }
     }
@@ -166,7 +167,7 @@ public class PortalLinkRegistry {
     public Map<String, Integer> getPendingLinkCounts() {
         Map<String, Integer> snapshot = new java.util.LinkedHashMap<>();
         for (Map.Entry<String, PendingLink> e : pendingLinks.entrySet()) {
-            snapshot.put(e.getKey(), e.getValue().count);
+            snapshot.put(e.getKey(), e.getValue().count.get());
         }
         return java.util.Collections.unmodifiableMap(snapshot);
     }
@@ -224,6 +225,8 @@ public class PortalLinkRegistry {
      * Call from shutdown hook to ensure last recorded links are not lost.
      */
     public void flush() {
+        ScheduledFuture<?> decay = decayTask;
+        if (decay != null) { decay.cancel(false); decayTask = null; }
         ScheduledFuture<?> existing = pendingSave;
         if (existing != null) {
             existing.cancel(false);
@@ -325,19 +328,24 @@ public class PortalLinkRegistry {
      */
     private void scheduleDecayCleanup() {
         if (executor == null) return;
-        
-        executor.scheduleAtFixedRate(() -> {
-            int before = pendingLinks.size();
-            pendingLinks.entrySet().removeIf(entry -> {
-                PendingLink pending = entry.getValue();
-                long ageMs = System.currentTimeMillis() - pending.lastSeenMs;
-                return ageMs > pendingDecayDays * 86_400_000L;
-            });
-            int removed = before - pendingLinks.size();
-            
-            if (removed > 0) {
-                LOG.info("[OptiPortal] PortalLinks: decayed " + removed + " expired pending link(s).");
-                schedulePendingSave();
+
+        decayTask = executor.scheduleAtFixedRate(() -> {
+            try {
+                int before = pendingLinks.size();
+                pendingLinks.entrySet().removeIf(entry -> {
+                    PendingLink pending = entry.getValue();
+                    long ageMs = System.currentTimeMillis() - pending.lastSeenMs;
+                    return ageMs > pendingDecayDays * 86_400_000L;
+                });
+                int removed = before - pendingLinks.size();
+
+                if (removed > 0) {
+                    LOG.info(() -> "[OptiPortal] PortalLinks: decayed " + removed + " expired pending link(s).");
+                    schedulePendingSave();
+                }
+            } catch (Exception e) {
+                // Must catch here — any uncaught exception kills the scheduled task permanently.
+                LOG.warning(() -> "[OptiPortal] PortalLinks: decay cleanup error (task will retry next cycle): " + e.getMessage());
             }
         }, 24, 24, TimeUnit.HOURS);
     }
@@ -351,17 +359,16 @@ public class PortalLinkRegistry {
      * Pending entries decay after a configurable idle period.
      */
     private static class PendingLink {
-        volatile int count;
+        java.util.concurrent.atomic.AtomicInteger count = new java.util.concurrent.atomic.AtomicInteger(0);
         volatile long lastSeenMs;
 
         // count starts at 0; recordLink always calls increment(), so first observation → count=1
         PendingLink() {
-            count = 0;
             lastSeenMs = System.currentTimeMillis();
         }
 
         void increment() {
-            count++;
+            count.incrementAndGet();
             lastSeenMs = System.currentTimeMillis();
         }
 

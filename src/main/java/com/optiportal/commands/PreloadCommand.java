@@ -589,6 +589,7 @@ public class PreloadCommand extends AbstractCommand {
 
             // Step 6: Invalidate in-memory portal cache
             plugin.getTeleportInterceptor().refreshPortalCache();
+            plugin.getTeleportInterceptor().onPortalDeleted(id);
 
             reply(ctx, "[OptiPortal] Deleted zone '" + id + "' (world=" + world + ").");
             return CompletableFuture.<Void>completedFuture(null);

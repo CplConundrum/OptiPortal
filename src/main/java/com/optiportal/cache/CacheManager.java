@@ -11,6 +11,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Logger;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
@@ -68,6 +69,10 @@ public class CacheManager {
     // Persistence fields for P11
     private final File registryFile;
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
+
+    // ReadWriteLock: setZoneTier() uses read lock (concurrent callers don't block each other),
+    // saveRegistry() uses write lock (pauses new writes only during the snapshot, which is milliseconds at most).
+    private final ReentrantReadWriteLock tierLock = new ReentrantReadWriteLock();
 
     public CacheManager(PluginConfig config, WalManager walManager,
                         ScheduledExecutorService executor, WorldRegistry worldRegistry,
@@ -181,21 +186,29 @@ public class CacheManager {
 
     public void saveRegistry() {
         if (registryFile == null) return;
+
+        // Snapshot both maps atomically to prevent tier/timestamp skew.
+        // zoneTiers and tierTimestamps must be consistent with each other.
+        final Map<String, String> tierSnapshot;
+        final Map<String, Long> tsSnapshot;
+        tierLock.writeLock().lock();
         try {
-            // Snapshot both maps under no lock — ConcurrentHashMap iteration is safe
-            Map<String, String> tierSnapshot = new HashMap<>();
+            tierSnapshot = new HashMap<>();
             for (Map.Entry<String, CacheTier> e : zoneTiers.entrySet()) {
                 tierSnapshot.put(e.getKey(), e.getValue().name());
             }
-            Map<String, Long> tsSnapshot = new HashMap<>(tierTimestamps);
+            tsSnapshot = new HashMap<>(tierTimestamps);
+        } finally {
+            tierLock.writeLock().unlock();
+        }
 
-            RegistrySnapshot snapshot = new RegistrySnapshot(tierSnapshot, tsSnapshot);
-            String json = GSON.toJson(snapshot);
-
+        RegistrySnapshot snapshot = new RegistrySnapshot(tierSnapshot, tsSnapshot);
+        String json = GSON.toJson(snapshot);
+        try {
             walManager.writeAtomic(registryFile, json);
             LOG.info("[OptiPortal] CacheManager: saved registry (" + tierSnapshot.size() + " zones)");
         } catch (Exception e) {
-            LOG.warning("[OptiPortal] CacheManager: failed to save registry: " + e.getMessage());
+            LOG.warning("[OptiPortal] CacheManager: saveRegistry failed: " + e.getMessage());
         }
     }
 
@@ -247,18 +260,25 @@ public class CacheManager {
 
     /**
      * Set a zone's tier. HOT and WARM record a timestamp for decay scheduling.
+     * Uses read lock to allow concurrent callers (teleport, proximity, chunk load, keepalive).
      */
     public void setZoneTier(String zoneId, CacheTier tier) {
-        zoneTiers.put(zoneId, tier);
-        if (tier == CacheTier.HOT || tier == CacheTier.WARM) {
-            long now = System.currentTimeMillis();
-            tierTimestamps.put(zoneId, now);
-            long decayMs = (tier == CacheTier.HOT)
-                    ? config.getHotDecaySeconds() * 1000L
-                    : config.getWarmDecayMinutes() * 60_000L;
-            earliestDecayMs.accumulateAndGet(now + decayMs, Math::min);
-        } else {
-            tierTimestamps.remove(zoneId);
+        tierLock.readLock().lock();
+        try {
+            zoneTiers.put(zoneId, tier);
+            if (tier == CacheTier.HOT || tier == CacheTier.WARM) {
+                long now = System.currentTimeMillis();
+                tierTimestamps.put(zoneId, now);
+                long decayMs = (tier == CacheTier.HOT)
+                        ? config.getHotDecaySeconds() * 1000L
+                        : config.getWarmDecayMinutes() * 60_000L;
+                earliestDecayMs.accumulateAndGet(now + decayMs, Math::min);
+            } else {
+                // COLD zones don't need a timestamp — remove stale one if present
+                tierTimestamps.remove(zoneId);
+            }
+        } finally {
+            tierLock.readLock().unlock();
         }
     }
 
@@ -387,14 +407,21 @@ public class CacheManager {
     }
 
     public int getTotalOwnedChunks() {
-        return chunkOwnership.values().stream()
-                .mapToInt(ConcurrentHashMap::size).sum();
+        int total = 0;
+        for (java.util.concurrent.ConcurrentHashMap<Long, Set<String>> worldMap : chunkOwnership.values()) {
+            total += worldMap.size();
+        }
+        return total;
     }
 
     public int getTotalSharedChunks() {
-        return (int) chunkOwnership.values().stream()
-                .flatMap(m -> m.values().stream())
-                .filter(s -> s.size() > 1).count();
+        int shared = 0;
+        for (java.util.concurrent.ConcurrentHashMap<Long, Set<String>> worldMap : chunkOwnership.values()) {
+            for (Set<String> owners : worldMap.values()) {
+                if (owners.size() > 1) shared++;
+            }
+        }
+        return shared;
     }
 
     /**
@@ -497,7 +524,7 @@ public class CacheManager {
      */
     public void registerOwnershipBatch(String zoneId, String world, java.util.List<int[]> chunkCoords) {
         if (zoneId == null || chunkCoords == null || chunkCoords.isEmpty()) return;
-        
+
         java.util.List<Long> engineIndexes = new java.util.ArrayList<>(chunkCoords.size());
         for (int[] coord : chunkCoords) {
             long key = packChunkIndex(coord[0], coord[1]);

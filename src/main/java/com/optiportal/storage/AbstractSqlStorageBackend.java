@@ -8,8 +8,11 @@ import java.sql.Statement;
 import java.sql.Types;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -32,6 +35,12 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
     // Optional cache updater for async invalidation
     private CacheUpdater cacheUpdater;
 
+    // In-memory mirror of DB rows — keeps cache notifications free of DB round-trips.
+    // Populated lazily on first write; authoritative DB is always the source of truth on startup.
+    private final LinkedHashMap<String, PortalEntry> memEntries = new LinkedHashMap<>();
+    private final ConcurrentHashMap<String, PortalEntry> memIndex = new ConcurrentHashMap<>();
+    private volatile List<PortalEntry> cachedList = Collections.emptyList();
+
     /**
      * Interface for cache update notifications.
      */
@@ -50,6 +59,7 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
     public void init() throws Exception {
         dataSource = createDataSource();
         createTable();
+        hydrateMemory();
     }
 
     protected abstract HikariDataSource createDataSource() throws Exception;
@@ -106,32 +116,12 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
 
     @Override
     public List<PortalEntry> loadAll() {
-        List<PortalEntry> result = new ArrayList<>();
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement("SELECT * FROM portal_entries");
-             ResultSet rs = ps.executeQuery()) {
-            while (rs.next()) {
-                result.add(mapRow(rs));
-            }
-        } catch (SQLException e) {
-            LOG.log(Level.WARNING, "[OptiPortal] SQL loadAll error", e);
-        }
-        return result;
+        return cachedList;
     }
 
     @Override
     public Optional<PortalEntry> loadById(String id) {
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(
-                     "SELECT * FROM portal_entries WHERE id = ?")) {
-            ps.setString(1, id);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) return Optional.of(mapRow(rs));
-            }
-        } catch (SQLException e) {
-            LOG.log(Level.WARNING, "[OptiPortal] SQL loadById error", e);
-        }
-        return Optional.empty();
+        return Optional.ofNullable(memIndex.get(id));
     }
 
     /**
@@ -144,17 +134,26 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
     @Override
     public void save(PortalEntry entry) {
         String sql = upsertSql();
-
+        boolean success = false;
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
             bindEntry(ps, entry);
             ps.executeUpdate();
+            success = true;
         } catch (SQLException e) {
             LOG.log(Level.WARNING, "[OptiPortal] SQL save error", e);
         }
-        // Notify cache updater
-        if (cacheUpdater != null) {
-            cacheUpdater.onUpdate(loadAll());
+        if (success) {
+            List<PortalEntry> snapshot;
+            synchronized (this) {
+                memEntries.put(entry.getId(), entry);
+                memIndex.put(entry.getId(), entry);
+
+                snapshot = rebuildSnapshot();
+            }
+            if (cacheUpdater != null) {
+                cacheUpdater.onUpdate(snapshot);
+            }
         }
     }
 
@@ -163,7 +162,7 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
         if (entries == null || entries.isEmpty()) return;
 
         String sql = upsertSql();
-
+        boolean success = false;
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
             conn.setAutoCommit(false);
@@ -174,6 +173,7 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
                 }
                 ps.executeBatch();
                 conn.commit();
+                success = true;
             } catch (SQLException e) {
                 conn.rollback();
                 throw e;
@@ -183,25 +183,44 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
         } catch (SQLException e) {
             LOG.log(Level.WARNING, "[OptiPortal] SQL saveAll error", e);
         }
-        // Notify cache updater
-        if (cacheUpdater != null) {
-            cacheUpdater.onUpdate(loadAll());
+        if (success) {
+            List<PortalEntry> snapshot;
+            synchronized (this) {
+                for (PortalEntry entry : entries) {
+                    memEntries.put(entry.getId(), entry);
+                    memIndex.put(entry.getId(), entry);
+                }
+                snapshot = rebuildSnapshot();
+            }
+            if (cacheUpdater != null) {
+                cacheUpdater.onUpdate(snapshot);
+            }
         }
     }
 
     @Override
     public void delete(String id) {
+        boolean success = false;
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(
                      "DELETE FROM portal_entries WHERE id = ?")) {
             ps.setString(1, id);
-            ps.executeUpdate();
+            int rows = ps.executeUpdate();
+            success = rows > 0;
         } catch (SQLException e) {
             LOG.log(Level.WARNING, "[OptiPortal] SQL delete error", e);
         }
-        // Notify cache updater
-        if (cacheUpdater != null) {
-            cacheUpdater.onUpdate(loadAll());
+        if (success) {
+            List<PortalEntry> snapshot;
+            synchronized (this) {
+                memEntries.remove(id);
+
+                memIndex.remove(id);
+                snapshot = rebuildSnapshot();
+            }
+            if (cacheUpdater != null) {
+                cacheUpdater.onUpdate(snapshot);
+            }
         }
     }
 
@@ -210,6 +229,43 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
         if (dataSource != null && !dataSource.isClosed()) {
             dataSource.close();
         }
+    }
+
+    /**
+     * Loads all rows from the database into the in-memory map.
+     * Called once at init(). After this, save/saveAll/delete keep the map in sync.
+     */
+    private synchronized void hydrateMemory() {
+        List<PortalEntry> rows = new ArrayList<>();
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement("SELECT * FROM portal_entries");
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                rows.add(mapRow(rs));
+            }
+        } catch (SQLException e) {
+            LOG.log(Level.WARNING, "[OptiPortal] SQL hydrateMemory error", e);
+        }
+        for (PortalEntry e : rows) {
+            memEntries.put(e.getId(), e);
+            memIndex.put(e.getId(), e);
+        }
+        cachedList = Collections.unmodifiableList(new ArrayList<>(memEntries.values()));
+    }
+
+    /**
+     * Rebuilds the cached snapshot from the in-memory map.
+     * Must be called while holding the lock on `this`.
+     */
+    private List<PortalEntry> rebuildSnapshot() {
+        List<PortalEntry> snap = Collections.unmodifiableList(new ArrayList<>(memEntries.values()));
+        cachedList = snap;
+        return snap;
+    }
+
+    @Override
+    public List<PortalEntry> loadAllCached() {
+        return cachedList;
     }
 
     protected void bindEntry(PreparedStatement ps, PortalEntry e) throws SQLException {

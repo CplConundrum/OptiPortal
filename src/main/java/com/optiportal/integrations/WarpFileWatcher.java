@@ -13,6 +13,7 @@ import java.util.Set;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 
@@ -46,21 +47,29 @@ public class WarpFileWatcher {
     private final WarmZoneManager warmZoneManager;
     private final ScheduledExecutorService executor;
     private final Runnable onSyncComplete;
-    
+    private final Consumer<String> onPortalDeleted;
+
     private ScheduledFuture<?> task;
     private long lastModified = -1;
-    
+
     public WarpFileWatcher(PluginConfig config, StorageBackend storage,
                            WarmZoneManager warmZoneManager, ScheduledExecutorService executor,
-                           Runnable onSyncComplete) {
+                           Runnable onSyncComplete, Consumer<String> onPortalDeleted) {
         this.config = config;
         this.storage = storage;
         this.warmZoneManager = warmZoneManager;
         this.executor = executor;
         this.onSyncComplete = onSyncComplete;
+        this.onPortalDeleted = onPortalDeleted;
     }
-    
-    /** Constructor for backwards compatibility - delegates with empty callback. */
+
+    public WarpFileWatcher(PluginConfig config, StorageBackend storage,
+                           WarmZoneManager warmZoneManager, ScheduledExecutorService executor,
+                           Runnable onSyncComplete) {
+        this(config, storage, warmZoneManager, executor, onSyncComplete, id -> {});
+    }
+
+    /** Constructor for backwards compatibility - delegates with empty callbacks. */
     public WarpFileWatcher(PluginConfig config, StorageBackend storage,
                            WarmZoneManager warmZoneManager, ScheduledExecutorService executor) {
         this(config, storage, warmZoneManager, executor, () -> {});
@@ -241,6 +250,7 @@ public class WarpFileWatcher {
             if (!incomingIds.contains(existingId)) {
                 PortalEntry ex = existing.get(existingId);
                 if (ex != null && ex.getType() == PortalEntry.EntryType.PORTAL) {
+                    onPortalDeleted.accept(existingId);
                     storage.delete(existingId);
                     LOG.info("[OptiPortal] Warp removed: " + existingId);
                 }

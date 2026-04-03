@@ -67,7 +67,7 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.P
     public void build(@Nonnull Ref<EntityStore> ref, @Nonnull UICommandBuilder cmd,
                       @Nonnull UIEventBuilder evt, @Nonnull Store<EntityStore> store) {
         cmd.append("Pages/PluginListPage.ui");
-        List<PortalEntry> zones = plugin.getStorage().loadAll();
+        List<PortalEntry> zones = plugin.getStorage().loadAllCached();
         renderZoneList(cmd, evt, zones);
         renderDetailPanel(cmd, evt);
     }
@@ -95,6 +95,7 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.P
                 var pcl = plugin.getPortalChunkListener();
                 if (pcl != null) pcl.removeFromIndex(id);
                 plugin.getPortalLinkRegistry().removeLink(id);
+                plugin.getTeleportInterceptor().onPortalDeleted(id);
                 plugin.getStorage().delete(id);
                 plugin.getTeleportInterceptor().refreshPortalCache();
                 selectedZoneId = null;
@@ -107,7 +108,7 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.P
     // Refresh (subsequent updates — does NOT re-append the root page)
 
     private void refresh() {
-        List<PortalEntry> zones = plugin.getStorage().loadAll();
+        List<PortalEntry> zones = plugin.getStorage().loadAllCached();
         UICommandBuilder cmd = new UICommandBuilder();
         UIEventBuilder   evt = new UIEventBuilder();
         renderZoneList(cmd, evt, zones);
@@ -243,7 +244,7 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.P
     private String overallStats() {
         CacheManager cache = plugin.getCacheManager();
         PluginConfig cfg   = plugin.getPluginConfig();
-        List<PortalEntry> all = plugin.getStorage().loadAll();
+        List<PortalEntry> all = plugin.getStorage().loadAllCached();
         int hot = 0, warm = 0, cold = 0, unvisited = 0;
         double totalRam = 0;
         for (PortalEntry z : all) {

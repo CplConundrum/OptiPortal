@@ -2,6 +2,30 @@
 
 ---
 
+## [1.2.0] - 2026-03-29
+
+### Fixed
+
+- **BUG FIX — Zone cleanup is now more reliable**: Several cases where zone state could linger longer than intended have been fixed. Portal deletion now cleans up properly, zone removal releases its memory protection correctly, and zones fall back to the right state when their chunks are no longer present.
+
+- **BUG FIX — Shutdown and reload behavior are safer**: Background tasks now stop more cleanly, reload leaves behind less stale state, and startup handles damaged data files more safely.
+
+- **BUG FIX — Saved data stays more consistent**: Several fixes reduce the chance of zone, link, or cache state getting out of sync after failures or busy periods.
+
+- **BUG FIX — A few smaller background-task leaks and overhead issues were removed**: This release also cleans up some smaller task-management issues that could waste resources over long uptimes.
+
+### Changed
+
+- **IMPROVEMENT — Routine portal activity is lighter on the server**: Several common code paths now avoid repeated storage work and unnecessary extra processing.
+
+- **IMPROVEMENT — Zone loading and state updates are smoother under load**: Chunk ownership updates, tier changes, and decay handling were reworked to reduce extra pressure during busy moments.
+
+- **IMPROVEMENT — Learned portal hotspots now expire naturally**: Old hotspot data is tracked more cleanly and no longer hangs around forever.
+
+- **IMPROVEMENT — SQL-backed setups should feel more responsive**: Runtime lookups are cheaper and less dependent on repeated full database reads.
+
+---
+
 ## [1.1.9] - 2026-03-27
 
 ### Fixed

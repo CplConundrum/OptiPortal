@@ -6,6 +6,8 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
+import com.hypixel.hytale.server.core.universe.world.storage.ChunkStore;
+
 /**
  * Handles async operation errors with proper recovery mechanisms.
  * 
@@ -166,9 +168,11 @@ public class AsyncErrorHandler {
         }
 
         // Guard: engine-level backoff for this chunk
+        // The second parameter is a backoff cap (MAX_FAILURE_BACKOFF_NANOS), not a timestamp.
+        // This matches Hytale's server implementation where backoff is capped at a fixed value.
         long chunkIndex = ((long)(cx & 0xFFFFFFFF)) | ((long)(cz & 0xFFFFFFFF) << 32);
         try {
-            if (world.getChunkStore().isChunkOnBackoff(chunkIndex, System.nanoTime())) {
+            if (world.getChunkStore().isChunkOnBackoff(chunkIndex, ChunkStore.MAX_FAILURE_BACKOFF_NANOS)) {
                 LOG.fine("[OptiPortal] retryChunkLoad skipped (engine backoff): " + cx + "," + cz);
                 return CompletableFuture.completedFuture(null);
             }
