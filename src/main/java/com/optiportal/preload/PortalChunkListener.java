@@ -17,19 +17,18 @@ import com.optiportal.model.WarmStrategy;
 import com.optiportal.storage.StorageBackend;
 
 /**
- * Listens to ChunkPreLoadProcessEvent to:
+ * Listens to ChunkPreLoadProcessEvent to auto-register portal devices as PREDICTIVE zones.
  *
- *   1. Auto-register PortalDevice-containing chunks as PREDICTIVE zones.
- *      If a loaded chunk has a PortalDevice component (an EnterPortalInteraction
- *      portal block), we register its chunk position as a preload zone so
- *      the approach-area is pre-warmed without manual warps.json entries.
+ * <p><b>DORMANT: This class is intentionally not wired into startup.</b>
+ * It may be activated in a future pass if automatic portal device registration proves useful.
  *
- *   2. Promote COLD cache zones to WARM when the server natively loads a chunk
- *      that belongs to one of our registered zones.
+ * <p>Behavior:
+ * <ol>
+ *   <li>Auto-register PortalDevice-containing chunks as PREDICTIVE zones. If a loaded chunk has a PortalDevice component (an EnterPortalInteraction portal block), we register its chunk position as a preload zone so the approach-area is pre-warmed without manual warps.json entries.</li>
+ *   <li>Promote COLD cache zones to WARM when the server natively loads a chunk that belongs to one of our registered zones.</li>
+ * </ol>
  *
- * Registration: call register(world) for each world as it is added (from
- * WorldRegistry.addWorldLoadCallback). The event is world-local, so must be
- * registered per world.
+ * <p>Registration: call register(world) for each world as it is added (from WorldRegistry.addWorldLoadCallback). The event is world-local, so must be registered per world.
  */
 public class PortalChunkListener {
 
@@ -305,6 +304,8 @@ public class PortalChunkListener {
     public void onWorldRemoved(com.hypixel.hytale.server.core.universe.world.World world) {
         String worldName = world.getName();
         reverseIndex.remove(worldName);
-        LOG.fine("[OptiPortal] PortalChunkListener: cleared reverseIndex for removed world: " + worldName);
+        // Also clear entryCache entries for this world to prevent stale references
+        entryCache.entrySet().removeIf(entry -> entry.getValue().getWorld().equals(worldName));
+        LOG.fine("[OptiPortal] PortalChunkListener: cleared reverseIndex and entryCache for removed world: " + worldName);
     }
 }

@@ -41,12 +41,24 @@ public class ZoneTtlEnforcer {
 
     private ScheduledFuture<?> cleanupTask;
 
+    /** Optional callback invoked after a zone is deleted via TTL enforcement. */
+    private java.util.function.Consumer<String> onZoneDeleted;
+
     public ZoneTtlEnforcer(PluginConfig config, StorageBackend storage,
                            CacheManager cacheManager, ScheduledExecutorService executor) {
         this.config = config;
         this.storage = storage;
         this.cacheManager = cacheManager;
         this.executor = executor;
+    }
+
+    /**
+     * Sets the optional callback invoked after a zone is deleted via TTL enforcement.
+     *
+     * @param callback Callback that receives the deleted zone ID, or {@code null} to disable
+     */
+    public void setOnZoneDeleted(java.util.function.Consumer<String> callback) {
+        this.onZoneDeleted = callback;
     }
 
     /**
@@ -119,6 +131,14 @@ public class ZoneTtlEnforcer {
                 cacheManager.releaseZoneChunks(entry.getId());
                 cacheManager.removeTierEntry(entry.getId());
                 storage.delete(entry.getId());
+                // Invoke runtime cleanup callback inline
+                if (onZoneDeleted != null) {
+                    try {
+                        onZoneDeleted.accept(entry.getId());
+                    } catch (Exception e) {
+                        LOG.warning("[OptiPortal] ZoneTtlEnforcer: callback failed for zone " + entry.getId() + ": " + e.getMessage());
+                    }
+                }
                 removed++;
                 LOG.info("[OptiPortal] TTL expired: " + entry.getId()
                         + " (lastActive=" + lastActive + " ttlDays=" + ttlDays + ")");

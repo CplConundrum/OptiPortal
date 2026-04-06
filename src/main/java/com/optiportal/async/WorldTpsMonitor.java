@@ -14,7 +14,19 @@ import com.optiportal.preload.WorldRegistry;
  * Observes server TPS by reading World.getBufferedTickLengthMetricSet() each
  * sample interval and converting the most recent tick duration to TPS.
  *
- * This monitor is READ-ONLY — it never controls or limits the server tick rate.
+ * <p><b>DORMANT: This class is intentionally not wired into OptiPortal startup.</b>
+ * It provides TPS monitoring utilities that may be activated by other subsystems
+ * (e.g., AsyncLoadBalancer) if load-aware scheduling is needed.
+ *
+ * <p>Threading: volatile double for currentTps. All reads are safe from any thread.
+ *
+ * <p><b>Lifecycle safety note:</b> This class schedules recurring tasks via
+ * {@code executor.scheduleAtFixedRate()}. If ever activated, callers must ensure
+ * explicit cancellation via {@code ScheduledFuture.cancel()} or plugin shutdown
+ * hooks to avoid task leaks, as {@link com.hypixel.hytale.server.core.plugin.PluginBase}
+ * does not automatically cancel arbitrary executor tasks during cleanup.
+ *
+ * <p>This monitor is READ-ONLY — it never controls or limits the server tick rate.
  * The server's actual TPS is determined entirely by the Hytale engine and can
  * exceed HYTALE_TARGET_TPS (e.g. during catch-up bursts). OptiPortal uses the
  * observed TPS only to throttle its own chunk-preload backpressure; it does not

@@ -13,6 +13,7 @@ import java.util.Set;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
@@ -51,6 +52,8 @@ public class WarpFileWatcher {
 
     private ScheduledFuture<?> task;
     private long lastModified = -1;
+    // Shutdown flag to prevent late sync work after stop()
+    private final AtomicBoolean stopped = new AtomicBoolean(false);
 
     public WarpFileWatcher(PluginConfig config, StorageBackend storage,
                            WarmZoneManager warmZoneManager, ScheduledExecutorService executor,
@@ -86,7 +89,13 @@ public class WarpFileWatcher {
     }
 
     public void stop() {
-        if (task != null) task.cancel(false);
+        if (stopped.compareAndSet(false, true)) {
+            LOG.fine(() -> "[OptiPortal] WarpFileWatcher stopping...");
+            if (task != null) {
+                task.cancel(false);
+                task = null;
+            }
+        }
     }
 
     /** Force immediate re-read (called by /preload refresh warps). Returns count of warps synced. */
@@ -155,6 +164,11 @@ public class WarpFileWatcher {
     }
 
     private void checkAndSync() {
+        // Guard against post-shutdown execution
+        if (stopped.get()) {
+            return;
+        }
+        
         // Try native TeleportPlugin map first — more accurate and zero file I/O
         int nativeSynced;
         try {

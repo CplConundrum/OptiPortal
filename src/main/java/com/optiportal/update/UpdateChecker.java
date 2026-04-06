@@ -56,12 +56,8 @@ public class UpdateChecker {
 
     private String getCurrentVersion() {
         try {
-            // Read version from manifest.json in resources
-            InputStream manifestStream = OptiPortal.class.getClassLoader()
-                .getResourceAsStream("manifest.json");
-            if (manifestStream != null) {
-                JsonObject manifest = JsonParser.parseReader(new InputStreamReader(manifestStream)).getAsJsonObject();
-                return manifest.get("Version").getAsString();
+            if (plugin.getManifest() != null && plugin.getManifest().getVersion() != null) {
+                return plugin.getManifest().getVersion().toString();
             }
         } catch (Exception e) {
             plugin.getLogger().at(Level.WARNING).log("[OptiPortal] Failed to read manifest version: " + e.getMessage());
@@ -75,7 +71,7 @@ public class UpdateChecker {
         connection.setRequestProperty("User-Agent", "OptiPortal-UpdateChecker/1.0");
         connection.setConnectTimeout(5000); // 5 seconds
         connection.setReadTimeout(5000); // 5 seconds
-        
+
         try (InputStream inputStream = connection.getInputStream();
              InputStreamReader reader = new InputStreamReader(inputStream)) {
             return JsonParser.parseReader(reader).getAsJsonObject();

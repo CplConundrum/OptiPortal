@@ -85,12 +85,13 @@ public class CacheManager {
         this.metricsCollector = metricsCollector;
         // Run tier decay check every 10 seconds
         executor.scheduleAtFixedRate(this::decayTiers, 10, 10, TimeUnit.SECONDS);
+        // Empty bucket pruning is now done directly at mutation sites
     }
 
     /** Backwards-compat constructor for existing callers without registryFile */
     public CacheManager(PluginConfig config, WalManager walManager,
                         ScheduledExecutorService executor, WorldRegistry worldRegistry) {
-        this(config, walManager, executor, worldRegistry, null, new MetricsCollector());
+        this(config, walManager, executor, worldRegistry, null, null);
     }
 
     public void loadRegistry() {
@@ -174,7 +175,7 @@ public class CacheManager {
      * Mark a zone as having a WARM floor.
      * HOT→WARM decay proceeds normally, but WARM→COLD is blocked — the WARM timer
      * simply resets so the zone stays at WARM indefinitely.
-     * Used for WARM-strategy zones that must stay loaded but should still reflect idle state.
+     * Used for WARM-strategy zones that must stay loaded but should still reflect active/idle state.
      */
     public void markWarmFloor(String zoneId) {
         warmFloorZones.add(zoneId);
@@ -244,16 +245,17 @@ public class CacheManager {
             ConcurrentHashMap<Long, Set<String>> worldMap = chunkOwnership.get(worldName);
             if (worldMap == null) return;
             for (Long key : keys) {
-                Set<String> owners = worldMap.get(key);
-                if (owners != null) {
+                worldMap.computeIfPresent(key, (k, owners) -> {
                     boolean removed = owners.remove(zoneId);
                     if (removed) {
-                        tryReleaseKeepLoaded(worldName, (int)(long) key, (int)(key >>> 32));
+                        tryReleaseKeepLoaded(worldName, (int)(long) k, (int)(k >>> 32));
                     }
-                    if (owners.isEmpty()) {
-                        worldMap.remove(key, owners);
-                    }
-                }
+                    return owners.isEmpty() ? null : owners;
+                });
+            }
+            // Prune empty world bucket immediately
+            if (worldMap.isEmpty()) {
+                chunkOwnership.remove(worldName, worldMap);
             }
         });
     }
@@ -431,14 +433,10 @@ public class CacheManager {
     public boolean isChunkOwned(String world, int cx, int cz) {
         ConcurrentHashMap<Long, Set<String>> worldMap = chunkOwnership.get(world);
         if (worldMap == null) {
-            metricsCollector.recordCacheMiss();
             return false;
         }
         Set<String> owners = worldMap.get(packChunkIndex(cx, cz));
-        boolean owned = owners != null && !owners.isEmpty();
-        if (owned) metricsCollector.recordCacheHit();
-        else metricsCollector.recordCacheMiss();
-        return owned;
+        return owners != null && !owners.isEmpty();
     }
 
     /**
@@ -525,13 +523,18 @@ public class CacheManager {
     public void registerOwnershipBatch(String zoneId, String world, java.util.List<int[]> chunkCoords) {
         if (zoneId == null || chunkCoords == null || chunkCoords.isEmpty()) return;
 
+        ConcurrentHashMap<Long, Set<String>> worldMap =
+                chunkOwnership.computeIfAbsent(world, w -> new ConcurrentHashMap<>());
+        Set<Long> reverseKeys = zoneToChunks
+                .computeIfAbsent(zoneId, z -> new ConcurrentHashMap<>())
+                .computeIfAbsent(world, w -> ConcurrentHashMap.newKeySet());
         java.util.List<Long> engineIndexes = new java.util.ArrayList<>(chunkCoords.size());
         for (int[] coord : chunkCoords) {
             long key = packChunkIndex(coord[0], coord[1]);
-            boolean added = chunkOwnership.computeIfAbsent(world, w -> new ConcurrentHashMap<>())
-                                      .computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet())
-                                      .add(zoneId);
-            recordReverseOwnership(zoneId, world, key);
+            boolean added = worldMap
+                    .computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet())
+                    .add(zoneId);
+            reverseKeys.add(key);
             if (added) {
                 engineIndexes.add(ChunkUtil.indexChunk(coord[0], coord[1]));
             }
@@ -568,8 +571,8 @@ public class CacheManager {
                 .computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet())
                 .add(zoneId);
         recordReverseOwnership(zoneId, world, key);
-        if (added && chunk != null) {
-            chunk.addKeepLoaded();
+        if (added) {
+            addKeepLoadedAsync(world, cx, cz);
             LOG.fine(() -> "[OptiPortal] addKeepLoaded: " + world + ":" + cx + ":" + cz + " (zone: " + zoneId + ")");
         }
     }
@@ -586,21 +589,25 @@ public class CacheManager {
         Set<Long> zoneKeys = zoneToChunks.getOrDefault(zoneId, new ConcurrentHashMap<>())
                                          .get(world);
         for (int dx = -radius; dx <= radius; dx++) {
+            // Capture effectively final copies of loop variables for lambda
+            int finalDx = dx;
             for (int dz = -radius; dz <= radius; dz++) {
-                long key = packChunkIndex(cx + dx, cz + dz);
-                Set<String> owners = worldMap.get(key);
-                if (owners != null) {
+                int finalDz = dz;
+                long key = packChunkIndex(cx + finalDx, cz + finalDz);
+                worldMap.computeIfPresent(key, (k, owners) -> {
                     boolean removed = owners.remove(zoneId);
                     if (removed) {
                         // Release this zone's own pin unconditionally (per-zone pinning).
-                        tryReleaseKeepLoaded(world, cx + dx, cz + dz);
+                        tryReleaseKeepLoaded(world, cx + finalDx, cz + finalDz);
                     }
-                    if (owners.isEmpty()) {
-                        worldMap.remove(key, owners);
-                    }
-                }
+                    return owners.isEmpty() ? null : owners;
+                });
                 if (zoneKeys != null) zoneKeys.remove(key);
             }
+        }
+        // Prune empty world bucket immediately
+        if (worldMap.isEmpty()) {
+            chunkOwnership.remove(world, worldMap);
         }
     }
 
@@ -623,20 +630,39 @@ public class CacheManager {
             ConcurrentHashMap<Long, Set<String>> worldMap = chunkOwnership.get(worldName);
             if (worldMap == null) return;
             for (Long key : keys) {
-                Set<String> owners = worldMap.get(key);
-                if (owners != null) {
+                worldMap.computeIfPresent(key, (k, owners) -> {
                     boolean removed = owners.remove(zoneId);
                     if (removed) {
                         // Per-zone pinning: release this zone's own pin unconditionally.
-                        tryReleaseKeepLoaded(worldName, (int)(long) key, (int)(key >>> 32));
+                        tryReleaseKeepLoaded(worldName, (int)(long) k, (int)(k >>> 32));
                     }
-                    if (owners.isEmpty()) {
-                        worldMap.remove(key, owners);
-                    }
-                }
+                    return owners.isEmpty() ? null : owners;
+                });
+            }
+            // Prune empty world bucket immediately
+            if (worldMap.isEmpty()) {
+                chunkOwnership.remove(worldName, worldMap);
             }
         });
         LOG.info("[OptiPortal] Deregistered ownership for zone: " + zoneId);
+    }
+
+    /**
+     * Prunes empty world buckets from chunkOwnership to prevent accumulation
+     * after repeated world churn.
+     *
+     * Note: This method is now only called during shutdown for safety.
+     * Direct cleanup is performed at mutation sites (releaseZoneChunks, deregisterAllChunks, etc.)
+     * to avoid unnecessary map iterations.
+     */
+    public void pruneEmptyWorldBuckets() {
+        chunkOwnership.entrySet().removeIf(entry -> {
+            boolean isEmpty = entry.getValue().isEmpty();
+            if (isEmpty) {
+                LOG.fine(() -> "[OptiPortal] Pruned empty world bucket: " + entry.getKey());
+            }
+            return isEmpty;
+        });
     }
 
     /**
@@ -685,6 +711,11 @@ public class CacheManager {
                         + "' downgraded " + current + " → " + downgraded
                         + " (chunk evicted: " + worldName + ":" + cx + ":" + cz + ")");
             }
+        }
+
+        // Prune empty world bucket immediately
+        if (worldMap.isEmpty()) {
+            chunkOwnership.remove(worldName, worldMap);
         }
 
         LOG.fine("[OptiPortal] onChunkEvicted: removed ownership for "
@@ -738,6 +769,11 @@ public class CacheManager {
                 LOG.info(() -> "[OptiPortal] onChunksEvicted: zone '" + zoneId
                         + "' downgraded " + current + " → " + downgraded);
             }
+        }
+
+        // Prune empty world bucket immediately
+        if (worldMap.isEmpty()) {
+            chunkOwnership.remove(worldName, worldMap);
         }
 
         LOG.fine(() -> "[OptiPortal] onChunksEvicted: batch removed " + evictions.size()

@@ -17,9 +17,14 @@ import java.util.UUID;
 import javax.annotation.Nonnull;
 
 /**
- * ECS system that tracks player death locations for OptiPortal cache management.
+ * ECS system for tracking player death locations for OptiPortal cache management.
  *
- * <p>Registers via {@code EntityStore.REGISTRY.registerSystem()} and listens for
+ * <p><b>DORMANT: This system is intentionally not wired into startup.</b>
+ * Death location tracking is already handled by {@link com.optiportal.integrations.GravestoneIntegration},
+ * which registers for GravestoneCreatedEvent and calls {@link com.optiportal.player.DeathLocationTracker#onPlayerDeath}.
+ * This ECS-based approach would duplicate that flow and is therefore left dormant.
+ *
+ * <p>Registered via {@code EntityStore.REGISTRY.registerSystem()} and listens for
  * the {@code DeathComponent} added event (triggered on player death). When a player
  * dies, this system captures the death location and triggers OptiPortal's death
  * location tracker to pre-load the chunk for respawn caching.

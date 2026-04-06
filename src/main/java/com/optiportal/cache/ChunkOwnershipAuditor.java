@@ -15,6 +15,18 @@ import it.unimi.dsi.fastutil.longs.LongSet;
  * Periodically audits the CacheManager chunk ownership map against what
  * the engine reports as actually loaded, detecting eviction drift.
  *
+ * <p><b>DORMANT: This class is intentionally not wired into startup.</b>
+ * It may be activated in a future pass if eviction drift detection proves necessary.
+ *
+ * <p><b>Lifecycle safety note:</b> This class schedules recurring tasks via
+ * {@code executor.scheduleAtFixedRate()}. If ever activated, callers must ensure
+ * explicit cancellation via {@code ScheduledFuture.cancel()} or plugin shutdown
+ * hooks to avoid task leaks, as {@link com.hypixel.hytale.server.core.plugin.PluginBase}
+ * does not automatically cancel arbitrary executor tasks during cleanup.
+ *
+ * Audits run every N minutes (configurable via ownershipAuditIntervalMinutes).
+ * On detection, CacheManager.onChunkEvicted() is called to clean up.
+ *
  * "Drift" occurs when the engine evicts a chunk (due to memory pressure,
  * world unload, or other causes) without OptiPortal receiving a corresponding
  * event. The ownership map then references chunks that no longer exist,

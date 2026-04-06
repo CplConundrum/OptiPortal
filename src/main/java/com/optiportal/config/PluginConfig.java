@@ -58,7 +58,7 @@ public class PluginConfig {
     // Decay (how fast zones cool down)
     private int hotDecaySeconds = 30;
     private int warmDecayMinutes = 45;
-    private int pollIntervalSeconds = 1;
+    private int pollIntervalSeconds = 2;
 
     // TTL (days, -1 = never)
     private int ttlWarm = -1;
@@ -397,6 +397,11 @@ public class PluginConfig {
         activation.addProperty("commitWindowSeconds", 3);
         activation.addProperty("predictiveRadius", 7);
 
+        JsonObject decay = new JsonObject();
+        decay.addProperty("hotDecaySeconds", 30);
+        decay.addProperty("warmDecayMinutes", 45);
+        decay.addProperty("pollIntervalSeconds", 2);
+
         JsonObject ttl = new JsonObject();
         ttl.addProperty("warm", -1);
         ttl.addProperty("recentHot", 7);
@@ -485,6 +490,7 @@ public class PluginConfig {
         root.addProperty("stagedLoadConcurrency", 5);
         root.add("defaults", defaults);
         root.add("activation", activation);
+        root.add("decay", decay);
         root.add("ttl", ttl);
         root.add("cache", cache);
         root.add("warps", warps);

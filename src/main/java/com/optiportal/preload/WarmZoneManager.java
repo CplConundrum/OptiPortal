@@ -58,6 +58,9 @@ public class WarmZoneManager {
     private final AtomicBoolean worldsReady = new AtomicBoolean(false);
     // Guards runStagedLoad — only one execution allowed, ever.
     private final AtomicBoolean stagedLoadStarted = new AtomicBoolean(false);
+    // Shutdown flag to prevent late startup callbacks from doing work
+    private final AtomicBoolean stopped = new AtomicBoolean(false);
+    private volatile CompletableFuture<Void> universeReadyTask;
 
     public WarmZoneManager(PluginConfig config, StorageBackend storage,
                            CacheManager cacheManager, ScheduledExecutorService executor) {
@@ -82,6 +85,11 @@ public class WarmZoneManager {
     @SuppressWarnings("unchecked")
     public void registerWorldsLoadedListener(EventRegistry events) {
         events.register(AllWorldsLoadedEvent.class, event -> {
+            // Guard against post-shutdown execution
+            if (stopped.get()) {
+                LOG.fine(() -> "[OptiPortal] AllWorldsLoadedEvent handler skipped: already stopped");
+                return;
+            }
             // Seed WorldRegistry from Universe — this is the authoritative world map
             Universe universe = Universe.get();
             if (universe != null && chunkPreloader != null) {
@@ -106,6 +114,11 @@ public class WarmZoneManager {
     }
 
     public void triggerStagedLoadOnce() {
+        // Guard against post-shutdown execution
+        if (stopped.get()) {
+            LOG.fine(() -> "[OptiPortal] triggerStagedLoadOnce skipped: already stopped");
+            return;
+        }
         LOG.fine(() -> "[OptiPortal] triggerStagedLoadOnce called, stagedLoadStarted=" + stagedLoadStarted.get());
         worldsReady.set(true);
         if (pollTask != null) pollTask.cancel(false);
@@ -121,17 +134,29 @@ public class WarmZoneManager {
     private volatile java.util.concurrent.ScheduledFuture<?> pollTask;
 
     public void startStagedLoad() {
+        // Guard against post-shutdown execution
+        if (stopped.get()) {
+            LOG.fine(() -> "[OptiPortal] startStagedLoad skipped: already stopped");
+            return;
+        }
+        
         // Primary path: hook into Universe.getUniverseReady() — fires exactly once when
         // the universe is fully initialised. No polling needed.
         Universe universe = Universe.get();
         if (universe != null) {
-            universe.getUniverseReady().thenRunAsync(this::triggerStagedLoadOnce, executor)
-                    .exceptionally(ex -> {
-                        LOG.warning(() -> "[OptiPortal] startStagedLoad: Universe.getUniverseReady() failed: "
-                                + ex.getMessage() + " — falling back to polling");
-                        startPollingFallback();
-                        return null;
-                    });
+            // Split the future chain: store the direct thenRunAsync stage for cancellation,
+            // attach exceptionally as a side effect without overwriting.
+            CompletableFuture<Void> readyTask =
+                    universe.getUniverseReady().thenRunAsync(this::triggerStagedLoadOnce, executor);
+            universeReadyTask = readyTask;
+            readyTask.exceptionally(ex -> {
+                LOG.warning(() -> "[OptiPortal] startStagedLoad: Universe.getUniverseReady() failed: "
+                        + ex.getMessage() + " — falling back to polling");
+                if (!stopped.get()) {
+                    startPollingFallback();
+                }
+                return null;
+            });
         } else {
             // Universe not yet available — use polling fallback
             LOG.warning(() -> "[OptiPortal] startStagedLoad: Universe.get() is null — using polling fallback");
@@ -141,12 +166,22 @@ public class WarmZoneManager {
 
     /** Polling fallback for environments where Universe.getUniverseReady() is unavailable. */
     private void startPollingFallback() {
+        // Guard against post-shutdown execution
+        if (stopped.get()) {
+            LOG.fine(() -> "[OptiPortal] startPollingFallback skipped: already stopped");
+            return;
+        }
         pollTask = executor.scheduleWithFixedDelay(this::pollWorldsReady, 2, 2, java.util.concurrent.TimeUnit.SECONDS);
     }
 
     private final java.util.concurrent.atomic.AtomicInteger pollCount = new java.util.concurrent.atomic.AtomicInteger(0);
 
     private void pollWorldsReady() {
+        // Guard against post-shutdown execution
+        if (stopped.get()) {
+            LOG.fine(() -> "[OptiPortal] pollWorldsReady skipped: already stopped");
+            return;
+        }
         if (worldsReady.get()) {
             if (pollTask != null) pollTask.cancel(false);
             return;
@@ -174,6 +209,12 @@ public class WarmZoneManager {
     }
 
     private void runStagedLoad() {
+        // Guard against post-shutdown execution
+        if (stopped.get()) {
+            LOG.fine(() -> "[OptiPortal] runStagedLoad skipped: already stopped");
+            return;
+        }
+        
         LOG.info(() -> "[OptiPortal] runStagedLoad executing...");
         List<PortalEntry> all = storage.loadAll();
 
@@ -321,6 +362,7 @@ public class WarmZoneManager {
                 // D4: supply executor so storage I/O runs on the plugin executor,
                 //     not ForkJoinPool.commonPool() (the thenRunAsync default).
                 .thenRunAsync(() -> {
+                    if (stopped.get()) return; // Guard against post-shutdown execution
                     cacheManager.setZoneTier(entry.getId(), CacheTier.HOT);
                     // WARM strategy zones never expire by design; eternal worlds also get no-decay.
                     com.hypixel.hytale.server.core.universe.world.World zoneWorld =
@@ -510,6 +552,24 @@ public class WarmZoneManager {
 
     public boolean isWorldsReady() {
         return worldsReady.get();
+    }
+
+    /**
+     * Stops the WarmZoneManager and cancels any pending startup tasks.
+     * Call from plugin shutdown before executor.shutdown().
+     */
+    public void stop() {
+        if (stopped.compareAndSet(false, true)) {
+            LOG.fine(() -> "[OptiPortal] WarmZoneManager stopping...");
+            if (pollTask != null) {
+                pollTask.cancel(false);
+                pollTask = null;
+            }
+            if (universeReadyTask != null) {
+                universeReadyTask.cancel(false);
+                universeReadyTask = null;
+            }
+        }
     }
 
     // -------------------------------------------------------------------------

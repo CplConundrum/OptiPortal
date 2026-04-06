@@ -1,7 +1,9 @@
 package com.optiportal.teleport;
 
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -69,6 +71,8 @@ public class TeleportInterceptor {
     private final RespawnTracker respawnTracker;
     private final DeathLocationTracker deathLocationTracker;
     private final GravestoneIntegration gravestoneIntegration;
+    private volatile List<PortalEntry> portalCache = Collections.emptyList();
+    private volatile Map<String, List<PortalEntry>> portalCacheByWorld = Collections.emptyMap();
 
     /**
      * Fallback pending respawn set used when GravestoneIntegration is null
@@ -92,6 +96,10 @@ public class TeleportInterceptor {
     private final ConcurrentHashMap<UUID, Long> lastSeenTeleportNanos = new ConcurrentHashMap<>();
     /** Tracks player's last known position before teleport for origin portal detection */
     private final ConcurrentHashMap<UUID, double[]> lastKnownPosition = new ConcurrentHashMap<>();
+    /** Last position that actually triggered a proximity scan; used to skip tiny no-op movement. */
+    private final ConcurrentHashMap<UUID, double[]> lastProximityCheckPosition = new ConcurrentHashMap<>();
+    /** Last wall-clock time a proximity scan actually ran for this player. */
+    private final ConcurrentHashMap<UUID, Long> lastProximityCheckMs = new ConcurrentHashMap<>();
 
     /**
      * Portal hotspot index: source-world → list of confirmed hotspots.
@@ -112,11 +120,13 @@ public class TeleportInterceptor {
 
     private ScheduledFuture<?> pollTask;
     private ScheduledFuture<?> cleanupTask;
+    private ScheduledFuture<?> cooldownCleanupTask;
 
     private static final int  HOTSPOT_CONFIDENCE_THRESHOLD  = 3;
     private static final long PENDING_HOTSPOT_TTL_MS        = 7L  * 24 * 60 * 60 * 1000;
     private static final long CONFIRMED_HOTSPOT_TTL_MS      = 30L * 24 * 60 * 60 * 1000;
     private static final long HOTSPOT_CLEANUP_INTERVAL_H    = 24;
+    private static final long COOLDOWN_CLEANUP_INTERVAL_H    = 1;
 
 
     public TeleportInterceptor(OptiPortal plugin, PluginConfig config,
@@ -136,6 +146,7 @@ public class TeleportInterceptor {
         this.deathLocationTracker = deathLocationTracker;
         this.gravestoneIntegration = gravestoneIntegration;
         this.executor = executor;
+        refreshPortalCache();
         // Poll TeleportRecord every second to detect walk-through portal teleports.
         // No portal-use event exists in Hytale for zone-trigger portals.
         int pollInterval = config.getPollIntervalSeconds();
@@ -144,6 +155,9 @@ public class TeleportInterceptor {
         cleanupTask = executor.scheduleWithFixedDelay(
                 this::cleanupStaleHotspots,
                 HOTSPOT_CLEANUP_INTERVAL_H, HOTSPOT_CLEANUP_INTERVAL_H, TimeUnit.HOURS);
+        cooldownCleanupTask = executor.scheduleWithFixedDelay(
+                this::pruneStaleCooldowns,
+                COOLDOWN_CLEANUP_INTERVAL_H, COOLDOWN_CLEANUP_INTERVAL_H, TimeUnit.HOURS);
     }
 
     // Protected getters for subclass access
@@ -173,16 +187,41 @@ public class TeleportInterceptor {
 
     /**
      * Refreshes the in-memory portal cache from storage.
-     * No-op on the base class; overridden by AsyncTeleportInterceptor.
      */
-    public void refreshPortalCache() {}
+    public void refreshPortalCache() {
+        rebuildPortalCachesFrom(storage.loadAll());
+    }
+
+    private void rebuildPortalCachesFrom(List<PortalEntry> entries) {
+        List<PortalEntry> allSnapshot = Collections.unmodifiableList(new java.util.ArrayList<>(entries));
+
+        Map<String, List<PortalEntry>> grouped = new HashMap<>();
+        for (PortalEntry entry : allSnapshot) {
+            grouped.computeIfAbsent(entry.getWorld(), k -> new java.util.ArrayList<>()).add(entry);
+        }
+
+        Map<String, List<PortalEntry>> byWorldSnapshot = new HashMap<>();
+        for (Map.Entry<String, List<PortalEntry>> e : grouped.entrySet()) {
+            byWorldSnapshot.put(
+                    e.getKey(),
+                    Collections.unmodifiableList(new java.util.ArrayList<>(e.getValue()))
+            );
+        }
+
+        this.portalCache = allSnapshot;
+        this.portalCacheByWorld = Collections.unmodifiableMap(byWorldSnapshot);
+    }
 
     /**
      * Returns all portal entries for proximity checks.
-     * Subclasses override this to return an in-memory cache instead of hitting storage.
      */
     protected List<PortalEntry> getAllPortalEntries() {
-        return storage.loadAll();
+        return portalCache;
+    }
+
+    protected List<PortalEntry> getPortalEntriesForWorld(String worldName) {
+        if (worldName == null) return Collections.emptyList();
+        return portalCacheByWorld.getOrDefault(worldName, Collections.emptyList());
     }
 
     protected ConcurrentHashMap<UUID, Long> getLastSeenTeleportNanos() {
@@ -239,6 +278,9 @@ public class TeleportInterceptor {
      * Zone name format in Hytale: regionName from ZoneDiscoveryInfo.
      */
     private void onDiscoverZone(DiscoverZoneEvent.Display event) {
+        // Guard against post-shutdown execution
+        if (plugin.isShuttingDown()) return;
+        
         String zoneName = event.getDiscoveryInfo().regionName();
         LOG.fine(() -> "[OptiPortal] DiscoverZoneEvent raw='" + zoneName + "'");
         if (zoneName == null || zoneName.isBlank()) return;
@@ -348,7 +390,7 @@ public class TeleportInterceptor {
                 final World w = world;
                 w.execute(() -> {
                     try {
-                        // ── Teleport detection ──────────────────────────────
+                        // ── Teleport detection ─────────────────────────────
                         TeleportRecord record = pRef.getComponent(TeleportRecord.getComponentType());
                         if (record != null) {
                             TeleportRecord.Entry last = record.getLastTeleport();
@@ -374,6 +416,9 @@ public class TeleportInterceptor {
                                                 // Compute source world before entering executor lambda
                                                 final String sourceWorld = dw.equals(w.getName()) ? dw : w.getName();
                                                 executor.execute(() -> {
+                                                    // Guard against post-shutdown execution
+                                                    if (plugin.isShuttingDown()) return;
+                                                    
                                                     LOG.fine(() -> "[OptiPortal] Poll teleport → "
                                                         + dx + "," + dy + "," + dz + " world=" + dw);
                                                     lingerOriginZone(fUuid);
@@ -417,11 +462,13 @@ public class TeleportInterceptor {
                                     final double dstX = cx, dstZ = cz;
                                     final String jWorld = curWorld;
                                     executor.execute(() -> {
+                                        // Guard against post-shutdown execution
+                                        if (plugin.isShuttingDown()) return;
+                                        
                                         PortalEntry best = null;
                                         double bestD = config.getActivationDistance() * 2;
-                                        for (PortalEntry pe : getAllPortalEntries()) {
+                                        for (PortalEntry pe : getPortalEntriesForWorld(jWorld)) {
                                             if (pe.isInstanced() || pe.getId().contains(":")) continue;
-                                            if (!pe.getWorld().equals(jWorld)) continue;
                                             // D2: Use Math.hypot instead of Math.sqrt for better performance
                                             double d = Math.hypot(pe.getX() - dstX, pe.getZ() - dstZ);
                                             if (d < bestD) { bestD = d; best = pe; }
@@ -442,7 +489,13 @@ public class TeleportInterceptor {
                             // Save position for origin detection on next teleport
                             lastKnownPosition.put(uuid, new double[]{cx, cy, cz});
                             final UUID fUuid2 = uuid;
-                            executor.execute(() -> checkProximityAndPreload(fUuid2, curWorld, cx, cy, cz));
+                            if (shouldRunProximityCheck(fUuid2, cx, cy, cz)) {
+                                executor.execute(() -> {
+                                    // Guard against post-shutdown execution
+                                    if (plugin.isShuttingDown()) return;
+                                    checkProximityAndPreload(fUuid2, curWorld, cx, cy, cz);
+                                });
+                            }
                         }
                     } catch (Exception e) {
                         LOG.warning(() -> "[OptiPortal] poll error: " + e);
@@ -455,6 +508,9 @@ public class TeleportInterceptor {
     }
 
     private void onAddPlayerToWorld(AddPlayerToWorldEvent event) {
+        // Guard against post-shutdown execution
+        if (plugin.isShuttingDown()) return;
+        
         World world = event.getWorld();
         if (world == null) return;
         String worldName = world.getName();
@@ -496,9 +552,8 @@ public class TeleportInterceptor {
      * Check proximity to all portals and trigger preload if within activation distance.
      */
     private void checkProximityAndPreload(UUID playerUuid, String worldName, double px, double py, double pz) {
-        for (com.optiportal.model.PortalEntry entry : getAllPortalEntries()) {
+        for (com.optiportal.model.PortalEntry entry : getPortalEntriesForWorld(worldName)) {
             if (entry.isInstanced()) continue;
-            if (!entry.getWorld().equals(worldName)) continue;
             if (entry.getId().contains(":")) continue; // skip death:, respawn:, etc.
 
             // Per-zone horizontal override; falls back to global config
@@ -592,9 +647,8 @@ public class TeleportInterceptor {
         PortalEntry destEntry = null;
         double bestDist = Double.MAX_VALUE;
 
-        for (PortalEntry entry : getAllPortalEntries()) {
+        for (PortalEntry entry : getPortalEntriesForWorld(destWorld)) {
             if (entry.isInstanced()) continue;
-            if (!entry.getWorld().equals(destWorld)) continue;
             if (entry.getId().contains(":")) continue;
             // D2: Use Math.hypot instead of Math.sqrt for better performance
             double dist = Math.hypot(entry.getX() - dx, entry.getZ() - dz);
@@ -646,9 +700,8 @@ public class TeleportInterceptor {
     protected String findNearestPortal(String worldName, double px, double py, double pz) {
         String best = null;
         double bestDist = config.getActivationDistance();
-        for (PortalEntry entry : getAllPortalEntries()) {
+        for (PortalEntry entry : getPortalEntriesForWorld(worldName)) {
             if (entry.isInstanced()) continue;
-            if (!entry.getWorld().equals(worldName)) continue;
             if (entry.getId().contains(":")) continue;
             // D2: Use Math.hypot instead of Math.sqrt for better performance
             double dist = Math.hypot(entry.getX() - px, entry.getZ() - pz);
@@ -669,10 +722,9 @@ public class TeleportInterceptor {
         
         String prevZoneId = null;
         double bestDist = Double.MAX_VALUE;
-        for (PortalEntry entry : getAllPortalEntries()) {
+        for (PortalEntry entry : getPortalEntriesForWorld(worldName)) {
             if (entry.isInstanced()) continue;
             if (entry.getId().contains(":")) continue;
-            if (!entry.getWorld().equals(worldName)) continue; // Only consider portals in the same world
             // D2: Use Math.hypot instead of Math.sqrt for better performance
             double dist = Math.hypot(entry.getX() - prePos[0], entry.getZ() - prePos[2]);
             if (dist < bestDist) {
@@ -710,6 +762,9 @@ public class TeleportInterceptor {
      * PlayerRef already cached in onAddPlayerToWorld; nothing extra needed here.
      */
     private void onPlayerReady(PlayerReadyEvent event) {
+        // Guard against post-shutdown execution
+        if (plugin.isShuttingDown()) return;
+        
         Player player = event.getPlayer();
         if (player == null) return;
 
@@ -816,6 +871,9 @@ public class TeleportInterceptor {
      * for world-to-world transitions where the player stays on the server.
      */
     private void onDrainPlayerFromWorld(DrainPlayerFromWorldEvent event) {
+        // Guard against post-shutdown execution
+        if (plugin.isShuttingDown()) return;
+        
         World world = event.getWorld();
         Transform transform = event.getTransform();
         if (world == null || transform == null) return;
@@ -835,6 +893,7 @@ public class TeleportInterceptor {
         // Offload to executor — linger/link ops are not world-thread-safe.
         executor.execute(() -> {
             if (fUuid == null) return; // no UUID = non-player entity, skip
+            if (plugin.isShuttingDown()) return; // Guard against post-shutdown execution
 
             // 1. Stamp the pre-portal position so the NEXT teleport poll can
             //    use it for portal-link learning (replaces the stale poll value).
@@ -858,6 +917,9 @@ public class TeleportInterceptor {
      * thread does not cold-load those chunks when the player arrives.
      */
     private void onPlayerConnect(PlayerConnectEvent event) {
+        // Guard against post-shutdown execution
+        if (plugin.isShuttingDown()) return;
+        
         World world = event.getWorld();
         if (world == null) return;
 
@@ -889,6 +951,7 @@ public class TeleportInterceptor {
 
         // Fire predictive load on executor — never block the connect event handler
         executor.execute(() -> {
+            if (plugin.isShuttingDown()) return; // Guard against post-shutdown execution
             int cx = com.optiportal.preload.ChunkPreloader.toChunkCoord(spawnX);
             int cz = com.optiportal.preload.ChunkPreloader.toChunkCoord(spawnZ);
             String zoneId = "spawn:" + worldName + ":" + cx + ":" + cz;
@@ -899,6 +962,9 @@ public class TeleportInterceptor {
     }
 
     private void onPlayerDisconnect(PlayerDisconnectEvent event) {
+        // Guard against post-shutdown execution
+        if (plugin.isShuttingDown()) return;
+        
         UUID uuid = event.getPlayerRef().getUuid();
         if (uuid != null) {
             removePlayerRef(uuid);
@@ -923,6 +989,24 @@ public class TeleportInterceptor {
             cleanupTask.cancel(false);
             cleanupTask = null;
         }
+        if (cooldownCleanupTask != null) {
+            cooldownCleanupTask.cancel(false);
+            cooldownCleanupTask = null;
+        }
+        
+        // Clear all interceptor-owned tracking collections to prevent retention
+        pendingRespawnCapture.clear();
+        reversePreloadCooldowns.clear();
+        cooldowns.clear();
+        playerRefs.clear();
+        lastSeenTeleportNanos.clear();
+        lastKnownPosition.clear();
+        lastProximityCheckPosition.clear();
+        lastProximityCheckMs.clear();
+        portalHotspots.clear();
+        pendingHotspotCounts.clear();
+        portalCache = Collections.emptyList();
+        portalCacheByWorld = Collections.emptyMap();
     }
 
     /**
@@ -942,6 +1026,10 @@ public class TeleportInterceptor {
      * @param portalId The ID of the deleted portal
      */
     public void onPortalDeleted(String portalId) {
+        rebuildPortalCachesFrom(portalCache.stream()
+                .filter(entry -> !entry.getId().equals(portalId))
+                .toList());
+
         // Remove any pending hotspot keys that reference this portal as destination
         pendingHotspotCounts.keySet().removeIf(key -> key.endsWith(":" + portalId));
 
@@ -952,7 +1040,27 @@ public class TeleportInterceptor {
         // Drop empty world buckets so they do not accumulate after portal deletion.
         portalHotspots.entrySet().removeIf(e -> e.getValue().isEmpty());
 
+        // Prune reversePreloadCooldowns for the deleted portal
+        reversePreloadCooldowns.remove(portalId);
+
         LOG.fine(() -> "[OptiPortal] Cleared pending and confirmed hotspot state for deleted portal: " + portalId);
+    }
+
+    /**
+     * Prunes stale reversePreloadCooldowns entries based on age.
+     * Called periodically to prevent indefinite growth from one-time portal IDs.
+     */
+    public void pruneStaleCooldowns() {
+        long now = System.currentTimeMillis();
+        long cutoff = now - 30_000L; // 30-second TTL for reverse preload cooldowns
+        
+        reversePreloadCooldowns.entrySet().removeIf(entry -> {
+            Long last = entry.getValue();
+            return last != null && last < cutoff;
+        });
+        
+        LOG.fine(() -> "[OptiPortal] Pruned stale reversePreloadCooldowns: "
+                + "remaining=" + reversePreloadCooldowns.size());
     }
 
     /**
@@ -989,8 +1097,52 @@ public class TeleportInterceptor {
         playerRefs.remove(uuid);
         cooldowns.remove(uuid);
         lastKnownPosition.remove(uuid);
+        lastProximityCheckPosition.remove(uuid);
+        lastProximityCheckMs.remove(uuid);
         lastSeenTeleportNanos.remove(uuid);
         pendingRespawnCapture.remove(uuid);
+    }
+
+    /**
+     * Skip proximity work when the player has barely moved since the last successful check.
+     * This reduces always-on polling overhead while still reacting quickly to real movement.
+     */
+    private boolean shouldRunProximityCheck(UUID playerUuid, double x, double y, double z) {
+        if (playerUuid == null) return true;
+
+        long now = System.currentTimeMillis();
+        double[] current = new double[]{x, y, z};
+        double[] previous = lastProximityCheckPosition.get(playerUuid);
+        Long lastMs = lastProximityCheckMs.get(playerUuid);
+        if (previous == null || lastMs == null) {
+            lastProximityCheckPosition.put(playerUuid, current);
+            lastProximityCheckMs.put(playerUuid, now);
+            return true;
+        }
+
+        double dx = x - previous[0];
+        double dy = y - previous[1];
+        double dz = z - previous[2];
+        double distSq = dx * dx + dy * dy + dz * dz;
+
+        // Large moves should trigger immediately, even if the last scan was recent.
+        if (distSq >= 16.0) { // about 4 blocks total movement
+            lastProximityCheckPosition.put(playerUuid, current);
+            lastProximityCheckMs.put(playerUuid, now);
+            return true;
+        }
+
+        // For smaller movement, require both some movement and a short cadence gap.
+        if (distSq < 1.0) {
+            return false;
+        }
+        if (now - lastMs < 4_000L) {
+            return false;
+        }
+
+        lastProximityCheckPosition.put(playerUuid, current);
+        lastProximityCheckMs.put(playerUuid, now);
+        return true;
     }
 
     /**
@@ -1075,6 +1227,7 @@ public class TeleportInterceptor {
                 // D4: thenRunAsync dispatches storage I/O to the plugin executor instead of
                 //     running on whichever thread completed the chunk future (may be world thread).
                 .thenRunAsync(() -> {
+                    if (plugin.isShuttingDown()) return; // Guard against post-shutdown execution
                     var opt = storage.loadById(zoneId);
                     if (opt.isPresent()) {
                         com.optiportal.model.PortalEntry e = opt.get();

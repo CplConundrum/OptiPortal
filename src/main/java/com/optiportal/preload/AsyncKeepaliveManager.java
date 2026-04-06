@@ -20,9 +20,12 @@ import com.optiportal.storage.StorageBackend;
 
 /**
  * Enhanced keepalive manager with improved async operations.
- * 
- * This extends the original KeepaliveManager with better async handling,
- * batched operations, and reduced world thread impact.
+ *
+ * <p><b>DORMANT: This class is intentionally not wired into startup.</b>
+ * It may be activated in a future pass if the original {@link KeepaliveManager} proves insufficient.
+ *
+ * <p>This extends the original KeepaliveManager with better async handling, batched operations,
+ * and reduced world thread impact.
  */
 public class AsyncKeepaliveManager extends KeepaliveManager {
     

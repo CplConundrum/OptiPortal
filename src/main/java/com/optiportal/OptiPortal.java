@@ -11,6 +11,7 @@ import com.hypixel.hytale.server.core.plugin.JavaPlugin;
 import com.hypixel.hytale.server.core.plugin.JavaPluginInit;
 import com.optiportal.cache.CacheManager;
 import com.optiportal.cache.SnapshotScheduler;
+import com.optiportal.cache.ZoneTtlEnforcer;
 import com.optiportal.cache.WalManager;
 import com.optiportal.commands.PreloadCommand;
 import com.optiportal.config.PluginConfig;
@@ -44,6 +45,15 @@ import com.optiportal.update.UpdateChecker;
  * - Gravestone integration for precise cache release
  * - RAM measurement via Java Instrumentation with terrain profiling
  * - Native UI panel and full command interface
+ *
+ * Note: The following subsystems are currently dormant and not wired into startup:
+ * - PortalChunkListener
+ * - ChunkOwnershipAuditor
+ * - EnhancedChunkPreloader
+ * - AsyncTeleportInterceptor
+ * - AsyncKeepaliveManager
+ * - PlayerDeathSystem (redundant with GravestoneIntegration)
+ * They may be activated in a future pass if needed for specific use cases.
  */
 public class OptiPortal extends JavaPlugin {
 
@@ -62,6 +72,7 @@ public class OptiPortal extends JavaPlugin {
     private CacheManager cacheManager;
     private WalManager walManager;
     private SnapshotScheduler snapshotScheduler;
+    private com.optiportal.cache.ZoneTtlEnforcer ttlEnforcer;
 
     // Zone management
     private WorldRegistry worldRegistry;
@@ -90,7 +101,7 @@ public class OptiPortal extends JavaPlugin {
     }
 
     @Override
-    protected void start0() {
+    protected void start() {
         try {
             getLogger().at(Level.INFO).log("[OptiPortal] Starting up...");
 
@@ -114,17 +125,37 @@ public class OptiPortal extends JavaPlugin {
             // WAL manager for crash protection
             walManager = new WalManager(config);
 
+            // Shared metrics collector for the live runtime path
+            metricsCollector = new MetricsCollector();
+
             // World registry — populated via AddWorldEvent/RemoveWorldEvent
             worldRegistry = new WorldRegistry();
             worldRegistry.register(getEventRegistry());
 
             // Cache manager
-            cacheManager = new CacheManager(config, walManager, executor, worldRegistry);
+            cacheManager = new CacheManager(config, walManager, executor, worldRegistry, null, metricsCollector);
             cacheManager.loadRegistry();
+
+            // TTL enforcement for expired zones
+            ttlEnforcer = new com.optiportal.cache.ZoneTtlEnforcer(config, storage, cacheManager, executor);
+            ttlEnforcer.setOnZoneDeleted(id -> {
+                var registry = portalLinkRegistry;
+                var interceptor = teleportInterceptor;
+                if (registry != null) {
+                    registry.removeLink(id);
+                }
+                if (interceptor != null) {
+                    interceptor.onPortalDeleted(id);
+                }
+                if (interceptor != null) {
+                    interceptor.refreshPortalCache();
+                }
+            });
+            ttlEnforcer.start();
 
             // Zone manager
             warmZoneManager = new WarmZoneManager(config, storage, cacheManager, executor);
-            chunkPreloader = new ChunkPreloader(config, cacheManager, worldRegistry, executor, storage, new MetricsCollector());
+            chunkPreloader = new ChunkPreloader(config, cacheManager, worldRegistry, executor, storage, metricsCollector, this::isShuttingDown);
             warmZoneManager.setChunkPreloader(chunkPreloader); // break circular dep via setter
 
             // Register AllWorldsLoadedEvent listener — actual chunk loading is gated on this
@@ -160,7 +191,6 @@ public class OptiPortal extends JavaPlugin {
             getCommandRegistry().registerCommand(new PreloadCommand(this));
 
             // Metrics
-            metricsCollector = new MetricsCollector();
             if (config.isMetricsEnabled()) {
                 new bStatsIntegration(this, metricsCollector).init();
             }
@@ -199,7 +229,8 @@ public class OptiPortal extends JavaPlugin {
         }
     }
 
-    protected void shutdown0() {
+    @Override
+    protected void shutdown() {
         doShutdown();
     }
 
@@ -212,27 +243,56 @@ public class OptiPortal extends JavaPlugin {
 
         getLogger().at(Level.INFO).log("[OptiPortal] Shutdown detected, serializing warm zones...");
         try {
+            // Stop local components first so their own guards flip before unregistering
+            if (warmZoneManager != null) warmZoneManager.stop();
             if (teleportInterceptor != null) teleportInterceptor.stop();
             if (warpFileWatcher != null) warpFileWatcher.stop();
             if (snapshotScheduler != null) snapshotScheduler.stop();
             if (keepaliveManager != null) keepaliveManager.stop();
+            if (ttlEnforcer != null) ttlEnforcer.stop();
+            
+            // Serialize warm zones
             if (warmZoneManager != null) warmZoneManager.serializeAll();
+            
+            // Save cache registry
             if (cacheManager != null) cacheManager.saveRegistry();
-            // Flush portal link registry before executor shutdown to ensure pending links are persisted
+            
+            // Flush portal link registry before executor shutdown
             if (portalLinkRegistry != null) portalLinkRegistry.flush();
-            if (storage != null) storage.close();
+            
+            // Unregister plugin event listeners using engine's explicit cleanup API
+            if (getEventRegistry() != null) {
+                getEventRegistry().shutdownAndCleanup(true);
+            }
+            
+            // Shutdown executor before closing storage. If the graceful drain times out,
+            // shutdownNow() is called but does not guarantee running tasks have finished —
+            // so we await a second time to give interrupted tasks a chance to exit before
+            // storage.close() tears down the underlying SQL connection or file handles.
             if (executor != null) {
-            unregisterShutdownHook();
+                unregisterShutdownHook();
                 executor.shutdown();
                 try {
                     if (!executor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {
                         executor.shutdownNow();
+                        // Second await: give interrupted tasks up to 2s to exit cleanly.
+                        if (!executor.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS)) {
+                            getLogger().at(Level.WARNING).log(
+                                    "[OptiPortal] Executor still has running tasks after shutdownNow(); "
+                                  + "proceeding to storage close relying on shutdown guards to keep callbacks inert.");
+                        }
                     }
                 } catch (InterruptedException ie) {
                     executor.shutdownNow();
                     Thread.currentThread().interrupt();
+                    getLogger().at(Level.WARNING).log(
+                            "[OptiPortal] Interrupted while waiting for executor shutdown; "
+                          + "proceeding to storage close relying on shutdown guards.");
                 }
             }
+
+            // Close storage backend only after the executor is as quiescent as possible.
+            if (storage != null) storage.close();
             getLogger().at(Level.INFO).log("[OptiPortal] Cache saved cleanly.");
         } catch (Exception e) {
             getLogger().at(Level.SEVERE).log("[OptiPortal] Error during shutdown: " + e.getMessage());
@@ -290,6 +350,7 @@ public class OptiPortal extends JavaPlugin {
         // Reschedule timed subsystems with updated intervals
         snapshotScheduler.reschedule();
         keepaliveManager.reschedule();
+        if (ttlEnforcer != null) ttlEnforcer.reschedule();
 
         // Restart warp watcher in case path or interval changed
         warpFileWatcher.stop();
@@ -342,10 +403,16 @@ public class OptiPortal extends JavaPlugin {
     public MetricsCollector getMetricsCollector() { return metricsCollector; }
     public ScheduledExecutorService getExecutor() { return executor; }
     public com.optiportal.preload.PortalLinkRegistry getPortalLinkRegistry() { return portalLinkRegistry; }
+    public com.optiportal.cache.ZoneTtlEnforcer getTtlEnforcer() { return ttlEnforcer; }
     public com.optiportal.async.AsyncLoadBalancer getAsyncLoadBalancer() { return null; }
     public com.optiportal.async.AsyncErrorHandler getAsyncErrorHandler() { return null; }
     public com.optiportal.async.WorldTpsMonitor getTpsMonitor() { return null; }
     public com.optiportal.preload.PortalChunkListener getPortalChunkListener() { return null; }
+    
+    /** Check if the plugin is shutting down. Used by listeners to prevent post-shutdown work. */
+    public boolean isShuttingDown() {
+        return shuttingDown.get();
+    }
     
     // --- Integration with HytaleServer utilities ---
 
@@ -355,11 +422,11 @@ public class OptiPortal extends JavaPlugin {
      */
     public void enhancedPredictiveLoad(String worldName, double x, double z, int radius) {
         // Use the more advanced chunk loading strategy that considers terrain complexity
-        int cx = ChunkPreloader.toChunkCoord(x);
-        int cz = ChunkPreloader.toChunkCoord(z);
-        
-        // Prioritize loading based on terrain density (simplified version)
         // In a real implementation, this would use HytaleServer's density functions
+        
+        // Convert world coordinates to chunk coordinates
+        int cx = com.optiportal.preload.ChunkPreloader.toChunkCoord(x);
+        int cz = com.optiportal.preload.ChunkPreloader.toChunkCoord(z);
         
         // First load the inner ring with priority
         chunkPreloader.predictiveLoad(worldName, cx, cz, radius);

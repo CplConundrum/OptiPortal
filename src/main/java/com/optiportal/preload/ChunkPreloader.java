@@ -9,6 +9,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 import java.util.logging.Logger;
 
@@ -51,6 +52,12 @@ public class ChunkPreloader {
     private final MetricsCollector metricsCollector;
 
     /**
+     * Shutdown predicate supplied by the plugin. Post-load completions call this before
+     * mutating cache tier or storage so they are inert after shutdown starts.
+     */
+    private final BooleanSupplier shuttingDown;
+
+    /**
      * In-flight load dedup map: zoneId → relay future currently being loaded.
      * Shared by subclasses so both ChunkPreloader and EnhancedChunkPreloader
      * deduplicate against the same state.
@@ -63,12 +70,28 @@ public class ChunkPreloader {
                           ScheduledExecutorService executor,
                           StorageBackend storage,
                           MetricsCollector metricsCollector) {
-        this.config       = config;
-        this.cacheManager = cacheManager;
+        this(config, cacheManager, worldRegistry, executor, storage, metricsCollector, () -> false);
+    }
+
+    public ChunkPreloader(PluginConfig config,
+                          CacheManager cacheManager,
+                          WorldRegistry worldRegistry,
+                          ScheduledExecutorService executor,
+                          StorageBackend storage,
+                          MetricsCollector metricsCollector,
+                          BooleanSupplier shuttingDown) {
+        this.config        = config;
+        this.cacheManager  = cacheManager;
         this.worldRegistry = worldRegistry;
-        this.executor     = executor;
-        this.storage      = storage;
+        this.executor      = executor;
+        this.storage       = storage;
         this.metricsCollector = metricsCollector;
+        this.shuttingDown  = shuttingDown;
+    }
+
+    /** Exposed to subclasses so they can guard their own post-load completions. */
+    protected boolean isShuttingDown() {
+        return shuttingDown.getAsBoolean();
     }
 
     /**
@@ -222,6 +245,7 @@ public class ChunkPreloader {
                 // U1: thenRunAsync does not fire on a failed future (e.g. ChunkLoadAbortedException),
                 //     so HOT promotion is suppressed when the load was aborted by a guard.
                 CompletableFuture<Void> chainedFuture = future.thenRunAsync(() -> {
+                    if (isShuttingDown()) return;
                     cacheManager.setZoneTier(zid, com.optiportal.model.CacheTier.HOT);
                     if (loadedCount > 0) {
                         LOG.fine(() -> "[OptiPortal] predictiveLoad complete: " + zid + " → HOT (loaded=" + loadedCount + " shared=" + skipped + ")");
@@ -356,6 +380,7 @@ public class ChunkPreloader {
             final long startTime = System.nanoTime();
             // D4 + U1: thenRunAsync dispatches to executor; does not fire on failed future.
             CompletableFuture<Void> chainedFuture = future.thenRunAsync(() -> {
+                if (isShuttingDown()) return;
                 LOG.fine(() -> "[OptiPortal] warmLoad complete: " + zid + " (loaded=" + loadedCount + " shared=" + skipped + ")");
                 // Update entry stats using total chunk count so shared-chunk loads
                 // still record correct RAM. Save so the UI reflects updated values.
@@ -456,36 +481,33 @@ public class ChunkPreloader {
      */
     private List<int[]> buildChunkListWithDensity(String worldName, int cx, int cz, int radius) {
         World world = worldRegistry.getWorld(worldName);
-        List<int[]> chunks = new ArrayList<>((2 * radius + 1) * (2 * radius + 1));
-        for (int dx = -radius; dx <= radius; dx++) {
-            for (int dz = -radius; dz <= radius; dz++) {
-                chunks.add(new int[]{cx + dx, cz + dz});
+        List<int[]> ready = new ArrayList<>((2 * radius + 1) * (2 * radius + 1));
+        List<int[]> backoff = world == null ? java.util.Collections.emptyList() : new ArrayList<>();
+
+        // Build centre-outward directly by Chebyshev ring instead of sorting the full list.
+        for (int ring = 0; ring <= radius; ring++) {
+            for (int dx = -ring; dx <= ring; dx++) {
+                for (int dz = -ring; dz <= ring; dz++) {
+                    if (Math.max(Math.abs(dx), Math.abs(dz)) != ring) continue;
+
+                    int chunkX = cx + dx;
+                    int chunkZ = cz + dz;
+                    int[] coord = new int[]{chunkX, chunkZ};
+
+                    if (world != null && world.getChunkStore().isChunkOnBackoff(
+                            ChunkUtil.indexChunk(chunkX, chunkZ), ChunkStore.MAX_FAILURE_BACKOFF_NANOS)) {
+                        backoff.add(coord);
+                    } else {
+                        ready.add(coord);
+                    }
+                }
             }
         }
 
-        chunks.sort((c1, c2) -> {
-            // Primary: Chebyshev distance — inner chunks first
-            int d1 = Math.max(Math.abs(c1[0] - cx), Math.abs(c1[1] - cz));
-            int d2 = Math.max(Math.abs(c2[0] - cx), Math.abs(c2[1] - cz));
-            if (d1 != d2) return Integer.compare(d1, d2);
-
-            if (world != null) {
-                long idx1 = ChunkUtil.indexChunk(c1[0], c1[1]);
-                long idx2 = ChunkUtil.indexChunk(c2[0], c2[1]);
-
-                // Secondary: resident chunks first — claiming ownership costs zero IO
-                boolean bo1 = world.getChunkStore().isChunkOnBackoff(
-                        idx1, ChunkStore.MAX_FAILURE_BACKOFF_NANOS);
-                boolean bo2 = world.getChunkStore().isChunkOnBackoff(
-                        idx2, ChunkStore.MAX_FAILURE_BACKOFF_NANOS);
-
-                // Tertiary: backoff chunks last — they will be skipped in loadChunks
-                if (bo1 != bo2) return bo1 ? 1 : -1;
-            }
-            return 0;
-        });
-
-        return chunks;
+        if (world != null && !backoff.isEmpty()) {
+            ready.addAll(backoff);
+        }
+        return ready;
     }
 
     /**
@@ -615,26 +637,31 @@ public class ChunkPreloader {
                                 + ") — on failure backoff");
                         futures[i] = CompletableFuture.completedFuture((WorldChunk) null);
                     } else {
-                        final int finalCx = cx;
-                        final int finalCz = cz;
-                        final String finalZoneId = zoneId;
-
                         // Store.getComponent() requires the WorldThread — use the async API
                         // for all chunks; the engine returns a completed future for already-
                         // resident chunks without a disk hop.
                         CompletableFuture<WorldChunk> base = nonTicking
                                 ? world.getNonTickingChunkAsync(ChunkUtil.indexChunk(cx, cz))
                                 : world.getChunkAsync(ChunkUtil.indexChunk(cx, cz));
-                        futures[i] = base.thenApply(chunk -> {
-                            if (chunk != null && finalZoneId != null) {
-                                cacheManager.registerOwnership(finalZoneId,
-                                        world.getName(), finalCx, finalCz, chunk);
-                            }
-                            return chunk;
-                        });
+                        futures[i] = base;
                     }
                 }
-                CompletableFuture<Void> batchDone = CompletableFuture.allOf(futures);
+                CompletableFuture<Void> batchDone = CompletableFuture.allOf(futures)
+                        .thenRunAsync(() -> {
+                            if (zoneId == null) return;
+
+                            List<int[]> loadedCoords = new ArrayList<>(batch.size());
+                            for (int i = 0; i < batch.size(); i++) {
+                                WorldChunk chunk = futures[i].getNow(null);
+                                if (chunk != null) {
+                                    loadedCoords.add(batch.get(i));
+                                }
+                            }
+
+                            if (!loadedCoords.isEmpty()) {
+                                cacheManager.registerOwnershipBatch(zoneId, world.getName(), loadedCoords);
+                            }
+                        }, executor);
                 if (batchDelay <= 0) return batchDone;
                 // After batch completes, sleep before next batch
                 return batchDone.thenCompose(vv -> {
@@ -647,3 +674,4 @@ public class ChunkPreloader {
         return chain;
     }
 }
+

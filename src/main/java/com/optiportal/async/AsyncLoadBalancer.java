@@ -16,6 +16,17 @@ import com.optiportal.preload.WorldRegistry;
 /**
  * Load balancer for async operations to prevent world thread overload.
  *
+ * <p><b>DORMANT: This class is intentionally not wired into OptiPortal startup.</b>
+ * It manages the scheduling and execution of async operations with load balancing,
+ * adaptive batch sizing, and priority-based scheduling.
+ *
+ * <p><b>Lifecycle safety note:</b> This class schedules recurring tasks via
+ * {@code executor.scheduleAtFixedRate()} for load adjustment and task processing.
+ * If ever activated, callers must ensure explicit cancellation via
+ * {@code ScheduledFuture.cancel()} or plugin shutdown hooks to avoid task leaks,
+ * as {@link com.hypixel.hytale.server.core.plugin.PluginBase} does not automatically
+ * cancel arbitrary executor tasks during cleanup.
+ *
  * This component manages the scheduling and execution of async operations,
  * implementing load balancing, adaptive batch sizing, and priority-based
  * scheduling to optimize world thread usage.

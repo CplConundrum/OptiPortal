@@ -337,18 +337,26 @@ public class PreloadCommand extends AbstractCommand {
     }
 
     private CompletableFuture<Void> handleStatus(CommandContext ctx) {
-        com.optiportal.async.CircuitBreaker cb = plugin.getAsyncErrorHandler().getCircuitBreaker();
-        com.optiportal.async.CircuitBreaker.CircuitBreakerStats cbStats = cb.getStats();
-        com.optiportal.async.AsyncLoadBalancer.LoadStats lb = plugin.getAsyncLoadBalancer().getLoadStats();
+        // Read async components into locals - they may be null in base runtime
+        com.optiportal.async.AsyncErrorHandler asyncErrorHandler = plugin.getAsyncErrorHandler();
+        com.optiportal.async.AsyncLoadBalancer asyncLoadBalancer = plugin.getAsyncLoadBalancer();
         com.optiportal.async.WorldTpsMonitor tps = plugin.getTpsMonitor();
+        
         java.util.Map<com.optiportal.model.CacheTier, Integer> tiers = plugin.getCacheManager().getTierCounts();
         int totalChunks = plugin.getChunkPreloader().getWorldRegistry().getTotalLoadedChunkCount();
 
+        // Build CircuitBreakerStats from locals
+        com.optiportal.async.CircuitBreaker cb = asyncErrorHandler != null ? asyncErrorHandler.getCircuitBreaker() : null;
+        
+        // Build LoadStats from locals
+        com.optiportal.async.AsyncLoadBalancer.LoadStats lb = asyncLoadBalancer != null ? asyncLoadBalancer.getLoadStats() : null;
+
+        // Handle TPS monitor availability
         String tpsLabel;
         double tpsVal;
         if (tps == null) {
             tpsVal = -1;
-            tpsLabel = "N/A (disabled)";
+            tpsLabel = "unavailable";
         } else {
             tpsVal = tps.getCurrentTps();
             tpsLabel = tps.isCriticallyLoaded() ? "critical"
@@ -356,15 +364,31 @@ public class PreloadCommand extends AbstractCommand {
                      : "nominal";
         }
 
-        reply(ctx, "[OptiPortal] Status — v1.1.8");
-        reply(ctx, String.format("  Circuit breaker : %s  (failures=%d)", cbStats.state, cbStats.failureCount));
-        reply(ctx, String.format("  Load balancer   : active=%d queued=%d avgTime=%.0fms batchSize=%d",
-                lb.activeOperations, lb.queuedTasks, lb.averageExecutionTime, lb.currentBatchSize));
+        reply(ctx, "[OptiPortal] Status — 1.2.1");
+        
+        // Circuit breaker info
+        if (cb != null) {
+            com.optiportal.async.CircuitBreaker.CircuitBreakerStats cbStats = cb.getStats();
+            reply(ctx, String.format("  Circuit breaker : %s  (failures=%d)", cbStats.state, cbStats.failureCount));
+        } else {
+            reply(ctx, "  Circuit breaker : unavailable (async infrastructure inactive)");
+        }
+        
+        // Load balancer info
+        if (lb != null) {
+            reply(ctx, String.format("  Load balancer   : active=%d queued=%d avgTime=%.0fms batchSize=%d",
+                    lb.activeOperations, lb.queuedTasks, lb.averageExecutionTime, lb.currentBatchSize));
+        } else {
+            reply(ctx, "  Load balancer   : unavailable (async infrastructure inactive)");
+        }
+        
+        // TPS info
         if (tpsVal < 0) {
             reply(ctx, "  TPS             : N/A (monitor disabled)");
         } else {
             reply(ctx, String.format("  TPS             : %.1f tps  (%s)", tpsVal, tpsLabel));
         }
+        
         reply(ctx, String.format("  Server chunks   : %d loaded", totalChunks));
         reply(ctx, String.format("  Zone registry   : %d HOT  |  %d WARM  |  %d COLD  |  %d UNVISITED",
                 tiers.getOrDefault(com.optiportal.model.CacheTier.HOT, 0),

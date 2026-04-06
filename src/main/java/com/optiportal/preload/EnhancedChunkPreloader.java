@@ -6,11 +6,13 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 import java.util.logging.Logger;
 
 import com.hypixel.hytale.math.util.ChunkUtil;
 import com.hypixel.hytale.server.core.universe.world.World;
 import com.hypixel.hytale.server.core.universe.world.storage.ChunkStore;
+import com.optiportal.OptiPortal;
 import com.optiportal.async.AsyncLoadBalancer;
 import com.optiportal.async.AsyncMetrics;
 import com.optiportal.async.WorldThreadBridge;
@@ -23,13 +25,21 @@ import com.optiportal.storage.StorageBackend;
 
 /**
  * Enhanced chunk preloader with improved async handling.
- * 
- * This extends the original ChunkPreloader with better async operations,
- * load balancing, and world thread isolation to prevent blocking.
+ *
+ * <p><b>DORMANT: This class is intentionally not wired into startup.</b>
+ * It may be activated in a future pass if the original ChunkPreloader proves insufficient.
+ *
+ * <p>This extends the original ChunkPreloader with better async operations, load balancing,
+ * and world thread isolation to prevent blocking.
  */
 public class EnhancedChunkPreloader extends ChunkPreloader {
     
     private static final Logger LOG = Logger.getLogger("OptiPortal");
+
+    private static boolean pluginShuttingDownOrFalse() {
+        OptiPortal plugin = OptiPortal.getInstance();
+        return plugin != null && plugin.isShuttingDown();
+    }
     
     private final ScheduledExecutorService executor;
     private final WorldThreadBridge worldBridge;
@@ -68,7 +78,22 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
                                   StorageBackend storage,
                                   MetricsCollector metricsCollector,
                                   CorridorIndex corridorIndex) {
-        super(config, cacheManager, worldRegistry, executor, storage, metricsCollector);
+        this(config, cacheManager, worldRegistry, executor, worldBridge, loadBalancer, metrics,
+             storage, metricsCollector, corridorIndex, EnhancedChunkPreloader::pluginShuttingDownOrFalse);
+    }
+
+    public EnhancedChunkPreloader(PluginConfig config,
+                                  CacheManager cacheManager,
+                                  WorldRegistry worldRegistry,
+                                  ScheduledExecutorService executor,
+                                  WorldThreadBridge worldBridge,
+                                  AsyncLoadBalancer loadBalancer,
+                                  AsyncMetrics metrics,
+                                  StorageBackend storage,
+                                  MetricsCollector metricsCollector,
+                                  CorridorIndex corridorIndex,
+                                  BooleanSupplier shuttingDown) {
+        super(config, cacheManager, worldRegistry, executor, storage, metricsCollector, shuttingDown);
         this.executor = executor;
         this.worldBridge = worldBridge;
         this.loadBalancer = loadBalancer;
@@ -130,7 +155,21 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
                                   StorageBackend storage,
                                   MetricsCollector metricsCollector) {
         this(config, cacheManager, worldRegistry, executor, worldBridge,
-             loadBalancer, metrics, storage, metricsCollector, null);
+             loadBalancer, metrics, storage, metricsCollector, (CorridorIndex) null);
+    }
+
+    public EnhancedChunkPreloader(PluginConfig config,
+                                  CacheManager cacheManager,
+                                  WorldRegistry worldRegistry,
+                                  ScheduledExecutorService executor,
+                                  WorldThreadBridge worldBridge,
+                                  AsyncLoadBalancer loadBalancer,
+                                  AsyncMetrics metrics,
+                                  StorageBackend storage,
+                                  MetricsCollector metricsCollector,
+                                  BooleanSupplier shuttingDown) {
+        this(config, cacheManager, worldRegistry, executor, worldBridge,
+             loadBalancer, metrics, storage, metricsCollector, null, shuttingDown);
     }
     
     /**
@@ -245,7 +284,10 @@ public class EnhancedChunkPreloader extends ChunkPreloader {
             final String zid = zoneId;
             // U1: thenRunAsync does not fire on a failed future (ChunkLoadAbortedException),
             //     so HOT promotion is suppressed when the load was aborted by a guard.
-            return load.thenRunAsync(() -> cacheManager.setZoneTier(zid, CacheTier.HOT), executor)
+            return load.thenRunAsync(() -> {
+                if (isShuttingDown()) return;
+                cacheManager.setZoneTier(zid, CacheTier.HOT);
+            }, executor)
                     .exceptionally(ex -> {
                         if (ex instanceof ChunkLoadAbortedException || ex.getCause() instanceof ChunkLoadAbortedException) {
                             LOG.fine("[OptiPortal] enhancedPredictiveLoad aborted for " + zid + " — tier not promoted: " + ex.getMessage());

@@ -32,8 +32,11 @@ import com.optiportal.storage.StorageBackend;
 
 /**
  * Enhanced teleport interceptor with improved async handling.
- * 
- * This extends the original TeleportInterceptor with better async operations,
+ *
+ * <p><b>DORMANT: This class is intentionally not wired into startup.</b>
+ * It may be activated in a future pass if the original TeleportInterceptor proves insufficient.
+ *
+ * <p>This extends the original TeleportInterceptor with better async operations,
  * event-driven updates, and reduced world thread impact.
  */
 public class AsyncTeleportInterceptor extends TeleportInterceptor {
@@ -186,11 +189,19 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
         }, 0, POSITION_UPDATE_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
 
-    /** Cancel the staggered position update task. Call from plugin shutdown before executor.shutdown(). */
+    /** Cancel the staggered position update task and parent tasks. Call from plugin shutdown before executor.shutdown(). */
     @Override
     public void stop() {
         java.util.concurrent.ScheduledFuture<?> task = positionUpdateTask;
         if (task != null) task.cancel(false);
+        
+        // Clear subclass-owned caches to prevent retention
+        positionCaches.clear();
+        lastAsyncPosition.clear();
+        portalCache = Collections.emptyList();
+        
+        // Chain to parent to ensure pollTask and cleanupTask are also cancelled
+        super.stop();
     }
     
     /**
