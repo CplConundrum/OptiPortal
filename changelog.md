@@ -2,6 +2,34 @@
 
 ---
 
+## [1.2.1] - 2026-04-04
+
+### Fixed
+
+- **Startup and shutdown now follow the engine properly**: OptiPortal now uses the right `start()` and `shutdown()` hooks, cleans up its listeners on the way down, and gives async work a safer path to finish before storage closes.
+
+- **A handful of awkward startup and cleanup edge cases are gone**: This round tightens up early-startup retention, chunk-ownership races, and a few legacy shutdown guard paths so zones and preload state stay in sync during reloads and shutdowns.
+
+- **`/preload status` no longer falls over on the base runtime**: If the async subsystem is inactive, the command now says so clearly instead of crashing, while still showing the live runtime information that is available.
+
+- **TTL expiry now actually runs end to end**: The TTL enforcer is now part of the live plugin lifecycle, and expired zones now get the same cleanup as manual deletion so old links and cached portal state do not hang around.
+
+- **Metrics, version reporting, and dormant-system notes are now more consistent**: The live runtime now shares one metrics collector, update checks read version metadata from the plugin manifest, and the code is clearer about which subsystems are present but not currently active.
+
+---
+
+### Changed
+
+- **Teleport polling is less aggressive by default**: The base poll interval now defaults to `2` seconds instead of `1`, which cuts the always-on polling cost in half on servers using the default settings without changing the overall detection model.
+
+
+- **Multi-world portal scans now stay focused on the current world**: The teleport interceptor now keeps a per-world in-memory portal cache, so its hot lookup paths no longer scan and discard portals from unrelated worlds on every pass.
+
+- **Small player movements no longer trigger constant portal rescans**: Proximity checks now wait for either more meaningful movement or a short cadence gap before running another full scan, which trims steady background CPU without changing the broader polling design.
+
+- **The code is clearer about what is live and what is still dormant**: Non-active systems such as the async teleport/keepalive path, ownership auditor, and player death system are now called out more explicitly so future maintenance work has a cleaner picture of the real runtime surface.
+---
+
 ## [1.2.0] - 2026-03-29
 
 ### Fixed
@@ -531,3 +559,5 @@ New `config.json` fields (all optional, defaults apply if absent):
 ## [1.0.0] - 2026-03-10
 
 Initial release
+
+

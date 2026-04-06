@@ -6,6 +6,512 @@ mirror the version numbers in `changelog.md`.
 
 ---
 
+## [1.2.1] - 2026-04-04
+
+---
+
+### `OptiPortal` lifecycle now runs through the engine-owned `start()` / `shutdown()` hooks
+
+**Files:** `OptiPortal.java`
+
+**Root cause:**
+The plugin previously overrode `start0()` directly and defined a dead no-arg `shutdown0()`
+overload. Decompiled engine source shows that `PluginBase.start0()` and
+`PluginBase.shutdown0(boolean)` own state transitions and call `start()` / `shutdown()`
+internally. By replacing the outer lifecycle methods instead of the inner hooks, OptiPortal
+was bypassing the normal plugin-state path.
+
+**Fix:**
+- Moved startup logic into `protected void start()`
+- Moved shutdown entry into `protected void shutdown()`
+- Kept `doShutdown()` as the shared shutdown helper
+
+**Decompiled comparison:**
+- `decompiled/com/hypixel/hytale/server/core/plugin/PluginBase.java`
+
+**Threading:** No new concurrency behavior. This restores the intended engine lifecycle path.
+
+---
+
+### `/preload status` now degrades safely when the async subsystem is inactive
+
+**Files:** `PreloadCommand.java`, `OptiPortal.java`
+
+**Root cause:**
+`OptiPortal` intentionally returns `null` for the dormant async getters on the live base
+runtime, but `/preload status` dereferenced those getters directly, causing a command-path NPE.
+
+**Fix:**
+- `handleStatus()` now reads async getters into locals first
+- circuit breaker and load balancer sections now print an explicit “async infrastructure inactive”
+  message when those services are unavailable
+- base runtime information such as loaded chunk counts and cache-tier counts still renders
+
+**Threading:** None. This is command-surface null-safety only.
+
+---
+
+### Plugin event listeners not unregistered on shutdown
+
+**Files:** `OptiPortal.java`
+
+**Root cause:**
+`PluginBase.cleanup(boolean)` calls `this.eventRegistry.shutdown()`. Decompiled engine source
+confirms that `Registry.shutdown()` only sets `enabled = false` — it does not iterate
+registrations and does not call `unregister()` on any of them. Plugin-scoped listeners
+registered via `getEventRegistry().register*(...)` were therefore not provably collectible
+after plugin shutdown, only inert if every handler individually checks a shutdown flag.
+
+**Fix:**
+`OptiPortal.doShutdown()` now calls `getEventRegistry().shutdownAndCleanup(true)` after
+stopping all local components (so their stopped flags are set before listeners are torn down).
+`Registry.shutdownAndCleanup(boolean)` iterates registrations in reverse order, calls each
+one, then clears the list — the same path the engine uses for its own owned registries.
+
+**Threading:** Called on the shutdown thread after `warmZoneManager.stop()`,
+`teleportInterceptor.stop()`, and all other component stops complete. No concurrent event
+dispatch can occur after `shutdownAndCleanup` returns because the registry is then disabled
+and empty.
+
+---
+
+### `WarmZoneManager` retained by the universe-ready callback after shutdown
+
+**Files:** `WarmZoneManager.java`
+
+**Root cause:**
+`startStagedLoad()` called `Universe.getUniverseReady().thenRunAsync(this::triggerStagedLoadOnce, executor)`.
+The returned `CompletableFuture<Void>` was not stored. If `stop()` was called before the
+universe-ready future resolved (e.g. rapid server shutdown during startup), the pending stage
+still held a reference to `this::triggerStagedLoadOnce`, preventing the `WarmZoneManager`
+instance from being collected. Additionally, if the universe-ready future completed
+exceptionally, the fallback called `startPollingFallback()` unconditionally, starting a poll
+loop even if the plugin had already shut down.
+
+**Fix:**
+- Added `volatile CompletableFuture<Void> universeReadyTask` field.
+- `startStagedLoad()` now returns early if `stopped.get()`, stores the direct
+  `thenRunAsync(...)` stage in `universeReadyTask`, and attaches `exceptionally(...)` to that
+  same stage without overwriting the field with the wrapper future.
+- The `exceptionally` fallback checks `!stopped.get()` before calling `startPollingFallback()`.
+- `stop()` calls `universeReadyTask.cancel(false)` (best-effort) and nulls the field.
+
+**Note:** Cancellation of a `CompletableFuture` downstream stage does not cancel the upstream
+engine future. The `stopped` guards on all callback entrypoints remain mandatory and are the
+primary safety mechanism. The cancellation is belt-and-suspenders to allow the instance to be
+released sooner.
+
+**Threading:** `universeReadyTask` is `volatile`. The `stop()` method uses
+`stopped.compareAndSet(false, true)` to ensure only one caller performs the cancel-and-null
+sequence. A racing `startStagedLoad()` that passes the initial `stopped.get()` check may still
+assign to `universeReadyTask` after `stop()` has nulled it, but the assigned future will
+immediately be inert because `triggerStagedLoadOnce` checks `stopped` at entry.
+
+---
+
+### `CacheManager` empty-bucket race when pruning per-world entries
+
+**Files:** `CacheManager.java`
+
+**Root cause:**
+After a zone's last chunk was removed from a world's bucket, prune sites called
+`chunkOwnership.remove(worldName)` — the single-argument overload. This is not atomic with
+respect to the preceding `isEmpty()` check. A concurrent `registerOwnership` call on the same
+world can interleave: it sees the bucket, adds a new entry, then the prune thread calls
+`remove(worldName)` and discards the newly populated bucket entirely. The lost entries would
+never be re-added until the next `registerOwnership` for an existing chunk, leaving
+`getOwnedChunkCount` understated and potentially confusing keepalive logic.
+
+**Fix:**
+All prune sites capture the local `worldMap` reference before the `isEmpty()` check and
+replace `remove(worldName)` with `remove(worldName, worldMap)`. `ConcurrentHashMap.remove(key, value)`
+is a CAS operation: it only removes the entry if the value reference still equals `worldMap`.
+If another thread has already replaced the bucket with a new map, the CAS fails and the new
+bucket is preserved. Affected methods: `releaseZoneChunks`, `deregisterOwnership`,
+`deregisterAllChunks`, `onChunkEvicted`, `onChunksEvicted`.
+
+**Threading:** `ConcurrentHashMap.remove(key, value)` is documented as atomic. The pattern
+`local = map.get(key); if (local.isEmpty()) map.remove(key, local)` is the standard
+compare-and-remove idiom for concurrent maps.
+
+---
+
+### `TeleportInterceptor` executor lambdas mutated plugin state after shutdown
+
+**Files:** `TeleportInterceptor.java`
+
+**Root cause:**
+`onDrainPlayerFromWorld` and `onPlayerConnect` checked `plugin.isShuttingDown()` on the
+event thread before dispatching work to the executor. However, the lambdas submitted to
+`executor.execute(...)` did not re-check shutdown state before running. If shutdown began
+after the event-thread check passed but before the executor ran the lambda, the lambda would
+still execute: `onDrainPlayerFromWorld` would write to `lastKnownPosition` and call
+`lingerOriginZone`, and `onPlayerConnect` would call `chunkPreloader.predictiveLoad` —
+both against plugin-state that is being torn down concurrently.
+
+**Fix:**
+Both executor lambdas now check `if (plugin.isShuttingDown()) return;` as their first
+statement. This matches the pattern already used by the position-poll lambdas at lines 386,
+432, and 461.
+
+**Threading:** `isShuttingDown()` reads a `volatile boolean` (or `AtomicBoolean.get()`).
+The check-then-act window is narrow and acceptable: if it races with shutdown completing,
+the worst outcome is one additional write to a ConcurrentHashMap that will be discarded when
+the executor is shut down immediately after.
+
+---
+
+### `CacheManager` per-chunk owner cleanup could drop a live owner set
+
+**Files:** `CacheManager.java`
+
+**Root cause:**
+After the world-bucket CAS fix, three hot deregistration paths still used the pattern
+`if (owners.isEmpty()) worldMap.remove(key, owners)`. The `owners` set is mutable and shared.
+If another thread re-added a zone ID to that same set after the emptiness check but before
+`remove(key, owners)`, the compare-and-remove could still succeed because the value reference
+was the same object. The newly re-populated owner set would be discarded entirely, dropping a
+live chunk ownership record.
+
+**Fix:**
+Replaced the "check empty, then remove" pattern with `ConcurrentHashMap.computeIfPresent(...)`
+in `releaseZoneChunks`, `deregisterOwnership`, and `deregisterAllChunks`. Each callback now:
+- removes the current zone ID from the owner set
+- releases the keep-loaded pin only if that zone actually owned the chunk
+- returns `null` only if the set is still empty at the end of the atomic map callback
+
+This keeps the emptiness check and entry removal inside one map operation.
+
+**Threading:** `computeIfPresent(...)` runs atomically for the targeted key in
+`ConcurrentHashMap`. Another thread can still race by adding a new owner after the callback
+returns, but it will add into a fresh entry rather than being silently removed by a stale
+post-check.
+
+---
+
+### Post-load completions could mutate cache/storage after shutdown started
+
+**Files:** `ChunkPreloader.java`, `EnhancedChunkPreloader.java`, `TeleportInterceptor.java`,
+`WarmZoneManager.java`, `OptiPortal.java`
+
+**Root cause:**
+Several async completion stages (`thenRunAsync`, `thenAcceptAsync`) touched cache tier,
+zone statistics, and storage after the initial load futures completed. These stages run on the
+plugin executor and can lag behind the event that scheduled them. Before this fix, shutdown
+could begin after the load itself was dispatched but before the completion callback ran. The
+callback would still promote HOT/WARM state or call `storage.save(...)` against an instance
+that was in the middle of shutdown.
+
+`ChunkPreloader` and `EnhancedChunkPreloader` had no shared shutdown predicate, so there was no
+cheap way for the completion stage to know the plugin had started tearing down. `TeleportInterceptor`
+and `WarmZoneManager` had direct access to shutdown state but were not checking it consistently
+inside late async callbacks.
+
+**Fix:**
+- Added a `BooleanSupplier shuttingDown` to `ChunkPreloader`, plus `protected boolean isShuttingDown()`.
+- `OptiPortal` now constructs the active `ChunkPreloader` with `this::isShuttingDown`.
+- `ChunkPreloader` guards its predictive/warm post-load `thenRunAsync(...)` blocks before
+  promoting tiers or saving entry stats.
+- `EnhancedChunkPreloader` uses the inherited predicate in its own post-load completion.
+- `TeleportInterceptor.predictiveLoadWithRam(...)` and `WarmZoneManager.loadWarmZone(...)`
+  now bail out early if shutdown has started before their async completion work runs.
+
+**Threading:** The shutdown predicate reads plugin state only; it does not block. Once
+`OptiPortal.shuttingDown` flips true, all guarded callbacks become inert even if they were
+already queued before executor shutdown.
+
+---
+
+### Legacy `EnhancedChunkPreloader` constructor path did not inherit shutdown awareness
+
+**Files:** `EnhancedChunkPreloader.java`
+
+**Root cause:**
+The enhanced preloader gained shutdown-aware post-load guards through the new
+`BooleanSupplier` constructor overload, but the long-standing convenience constructor still
+delegated to the superclass default `() -> false`. If a caller instantiated
+`EnhancedChunkPreloader` through the old constructor surface, `isShuttingDown()` inside the
+subclass always returned false and the new guards were effectively dead code.
+
+There was also an overload-resolution edge case: after adding both `CorridorIndex` and
+`BooleanSupplier` convenience constructors, a `null` delegation target became ambiguous to the
+compiler.
+
+**Fix:**
+- Added `pluginShuttingDownOrFalse()` which reads `OptiPortal.getInstance()` and returns
+  `plugin.isShuttingDown()` when available.
+- Updated the legacy constructor path to delegate through the supplier-aware overload using
+  `EnhancedChunkPreloader::pluginShuttingDownOrFalse`.
+- Disambiguated the convenience delegation with `(CorridorIndex) null` where required so Java
+  selects the intended overload deterministically.
+
+**Threading:** `OptiPortal.getInstance()` is read-only here and shutdown state is stored in an
+`AtomicBoolean`, so the fallback supplier is safe to call from any executor callback.
+
+---
+
+### Shutdown could close storage before async callbacks had fully quiesced
+
+**Files:** `OptiPortal.java`
+
+**Root cause:**
+`storage.close()` previously ran before executor shutdown had fully drained. That is harmless
+for pure in-memory state, but not for real backends: `AbstractSqlStorageBackend.close()`
+shuts down `HikariDataSource`, and the JSON backend tears down its in-memory snapshot state.
+Any late async callback still calling `storage.loadById(...)` or `storage.save(...)` could then
+race a closed datasource or file backend.
+
+The first pass moved executor shutdown ahead of `storage.close()`, but the timeout path still
+needed to be explicit: `shutdownNow()` interrupts queued/running tasks, yet does not guarantee
+they have already exited by the time control returns.
+
+**Fix:**
+- `OptiPortal.doShutdown()` now stops local components, flushes registries, unregisters plugin
+  listeners, then shuts down the executor before closing storage.
+- If the first `awaitTermination(...)` times out, shutdown now calls `shutdownNow()` and waits
+  a second time before closing storage.
+- If tasks still remain after that second wait, OptiPortal logs that it is proceeding while
+  relying on the new shutdown guards to keep any straggler callbacks inert.
+
+**Threading:** This does not make a hard real-time guarantee that every task has exited before
+storage close, but it narrows the window substantially and pairs the timeout path with explicit
+guarded callback behavior rather than silent best-effort shutdown.
+
+---
+
+### `PortalChunkListener` status corrected: implemented but still dormant
+
+**Files:** `OptiPortal.java`, `PortalChunkListener.java`, `PreloadCommand.java`,
+`OptiPortalUIPage.java`
+
+**Root cause:**
+During earlier review passes, `PortalChunkListener` was mistakenly treated as active because the
+class exists and contains cleanup logic. In the actual startup path, no instance is constructed
+and `OptiPortal.getPortalChunkListener()` still returns `null`. That meant any claims about
+listener-lifecycle fixes inside this class being active in production were overstated.
+
+**Fix:**
+Documented the dormant status directly in `OptiPortal` and kept the nullable getter behavior
+explicit. Command/UI call sites already tolerate `null`, so the documentation fix brings the
+maintenance notes back in sync with reality without changing runtime wiring.
+
+**Threading:** None. This is a code-state/documentation correction so future maintenance work
+does not assume an inactive listener is participating in runtime cleanup.
+
+---
+
+### `ZoneTtlEnforcer` is now part of the live plugin lifecycle
+
+**Files:** `OptiPortal.java`, `ZoneTtlEnforcer.java`
+
+**Root cause:**
+TTL policy and per-zone TTL data were implemented, but the enforcement scheduler itself was not
+instantiated from the live startup path. That meant TTL configuration existed without any active
+cleanup loop.
+
+**Fix:**
+- `OptiPortal.start()` now constructs and starts `ZoneTtlEnforcer`
+- `doShutdown()` stops it
+- `reloadConfig()` reschedules it with the updated interval
+
+**Threading:** The enforcer runs on the shared plugin executor and keeps a `ScheduledFuture`
+handle so start/stop/reschedule all operate cleanly on the live runtime path.
+
+---
+
+### TTL-expired zones now receive the same runtime invalidation shape as manual delete
+
+**Files:** `ZoneTtlEnforcer.java`, `OptiPortal.java`, `PreloadCommand.java`
+
+**Root cause:**
+Once TTL enforcement was activated, its delete path only:
+
+- released zone chunks
+- removed tier state
+- deleted from storage
+
+The manual `/preload delete` path also removed learned portal links and invalidated the
+teleport interceptor’s in-memory portal cache. Without that parity, TTL-expired portals could
+linger in runtime-only structures after their storage entry was gone.
+
+**Fix:**
+- added a nullable deletion callback to `ZoneTtlEnforcer`
+- invoke that callback inline after successful storage deletion
+- `OptiPortal` wires the callback to:
+  - `portalLinkRegistry.removeLink(id)`
+  - `teleportInterceptor.onPortalDeleted(id)`
+  - `teleportInterceptor.refreshPortalCache()`
+- the callback uses local captures and null checks so it tolerates startup/shutdown ordering
+
+**Threading:** Callback invocation is inline and wrapped in a local `try/catch`, so failures are
+logged without killing future TTL cleanup runs.
+
+---
+
+### Live metrics no longer fragment across multiple `MetricsCollector` instances
+
+**Files:** `OptiPortal.java`, `CacheManager.java`, `ChunkPreloader.java`, `bStatsIntegration.java`
+
+**Root cause:**
+The live runtime previously constructed separate collectors for:
+
+- the plugin-owned metrics path
+- `ChunkPreloader`
+- and, depending on constructor path, `CacheManager`
+
+That fragmented observability data and made the plugin-facing collector incomplete.
+
+**Fix:**
+- `OptiPortal.start()` now creates the shared `metricsCollector` before constructing active
+  components that accept one
+- that same instance is passed to the live `CacheManager`, `ChunkPreloader`, and `bStatsIntegration`
+
+**Threading:** No behavioral change beyond consolidating counter ownership onto one shared
+runtime object.
+
+---
+
+### `UpdateChecker` now reads the current plugin version from engine manifest metadata
+
+**Files:** `UpdateChecker.java`
+
+**Root cause:**
+`UpdateChecker.getCurrentVersion()` manually reopened `manifest.json` from the classloader even
+though the plugin base already exposes manifest metadata through `plugin.getManifest()`.
+
+Decompiled engine source confirms `PluginBase` carries the parsed manifest and exposes it via
+`getManifest()`.
+
+**Fix:**
+- replaced the manual manifest resource read with:
+  - `plugin.getManifest()`
+  - `plugin.getManifest().getVersion()`
+
+**Decompiled comparison:**
+- `decompiled/com/hypixel/hytale/server/core/plugin/PluginBase.java`
+
+**Threading:** None. This is a cleaner metadata read path on the update-check worker.
+
+---
+
+### Dormant scheduled async components now carry clearer activation warnings
+
+**Files:** `WorldTpsMonitor.java`, `AsyncLoadBalancer.java`, `ChunkOwnershipAuditor.java`,
+`OptiPortal.java`
+
+**Root cause:**
+The active scheduled components are now mostly lifecycle-safe, but several dormant async classes
+still schedule recurring work without being fully wired into the live shutdown path. Because
+decompiled `PluginBase.cleanup(boolean)` does not auto-cancel arbitrary tasks scheduled onto a
+plugin-owned executor, future activation of these classes still requires explicit lifecycle
+ownership.
+
+**Fix:**
+- tightened dormant/live documentation in `OptiPortal`
+- added comments to dormant scheduled classes noting that explicit cancellation wiring is
+  required before activation
+
+**Decompiled comparison:**
+- `decompiled/com/hypixel/hytale/server/core/plugin/PluginBase.java`
+
+**Threading:** No runtime behavior change. This is preventive documentation so future activation
+work does not assume executor shutdown alone is sufficient.
+
+---
+
+### Teleport poll interval default was too aggressive for the base polling model
+
+**Files:** `PluginConfig.java`, `TeleportInterceptor.java`
+
+**Root cause:**
+The live runtime still uses the base `TeleportInterceptor`, which polls `TeleportRecord` on a
+fixed cadence and performs one `world.execute(...)` per cached online player each cycle. The
+default `pollIntervalSeconds` value was `1`, so even quiet servers paid this constant polling
+cost once per second per player. That was a reasonable safety-first default during feature
+bring-up, but it kept baseline CPU higher than necessary once the polling path grew additional
+proximity and hotspot logic.
+
+The default-config generator also did not explicitly emit `decay.pollIntervalSeconds`, so new
+installs silently inherited the in-code default instead of declaring the intended polling
+cadence in `config.json`.
+
+**Fix:**
+- Changed the in-code default `pollIntervalSeconds` from `1` to `2`
+- Added an explicit `decay` block to generated default config with:
+  - `hotDecaySeconds`
+  - `warmDecayMinutes`
+  - `pollIntervalSeconds = 2`
+
+**Threading:** No concurrency semantics changed. This reduces scheduler frequency only; the
+underlying polling model, task ownership, and world-thread access pattern remain unchanged.
+
+---
+
+### `TeleportInterceptor` was rescanning portals from unrelated worlds on the hot path
+
+**Files:** `TeleportInterceptor.java`
+
+**Root cause:**
+The hot helper methods in `TeleportInterceptor` iterated the full `portalCache` and then
+filtered by world name inside the loop. On multi-world servers this meant every proximity
+check, nearest-portal lookup, reverse preload lookup, and same-world jump scan walked portals
+from unrelated worlds only to discard them immediately.
+
+This wasted CPU in the exact path already identified as the strongest baseline suspect:
+
+- `checkProximityAndPreload(...)`
+- `reversePreloadOrigin(...)`
+- `findNearestPortal(...)`
+- `lingerOriginZone(...)`
+- same-world jump detection inside `pollTeleportRecords()`
+
+The cost scaled with total portal count across the server rather than the number of portals in
+the relevant world.
+
+**Fix:**
+- Added `volatile Map<String, List<PortalEntry>> portalCacheByWorld`
+- Reworked `refreshPortalCache()` to rebuild both:
+  - the full immutable portal snapshot
+  - immutable per-world portal lists
+- Added `getPortalEntriesForWorld(worldName)` helper
+- Switched world-specific hot scans to iterate the world-local list instead of the full cache
+- Updated `onPortalDeleted(...)` and `stop()` to keep both caches consistent
+
+**Threading:** The caches are published as immutable snapshots through volatile fields. Readers
+either see the old complete snapshot or the new complete snapshot; no reader can observe a
+partially built world index.
+
+---
+
+### Movement-based proximity scans were still too eager for lightly moving players
+
+**Files:** `TeleportInterceptor.java`
+
+**Root cause:**
+The first polling optimization only added a movement threshold: if the player moved about one
+block total since the last successful proximity check, the poller ran another full portal scan.
+On real servers, players often make frequent small adjustments while standing near a build,
+inventory, teleporter, or spawn area. That meant the poller could still rescan portals on many
+successive poll cycles even when the player's movement was not meaningful enough to justify
+continuous proximity work.
+
+**Fix:**
+- Added `lastProximityCheckMs`
+- `shouldRunProximityCheck(...)` now uses two tiers:
+  - larger moves trigger immediately
+  - smaller moves require both:
+    - at least modest movement
+    - a short wall-clock gap since the last successful proximity scan
+- Wired the new timestamp map into `stop()` and `removePlayerRef(...)`
+
+This preserves responsiveness for real repositioning while reducing repeated scans from jittery
+or low-value movement.
+
+**Threading:** The method reads and writes `ConcurrentHashMap` state only. It is called from the
+polling path on the executor side and does not add any world-thread work or blocking.
+
+---
+
 ## [1.2.0] - 2026-03-29
 
 ---
