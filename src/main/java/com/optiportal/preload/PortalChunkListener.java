@@ -19,8 +19,10 @@ import com.optiportal.storage.StorageBackend;
 /**
  * Listens to ChunkPreLoadProcessEvent to auto-register portal devices as PREDICTIVE zones.
  *
- * <p><b>DORMANT: This class is intentionally not wired into startup.</b>
- * It may be activated in a future pass if automatic portal device registration proves useful.
+ * <p>This service is available in the live runtime, but its world-event registration is
+ * config-gated. When enabled, it can auto-register portal devices and promote zones on
+ * engine chunk-preload events. When disabled, it still remains useful as an index-backed
+ * helper for zone cleanup paths such as delete/removeFromIndex.
  *
  * <p>Behavior:
  * <ol>

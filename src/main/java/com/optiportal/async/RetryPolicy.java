@@ -43,7 +43,7 @@ public class RetryPolicy {
              DEFAULT_MAX_DELAY_MS, executor);
     }
 
-    /** Full constructor — called by Builder. */
+    /** Full constructor - called by Builder. */
     private RetryPolicy(int maxRetries, long initialDelayMs, double backoffMultiplier,
                         long maxDelayMs, ScheduledExecutorService executor) {
         this.maxRetries        = maxRetries;
@@ -123,37 +123,24 @@ public class RetryPolicy {
                                                    int attempt,
                                                    long delayMs) {
         CompletableFuture<T> future = new CompletableFuture<>();
+        var delayedExecutor = executor != null
+                ? CompletableFuture.delayedExecutor(delayMs, TimeUnit.MILLISECONDS, executor)
+                : CompletableFuture.delayedExecutor(delayMs, TimeUnit.MILLISECONDS);
 
-        if (executor != null) {
-            executor.schedule(() ->
+        CompletableFuture.runAsync(() ->
                 executeWithRetry(operation, operationType, operationId, attempt)
-                    .whenComplete((result, ex) -> {
-                        if (ex == null) future.complete(result);
-                        else future.completeExceptionally(ex);
-                    }),
-                delayMs, TimeUnit.MILLISECONDS);
-        } else {
-            // No shared executor — create a one-shot pool for this delay.
-            // Shutdown immediately after schedule() so the pool terminates once
-            // the queued task runs rather than waiting for GC (leak-safe).
-            ScheduledExecutorService oneShot =
-                    java.util.concurrent.Executors.newScheduledThreadPool(1);
-            try {
-                oneShot.schedule(() ->
-                    executeWithRetry(operation, operationType, operationId, attempt)
-                        .whenComplete((result, ex) -> {
-                            if (ex == null) future.complete(result);
-                            else future.completeExceptionally(ex);
-                        }),
-                    delayMs, TimeUnit.MILLISECONDS);
-                oneShot.shutdown(); // one-shot: terminate after scheduled task runs
-            } catch (Exception e) {
-                oneShot.shutdownNow();
-                future.completeExceptionally(e);
-            }
-        }
+                    .whenComplete((result, ex) -> complete(future, result, ex)),
+                delayedExecutor)
+            .whenComplete((ignored, ex) -> {
+                if (ex != null) future.completeExceptionally(ex);
+            });
 
         return future;
+    }
+
+    private static <T> void complete(CompletableFuture<T> future, T result, Throwable ex) {
+        if (ex == null) future.complete(result);
+        else future.completeExceptionally(ex);
     }
 
     private long calculateDelay(int attempt) {

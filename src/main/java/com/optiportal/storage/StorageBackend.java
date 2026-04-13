@@ -1,6 +1,7 @@
 package com.optiportal.storage;
 
 import com.optiportal.model.PortalEntry;
+import com.optiportal.config.PluginConfig;
 
 import java.util.List;
 import java.util.Optional;
@@ -59,5 +60,38 @@ public interface StorageBackend {
      */
     default List<PortalEntry> loadAllCached() {
         return loadAll();
+    }
+
+    /**
+     * Load entries whose IDs start with the given prefix.
+     * Returns empty list if the backend doesn't support prefix-based queries.
+     * Default implementation delegates to loadAllCached() and filters locally.
+     * JSON backend overrides this to return a filtered snapshot without rebuild.
+     */
+    default List<PortalEntry> loadEntriesWithIdPrefix(String prefix) {
+        return loadAllCached().stream()
+                .filter(entry -> entry.getId() != null && entry.getId().startsWith(prefix))
+                .toList();
+    }
+
+    /**
+     * Load entries that the warp watcher owns (type == PORTAL and not HyTeleportersX-owned).
+     * Returns empty list if the backend doesn't support this filtering pattern.
+     * Default implementation delegates to loadAllCached() and filters locally.
+     * JSON backend overrides this to return a filtered snapshot without rebuild.
+     */
+    default List<PortalEntry> loadWarpSyncEntries(String excludedIdPrefix) {
+        return loadAllCached().stream()
+                .filter(entry -> entry.getType() == PortalEntry.EntryType.PORTAL
+                               && (excludedIdPrefix == null || !entry.getId().startsWith(excludedIdPrefix)))
+                .toList();
+    }
+
+    /**
+     * Apply updated config to a live backend instance.
+     * Backends that do not support live config changes can ignore this hook.
+     */
+    default void onConfigReload(PluginConfig config) {
+        // no-op by default
     }
 }

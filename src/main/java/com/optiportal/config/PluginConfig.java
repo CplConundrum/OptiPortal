@@ -28,6 +28,7 @@ public class PluginConfig {
     private int bytesPerChunk = 98304; // 96 KB = 64 KB base × 1.5 overhead
     private String startupLoadStrategy = "sequential";
     private int snapshotIntervalMinutes = 60;
+    private int storageWriteBehindDelayMs = 1000;
     private boolean suppressRamWarnings = false;
     private int lowTrafficThreshold = 10;
     private boolean immuneToSimulationReduction = false;
@@ -98,6 +99,17 @@ public class PluginConfig {
     private String gravestonePluginId = "gravestones";
     private boolean gravestoneReleaseOnBreak = true;
     private boolean gravestoneReleaseOnEmpty = true;
+    private boolean betterGravestoneIntegrationEnabled = false;
+    private String betterGravestonePluginId = "mirko0:BetterGravestone";
+    private String betterGravestoneBlockId = "Furniture_Gravestone";
+    private int betterGravestoneWatchIntervalSeconds = 5;
+    private boolean hyTeleportersXIntegrationEnabled = false;
+    private String hyTeleportersXPluginId = "HyTeleportersX";
+    private String hyTeleportersXSourcePath = "HyTeleportersX/Teleporters.json";
+    private boolean hyTeleportersXWatchForChanges = true;
+    private int hyTeleportersXWatchIntervalSeconds = 30;
+    private String hyTeleportersXIdPrefix = "hyteleportersx:";
+    private boolean portalChunkListenerEnabled = false;
 
     // MySQL
     private String mysqlHost = "localhost";
@@ -181,6 +193,7 @@ public class PluginConfig {
         if (json.has("bytesPerChunk")) bytesPerChunk = json.get("bytesPerChunk").getAsInt();
         if (json.has("startupLoadStrategy")) startupLoadStrategy = json.get("startupLoadStrategy").getAsString();
         if (json.has("snapshotIntervalMinutes")) snapshotIntervalMinutes = json.get("snapshotIntervalMinutes").getAsInt();
+        if (json.has("storageWriteBehindDelayMs")) storageWriteBehindDelayMs = json.get("storageWriteBehindDelayMs").getAsInt();
         if (json.has("suppressRamWarnings")) suppressRamWarnings = json.get("suppressRamWarnings").getAsBoolean();
         if (json.has("lowTrafficThreshold")) lowTrafficThreshold = json.get("lowTrafficThreshold").getAsInt();
         if (json.has("immuneToSimulationReduction")) immuneToSimulationReduction = json.get("immuneToSimulationReduction").getAsBoolean();
@@ -271,6 +284,26 @@ public class PluginConfig {
                 if (gs.has("pluginId")) gravestonePluginId = gs.get("pluginId").getAsString();
                 if (gs.has("releaseOnBreak")) gravestoneReleaseOnBreak = gs.get("releaseOnBreak").getAsBoolean();
                 if (gs.has("releaseOnEmpty")) gravestoneReleaseOnEmpty = gs.get("releaseOnEmpty").getAsBoolean();
+            }
+            if (integrations.has("betterGravestone")) {
+                JsonObject bgs = integrations.getAsJsonObject("betterGravestone");
+                if (bgs.has("enabled")) betterGravestoneIntegrationEnabled = bgs.get("enabled").getAsBoolean();
+                if (bgs.has("pluginId")) betterGravestonePluginId = bgs.get("pluginId").getAsString();
+                if (bgs.has("blockId")) betterGravestoneBlockId = bgs.get("blockId").getAsString();
+                if (bgs.has("watchIntervalSeconds")) betterGravestoneWatchIntervalSeconds = bgs.get("watchIntervalSeconds").getAsInt();
+            }
+            if (integrations.has("hyTeleportersX")) {
+                JsonObject htx = integrations.getAsJsonObject("hyTeleportersX");
+                if (htx.has("enabled")) hyTeleportersXIntegrationEnabled = htx.get("enabled").getAsBoolean();
+                if (htx.has("pluginId")) hyTeleportersXPluginId = htx.get("pluginId").getAsString();
+                if (htx.has("sourcePath")) hyTeleportersXSourcePath = htx.get("sourcePath").getAsString();
+                if (htx.has("watchForChanges")) hyTeleportersXWatchForChanges = htx.get("watchForChanges").getAsBoolean();
+                if (htx.has("watchIntervalSeconds")) hyTeleportersXWatchIntervalSeconds = htx.get("watchIntervalSeconds").getAsInt();
+                if (htx.has("idPrefix")) hyTeleportersXIdPrefix = htx.get("idPrefix").getAsString();
+            }
+            if (integrations.has("portalChunkListener")) {
+                JsonObject pcl = integrations.getAsJsonObject("portalChunkListener");
+                if (pcl.has("enabled")) portalChunkListenerEnabled = pcl.get("enabled").getAsBoolean();
             }
         }
 
@@ -366,6 +399,13 @@ public class PluginConfig {
             if (rebuild.has("intervalHours")) scheduledRebuildIntervalHours = rebuild.get("intervalHours").getAsInt();
         }
 
+        if (json.has("async")) {
+            JsonObject async = json.getAsJsonObject("async");
+            if (async.has("tpsMonitorEnabled")) tpsMonitorEnabled = async.get("tpsMonitorEnabled").getAsBoolean();
+            if (async.has("tpsLowThreshold")) tpsLowThreshold = async.get("tpsLowThreshold").getAsDouble();
+            if (async.has("tpsCriticalThreshold")) tpsCriticalThreshold = async.get("tpsCriticalThreshold").getAsDouble();
+        }
+
         if (json.has("tpsMonitor")) {
             JsonObject tps = json.getAsJsonObject("tpsMonitor");
             if (tps.has("enabled")) tpsMonitorEnabled = tps.get("enabled").getAsBoolean();
@@ -439,6 +479,23 @@ public class PluginConfig {
         gsIntegration.addProperty("releaseOnBreak", true);
         gsIntegration.addProperty("releaseOnEmpty", true);
         integrations.add("gravestone", gsIntegration);
+        JsonObject betterGravestoneIntegration = new JsonObject();
+        betterGravestoneIntegration.addProperty("enabled", false);
+        betterGravestoneIntegration.addProperty("pluginId", "mirko0:BetterGravestone");
+        betterGravestoneIntegration.addProperty("blockId", "Furniture_Gravestone");
+        betterGravestoneIntegration.addProperty("watchIntervalSeconds", 5);
+        integrations.add("betterGravestone", betterGravestoneIntegration);
+        JsonObject hyTeleportersXIntegration = new JsonObject();
+        hyTeleportersXIntegration.addProperty("enabled", false);
+        hyTeleportersXIntegration.addProperty("pluginId", "HyTeleportersX");
+        hyTeleportersXIntegration.addProperty("sourcePath", "HyTeleportersX/Teleporters.json");
+        hyTeleportersXIntegration.addProperty("watchForChanges", true);
+        hyTeleportersXIntegration.addProperty("watchIntervalSeconds", 30);
+        hyTeleportersXIntegration.addProperty("idPrefix", "hyteleportersx:");
+        integrations.add("hyTeleportersX", hyTeleportersXIntegration);
+        JsonObject portalChunkListener = new JsonObject();
+        portalChunkListener.addProperty("enabled", false);
+        integrations.add("portalChunkListener", portalChunkListener);
 
         JsonObject mysql = new JsonObject();
         mysql.addProperty("host", "localhost");
@@ -479,11 +536,17 @@ public class PluginConfig {
         keepalive.add("warm", keepaliveWarmObj);
         keepalive.add("cold", keepaliveColdObj);
 
+        JsonObject tpsMonitor = new JsonObject();
+        tpsMonitor.addProperty("enabled", true);
+        tpsMonitor.addProperty("lowThreshold", 18.0);
+        tpsMonitor.addProperty("criticalThreshold", 12.0);
+
         JsonObject root = new JsonObject();
         root.addProperty("backend", "rocksdb");
         root.addProperty("bytesPerChunk", 98304);
         root.addProperty("startupLoadStrategy", "sequential");
         root.addProperty("snapshotIntervalMinutes", 60);
+        root.addProperty("storageWriteBehindDelayMs", 1000);
         root.addProperty("suppressRamWarnings", false);
         root.addProperty("lowTrafficThreshold", 10);
         root.addProperty("immuneToSimulationReduction", false);
@@ -502,6 +565,7 @@ public class PluginConfig {
         root.add("updateChecker", updateChecker);
         root.add("rebuildFromChunks", rebuild);
         root.add("keepalive", keepalive);
+        root.add("tpsMonitor", tpsMonitor);
 
         configFile.getParentFile().mkdirs();
         try (FileWriter writer = new FileWriter(configFile)) {
@@ -567,6 +631,7 @@ public class PluginConfig {
     public int getBytesPerChunk() { return bytesPerChunk; }
     public String getStartupLoadStrategy() { return startupLoadStrategy; }
     public int getSnapshotIntervalMinutes() { return snapshotIntervalMinutes; }
+    public int getStorageWriteBehindDelayMs() { return storageWriteBehindDelayMs; }
     public boolean isSuppressRamWarnings() { return suppressRamWarnings; }
     public int getLowTrafficThreshold() { return lowTrafficThreshold; }
     public boolean isImmuneToSimulationReduction() { return immuneToSimulationReduction; }
@@ -621,6 +686,17 @@ public class PluginConfig {
     public String getGravestonePluginId() { return gravestonePluginId; }
     public boolean isGravestoneReleaseOnBreak() { return gravestoneReleaseOnBreak; }
     public boolean isGravestoneReleaseOnEmpty() { return gravestoneReleaseOnEmpty; }
+    public boolean isBetterGravestoneIntegrationEnabled() { return betterGravestoneIntegrationEnabled; }
+    public String getBetterGravestonePluginId() { return betterGravestonePluginId; }
+    public String getBetterGravestoneBlockId() { return betterGravestoneBlockId; }
+    public int getBetterGravestoneWatchIntervalSeconds() { return betterGravestoneWatchIntervalSeconds; }
+    public boolean isHyTeleportersXIntegrationEnabled() { return hyTeleportersXIntegrationEnabled; }
+    public String getHyTeleportersXPluginId() { return hyTeleportersXPluginId; }
+    public String getHyTeleportersXSourcePath() { return hyTeleportersXSourcePath; }
+    public boolean isHyTeleportersXWatchForChanges() { return hyTeleportersXWatchForChanges; }
+    public int getHyTeleportersXWatchIntervalSeconds() { return hyTeleportersXWatchIntervalSeconds; }
+    public String getHyTeleportersXIdPrefix() { return hyTeleportersXIdPrefix; }
+    public boolean isPortalChunkListenerEnabled() { return portalChunkListenerEnabled; }
     public String getMysqlHost() { return mysqlHost; }
     public int getMysqlPort() { return mysqlPort; }
     public String getMysqlDatabase() { return mysqlDatabase; }

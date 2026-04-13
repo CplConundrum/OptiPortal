@@ -6,8 +6,10 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
@@ -39,6 +41,10 @@ public class ChunkPreloader {
 
     /** Chunks within this Chebyshev radius gate the future returned to callers. */
     private static final int INNER_RING_RADIUS = 2;
+    private static final double BATCH_LATENCY_EMA_ALPHA = 0.25;
+    private static final double HIGH_BATCH_LATENCY_MS = 100.0;
+    private static final double CRITICAL_BATCH_LATENCY_MS = 250.0;
+    private static final int ENTRY_SAVE_BATCH_DELAY_MS = 250;
 
     /** Approximate RAM per chunk in MB (16KB per chunk). Deprecated — use config.getBytesPerChunk() instead. */
     @Deprecated
@@ -63,6 +69,11 @@ public class ChunkPreloader {
      * deduplicate against the same state.
      */
     protected final ConcurrentHashMap<String, CompletableFuture<Void>> inflightLoads = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Double> recentBatchLatencyMsByWorld = new ConcurrentHashMap<>();
+    private final Object pendingEntrySaveLock = new Object();
+    private final AtomicBoolean entrySaveFlushRunning = new AtomicBoolean(false);
+    private volatile ConcurrentHashMap<String, PortalEntry> pendingEntrySaves = new ConcurrentHashMap<>();
+    private volatile ScheduledFuture<?> pendingEntrySaveTask;
 
     public ChunkPreloader(PluginConfig config,
                           CacheManager cacheManager,
@@ -87,6 +98,7 @@ public class ChunkPreloader {
         this.storage       = storage;
         this.metricsCollector = metricsCollector;
         this.shuttingDown  = shuttingDown;
+        this.worldRegistry.addWorldUnloadCallback(recentBatchLatencyMsByWorld::remove);
     }
 
     /** Exposed to subclasses so they can guard their own post-load completions. */
@@ -138,6 +150,61 @@ public class ChunkPreloader {
      */
     protected StorageBackend getStorage() {
         return storage;
+    }
+
+    /**
+     * Coalesce repeated stat-only entry saves so bursty preload completions do not each
+     * force their own backend write path.
+     */
+    public void queueEntrySave(PortalEntry entry) {
+        if (entry == null) return;
+        pendingEntrySaves.put(entry.getId(), entry);
+        synchronized (pendingEntrySaveLock) {
+            if (entrySaveFlushRunning.get()) {
+                return;
+            }
+            if (pendingEntrySaveTask != null && !pendingEntrySaveTask.isDone()) {
+                return;
+            }
+            pendingEntrySaveTask = executor.schedule(this::flushPendingEntrySaves,
+                    ENTRY_SAVE_BATCH_DELAY_MS, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /**
+     * Flush any coalesced stat updates immediately. Called during shutdown so the final
+     * RAM/preload counters are not left waiting on the debounce window.
+     */
+    public void flushPendingEntrySaves() {
+        if (!entrySaveFlushRunning.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            synchronized (pendingEntrySaveLock) {
+                ScheduledFuture<?> task = pendingEntrySaveTask;
+                if (task != null) {
+                    task.cancel(false);
+                    pendingEntrySaveTask = null;
+                }
+            }
+            while (true) {
+                ConcurrentHashMap<String, PortalEntry> batch = pendingEntrySaves;
+                if (batch.isEmpty()) {
+                    break;
+                }
+                pendingEntrySaves = new ConcurrentHashMap<>();
+                storage.saveAll(new ArrayList<>(batch.values()));
+            }
+        } finally {
+            entrySaveFlushRunning.set(false);
+            synchronized (pendingEntrySaveLock) {
+                if (!pendingEntrySaves.isEmpty()
+                        && (pendingEntrySaveTask == null || pendingEntrySaveTask.isDone())) {
+                    pendingEntrySaveTask = executor.schedule(this::flushPendingEntrySaves,
+                            ENTRY_SAVE_BATCH_DELAY_MS, TimeUnit.MILLISECONDS);
+                }
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -255,7 +322,7 @@ public class ChunkPreloader {
                     Optional<PortalEntry> entryOpt = storage.loadById(zid);
                     entryOpt.ifPresent(entry -> {
                         updateEntryStats(entry, totalCount);
-                        storage.save(entry);
+                        queueEntrySave(entry);
                     });
                     // Record metrics
                     metricsCollector.recordPreload();
@@ -387,7 +454,7 @@ public class ChunkPreloader {
                 Optional<PortalEntry> entryOpt = storage.loadById(zid);
                 entryOpt.ifPresent(entry -> {
                     updateEntryStats(entry, totalCount);
-                    storage.save(entry);
+                    queueEntrySave(entry);
                 });
                 // Record metrics
                 metricsCollector.recordPreload();
@@ -515,7 +582,31 @@ public class ChunkPreloader {
      * Overridden by {@link EnhancedChunkPreloader} to apply TPS-adaptive scaling.
      */
     protected int getEffectiveBatchSize(String worldName) {
-        return config.getWarmBatchSize();
+        int baseBatchSize = Math.max(1, config.getWarmBatchSize());
+        double multiplier = 1.0;
+
+        World world = worldRegistry.getWorld(worldName);
+        int pressureThreshold = config.getMaxLoadedChunksPressureThreshold();
+        if (world != null && pressureThreshold > 0) {
+            double pressureRatio = world.getChunkStore().getLoadedChunksCount() / (double) pressureThreshold;
+            if (pressureRatio >= 1.0) {
+                return 1;
+            }
+            if (pressureRatio >= 0.90) {
+                multiplier = Math.min(multiplier, 0.25);
+            } else if (pressureRatio >= 0.75) {
+                multiplier = Math.min(multiplier, 0.5);
+            }
+        }
+
+        double latencyMs = recentBatchLatencyMsByWorld.getOrDefault(worldName, 0.0);
+        if (latencyMs >= CRITICAL_BATCH_LATENCY_MS) {
+            multiplier = Math.min(multiplier, 0.25);
+        } else if (latencyMs >= HIGH_BATCH_LATENCY_MS) {
+            multiplier = Math.min(multiplier, 0.5);
+        }
+
+        return Math.max(1, (int) Math.round(baseBatchSize * multiplier));
     }
 
     /**
@@ -523,7 +614,48 @@ public class ChunkPreloader {
      * Overridden by {@link EnhancedChunkPreloader} to apply TPS-adaptive scaling.
      */
     protected int getEffectiveBatchDelay(String worldName) {
-        return config.getWarmBatchDelayMs();
+        int baseDelayMs = Math.max(0, config.getWarmBatchDelayMs());
+        double multiplier = 1.0;
+
+        World world = worldRegistry.getWorld(worldName);
+        int pressureThreshold = config.getMaxLoadedChunksPressureThreshold();
+        if (world != null && pressureThreshold > 0) {
+            double pressureRatio = world.getChunkStore().getLoadedChunksCount() / (double) pressureThreshold;
+            if (pressureRatio >= 0.90) {
+                multiplier = Math.max(multiplier, 4.0);
+            } else if (pressureRatio >= 0.75) {
+                multiplier = Math.max(multiplier, 2.0);
+            }
+        }
+
+        double latencyMs = recentBatchLatencyMsByWorld.getOrDefault(worldName, 0.0);
+        if (latencyMs >= CRITICAL_BATCH_LATENCY_MS) {
+            multiplier = Math.max(multiplier, 4.0);
+        } else if (latencyMs >= HIGH_BATCH_LATENCY_MS) {
+            multiplier = Math.max(multiplier, 2.0);
+        }
+
+        return (int) Math.round(baseDelayMs * multiplier);
+    }
+
+    private void recordBatchLatency(String worldName, double latencyMs) {
+        if (latencyMs <= 0) return;
+        recentBatchLatencyMsByWorld.compute(worldName, (key, previous) -> {
+            if (previous == null || previous <= 0) {
+                return latencyMs;
+            }
+            return BATCH_LATENCY_EMA_ALPHA * latencyMs
+                    + (1.0 - BATCH_LATENCY_EMA_ALPHA) * previous;
+        });
+    }
+
+    // -------------------------------------------------------------------------
+    // Test seams
+    // -------------------------------------------------------------------------
+
+    /** Package-private: inject a latency value for a world to drive adaptive-budgeting tests. */
+    void injectBatchLatencyForTest(String worldName, double latencyMs) {
+        recentBatchLatencyMsByWorld.put(worldName, latencyMs);
     }
 
     // -------------------------------------------------------------------------
@@ -610,19 +742,16 @@ public class ChunkPreloader {
             }
         }
 
-        int batchSize  = getEffectiveBatchSize(world.getName());
-        int batchDelay = getEffectiveBatchDelay(world.getName());
-
-        // Build list of batches
-        List<List<int[]>> batches = new java.util.ArrayList<>();
-        for (int i = 0; i < coords.size(); i += batchSize) {
-            batches.add(coords.subList(i, Math.min(i + batchSize, coords.size())));
-        }
-
-        // Chain batches sequentially: each batch starts after the previous completes + delay
+        // Chain batches sequentially: each batch re-evaluates its budget before starting so
+        // long-running preloads can respond to rising chunk pressure or batch latency.
         CompletableFuture<Void> chain = CompletableFuture.completedFuture(null);
-        for (List<int[]> batch : batches) {
+        for (int batchStart = 0; batchStart < coords.size();) {
+            final int currentStart = batchStart;
+            int effectiveBatchSize = Math.max(1, getEffectiveBatchSize(world.getName()));
+            final int currentEnd = Math.min(currentStart + effectiveBatchSize, coords.size());
+            final List<int[]> batch = coords.subList(currentStart, currentEnd);
             chain = chain.thenCompose(v -> {
+                final long batchStartNanos = System.nanoTime();
                 // Fire this batch concurrently
                 @SuppressWarnings("unchecked")
                 CompletableFuture<WorldChunk>[] futures = new CompletableFuture[batch.size()];
@@ -648,6 +777,7 @@ public class ChunkPreloader {
                 }
                 CompletableFuture<Void> batchDone = CompletableFuture.allOf(futures)
                         .thenRunAsync(() -> {
+                            recordBatchLatency(world.getName(), (System.nanoTime() - batchStartNanos) / 1_000_000.0);
                             if (zoneId == null) return;
 
                             List<int[]> loadedCoords = new ArrayList<>(batch.size());
@@ -662,14 +792,16 @@ public class ChunkPreloader {
                                 cacheManager.registerOwnershipBatch(zoneId, world.getName(), loadedCoords);
                             }
                         }, executor);
-                if (batchDelay <= 0) return batchDone;
+                int effectiveBatchDelay = getEffectiveBatchDelay(world.getName());
+                if (effectiveBatchDelay <= 0) return batchDone;
                 // After batch completes, sleep before next batch
                 return batchDone.thenCompose(vv -> {
                     CompletableFuture<Void> delay = new CompletableFuture<>();
-                    executor.schedule(() -> delay.complete(null), batchDelay, java.util.concurrent.TimeUnit.MILLISECONDS);
+                    executor.schedule(() -> delay.complete(null), effectiveBatchDelay, java.util.concurrent.TimeUnit.MILLISECONDS);
                     return delay;
                 });
             });
+            batchStart = currentEnd;
         }
         return chain;
     }

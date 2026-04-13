@@ -15,7 +15,9 @@ import com.optiportal.cache.ZoneTtlEnforcer;
 import com.optiportal.cache.WalManager;
 import com.optiportal.commands.PreloadCommand;
 import com.optiportal.config.PluginConfig;
+import com.optiportal.integrations.BetterGravestoneWatcher;
 import com.optiportal.integrations.GravestoneIntegration;
+import com.optiportal.integrations.HyTeleportersXWatcher;
 import com.optiportal.integrations.WarpFileWatcher;
 import com.optiportal.metrics.MetricsCollector;
 import com.optiportal.metrics.bStatsIntegration;
@@ -46,13 +48,12 @@ import com.optiportal.update.UpdateChecker;
  * - RAM measurement via Java Instrumentation with terrain profiling
  * - Native UI panel and full command interface
  *
- * Note: The following subsystems are currently dormant and not wired into startup:
- * - PortalChunkListener
+ * Note: The following subsystems are currently dormant or config-gated:
  * - ChunkOwnershipAuditor
  * - EnhancedChunkPreloader
  * - AsyncTeleportInterceptor
  * - AsyncKeepaliveManager
- * - PlayerDeathSystem (redundant with GravestoneIntegration)
+ * - PortalChunkListener world-event activation (available via getter, disabled by default)
  * They may be activated in a future pass if needed for specific use cases.
  */
 public class OptiPortal extends JavaPlugin {
@@ -80,6 +81,7 @@ public class OptiPortal extends JavaPlugin {
     private ChunkPreloader chunkPreloader;
     private com.optiportal.preload.KeepaliveManager keepaliveManager;
     private com.optiportal.preload.PortalLinkRegistry portalLinkRegistry;
+    private com.optiportal.preload.PortalChunkListener portalChunkListener;
 
     // Player tracking
     private RespawnTracker respawnTracker;
@@ -87,13 +89,19 @@ public class OptiPortal extends JavaPlugin {
 
     // Integrations
     private WarpFileWatcher warpFileWatcher;
+    private HyTeleportersXWatcher hyTeleportersXWatcher;
     private GravestoneIntegration gravestoneIntegration;
+    private BetterGravestoneWatcher betterGravestoneWatcher;
 
     // Teleport handling
     private TeleportInterceptor teleportInterceptor;
 
     // Metrics
     private MetricsCollector metricsCollector;
+    private com.optiportal.async.AsyncMetrics asyncMetrics;
+    private com.optiportal.async.AsyncErrorHandler asyncErrorHandler;
+    private com.optiportal.async.AsyncLoadBalancer asyncLoadBalancer;
+    private com.optiportal.async.WorldTpsMonitor tpsMonitor;
 
     public OptiPortal(@Nonnull JavaPluginInit init) {
         super(init);
@@ -128,9 +136,28 @@ public class OptiPortal extends JavaPlugin {
             // Shared metrics collector for the live runtime path
             metricsCollector = new MetricsCollector();
 
+            // Async observability/runtime protection stack.
+            // These services are now live so status reporting and future async integrations
+            // have concrete infrastructure instead of null placeholder getters.
+            asyncMetrics = new com.optiportal.async.AsyncMetrics();
+
             // World registry — populated via AddWorldEvent/RemoveWorldEvent
             worldRegistry = new WorldRegistry();
             worldRegistry.register(getEventRegistry());
+
+            if (config.isTpsMonitorEnabled()) {
+                tpsMonitor = new com.optiportal.async.WorldTpsMonitor(worldRegistry, executor, config);
+                tpsMonitor.start();
+            }
+            com.optiportal.async.CircuitBreaker circuitBreaker = new com.optiportal.async.CircuitBreaker();
+            asyncErrorHandler = new com.optiportal.async.AsyncErrorHandler(asyncMetrics, circuitBreaker, executor);
+            asyncLoadBalancer = new com.optiportal.async.AsyncLoadBalancer(
+                    executor,
+                    asyncMetrics,
+                    asyncErrorHandler,
+                    tpsMonitor,
+                    worldRegistry
+            );
 
             // Cache manager
             cacheManager = new CacheManager(config, walManager, executor, worldRegistry, null, metricsCollector);
@@ -157,6 +184,13 @@ public class OptiPortal extends JavaPlugin {
             warmZoneManager = new WarmZoneManager(config, storage, cacheManager, executor);
             chunkPreloader = new ChunkPreloader(config, cacheManager, worldRegistry, executor, storage, metricsCollector, this::isShuttingDown);
             warmZoneManager.setChunkPreloader(chunkPreloader); // break circular dep via setter
+            portalChunkListener = new com.optiportal.preload.PortalChunkListener(
+                    storage,
+                    cacheManager,
+                    warmZoneManager,
+                    config,
+                    executor
+            );
 
             // Register AllWorldsLoadedEvent listener — actual chunk loading is gated on this
             warmZoneManager.registerWorldsLoadedListener(getEventRegistry());
@@ -168,6 +202,14 @@ public class OptiPortal extends JavaPlugin {
             // Gravestone integration — create before TeleportInterceptor to ensure it's initialized
             gravestoneIntegration = new GravestoneIntegration(config, deathLocationTracker);
             gravestoneIntegration.init(getEventRegistry());
+            betterGravestoneWatcher = new BetterGravestoneWatcher(
+                    this,
+                    config,
+                    deathLocationTracker,
+                    gravestoneIntegration,
+                    worldRegistry,
+                    executor
+            );
 
             // Portal link registry — learns links from observed teleports
             portalLinkRegistry = new com.optiportal.preload.PortalLinkRegistry(getDataDirectory().toFile(), executor, config);
@@ -175,14 +217,19 @@ public class OptiPortal extends JavaPlugin {
             // Teleport interceptor
             teleportInterceptor = new TeleportInterceptor(this, config, warmZoneManager, chunkPreloader, storage, portalLinkRegistry, respawnTracker, deathLocationTracker, gravestoneIntegration, executor);
 
-            // File watchers
+            // File watchers - created but .start() deferred to post-enable
             warpFileWatcher = new WarpFileWatcher(config, storage, warmZoneManager, executor,
                     teleportInterceptor::refreshPortalCache,
                     id -> {
                         portalLinkRegistry.removeLink(id);
                         teleportInterceptor.onPortalDeleted(id);
                     });
-            warpFileWatcher.start();
+            hyTeleportersXWatcher = new HyTeleportersXWatcher(config, storage, warmZoneManager, executor,
+                    teleportInterceptor::refreshPortalCache,
+                    id -> {
+                        portalLinkRegistry.removeLink(id);
+                        teleportInterceptor.onPortalDeleted(id);
+                    });
 
             // Register events
             registerEvents();
@@ -190,24 +237,22 @@ public class OptiPortal extends JavaPlugin {
             // Register commands
             getCommandRegistry().registerCommand(new PreloadCommand(this));
 
-            // Metrics
+            // Snapshot scheduler - created but .start() deferred to post-enable
+            snapshotScheduler = new SnapshotScheduler(config, cacheManager, executor);
+
+            // Staged startup cache load - called after listeners registered, deferred to post-enable
+            // warmZoneManager.startStagedLoad(); // REMOVED: now deferred in executor
+
+            // Keepalive heartbeat - created but .start() deferred to post-enable
+            keepaliveManager = new com.optiportal.preload.KeepaliveManager(
+                    config, cacheManager, chunkPreloader, storage, executor);
+
+            // Metrics - one-time init, stays eager
             if (config.isMetricsEnabled()) {
                 new bStatsIntegration(this, metricsCollector).init();
             }
 
-            // Snapshot scheduler
-            snapshotScheduler = new SnapshotScheduler(config, cacheManager, executor);
-            snapshotScheduler.start();
-
-            // Staged startup cache load
-            warmZoneManager.startStagedLoad();
-
-            // Keepalive heartbeat
-            keepaliveManager = new com.optiportal.preload.KeepaliveManager(
-                    config, cacheManager, chunkPreloader, storage, executor);
-            keepaliveManager.start();
-
-            // Update checker
+            // Update checker - one-time check, stays eager
             if (config.isUpdateCheckerEnabled()) {
                 new UpdateChecker(this).checkAsync(executor);
             }
@@ -217,11 +262,54 @@ public class OptiPortal extends JavaPlugin {
             Runtime.getRuntime().addShutdownHook(shutdownHook);
 
             // Wire world removal cleanup callbacks
+            if (config.isPortalChunkListenerEnabled()) {
+                worldRegistry.addWorldLoadCallback(portalChunkListener::register);
+                worldRegistry.addWorldRemoveCallback(portalChunkListener::onWorldRemoved);
+                getLogger().at(Level.INFO).log("[OptiPortal] PortalChunkListener world hooks enabled.");
+            } else {
+                getLogger().at(Level.INFO).log("[OptiPortal] PortalChunkListener world hooks disabled by config.");
+            }
             worldRegistry.addWorldRemoveCallback(warmZoneManager::onWorldRemoved);
             worldRegistry.addWorldUnloadCallback(teleportInterceptor::onWorldRemoved);
+            worldRegistry.seedFromUniverse();
 
+            // Log success - core runtime is ready
+            getLogger().at(Level.INFO).log("[OptiPortal] Core runtime enabled successfully.");
 
-            getLogger().at(Level.INFO).log("[OptiPortal] Enabled successfully.");
+            // Schedule deferred follow-up tasks to begin after enable completes
+            // These are non-critical startup operations that don't block the plugin from being considered live
+            executor.execute(() -> {
+                // Skip if shutdown already occurred
+                if (shuttingDown.get()) return;
+
+                // File watchers - integration sync, not core runtime
+                if (warpFileWatcher != null) {
+                    warpFileWatcher.start();
+                }
+                if (hyTeleportersXWatcher != null) {
+                    hyTeleportersXWatcher.start();
+                }
+                if (betterGravestoneWatcher != null) {
+                    betterGravestoneWatcher.start();
+                }
+
+                // Staged-load arming - can start after listener is registered
+                if (warmZoneManager != null) {
+                    warmZoneManager.startStagedLoad();
+                }
+
+                // Keepalive heartbeat - async task, doesn't block runtime
+                if (keepaliveManager != null) {
+                    keepaliveManager.start();
+                }
+
+                // Snapshot scheduler - can start after cache state is loaded
+                if (snapshotScheduler != null) {
+                    snapshotScheduler.start();
+                }
+
+                getLogger().at(Level.INFO).log("[OptiPortal] Deferred startup tasks completed.");
+            });
 
         } catch (Exception e) {
             getLogger().at(Level.SEVERE).log("[OptiPortal] Failed to enable: " + e.getMessage());
@@ -247,9 +335,12 @@ public class OptiPortal extends JavaPlugin {
             if (warmZoneManager != null) warmZoneManager.stop();
             if (teleportInterceptor != null) teleportInterceptor.stop();
             if (warpFileWatcher != null) warpFileWatcher.stop();
+            if (hyTeleportersXWatcher != null) hyTeleportersXWatcher.stop();
+            if (betterGravestoneWatcher != null) betterGravestoneWatcher.stop();
             if (snapshotScheduler != null) snapshotScheduler.stop();
             if (keepaliveManager != null) keepaliveManager.stop();
             if (ttlEnforcer != null) ttlEnforcer.stop();
+            if (chunkPreloader != null) chunkPreloader.flushPendingEntrySaves();
             
             // Serialize warm zones
             if (warmZoneManager != null) warmZoneManager.serializeAll();
@@ -327,6 +418,7 @@ public class OptiPortal extends JavaPlugin {
      *   <li>activation thresholds, TTLs, RAM warning suppression, lowTrafficThreshold
      *   <li>warp file path / watch interval — watcher is restarted
      *   <li>gravestone watch interval
+     *   <li>betterGravestone watch interval / block id / plugin id
      *   <li>UI display flags
      *   <li>bStats enabled flag
      * </ul>
@@ -340,32 +432,123 @@ public class OptiPortal extends JavaPlugin {
      *   <li>cacheDirectory — cache files are already open
      *   <li>immuneToSimulationReduction — applied to worlds at registration time
      *   <li>updateChecker.enabled — runs once at startup
+     *   <li>tpsMonitor.enabled / thresholds — monitor wiring happens at startup
+     *   <li>integrations.portalChunkListener.enabled — world-event registration happens at startup
      * </ul>
      *
      * @return a human-readable summary of what was reloaded
      */
     public String reloadConfig() {
+        // Capture old watcher settings BEFORE reload to avoid comparing against already-reloaded values
+        boolean oldTpsMonitorEnabled = config.isTpsMonitorEnabled();
+        double oldTpsLowThreshold = config.getTpsLowThreshold();
+        double oldTpsCriticalThreshold = config.getTpsCriticalThreshold();
+        boolean oldPortalChunkListenerEnabled = config.isPortalChunkListenerEnabled();
+
+        boolean oldWarpsWatch = config.isWarpsWatchForChanges();
+        String oldWarpsPath = config.getWarpsSourcePath();
+        int oldWarpsInterval = config.getWarpsWatchIntervalSeconds();
+
+        boolean oldHtxEnabled = config.isHyTeleportersXIntegrationEnabled();
+        boolean oldHtxWatch = config.isHyTeleportersXWatchForChanges();
+        String oldHtxPath = config.getHyTeleportersXSourcePath();
+        int oldHtxInterval = config.getHyTeleportersXWatchIntervalSeconds();
+        boolean oldBetterGsEnabled = config.isBetterGravestoneIntegrationEnabled();
+        String oldBetterGsPluginId = config.getBetterGravestonePluginId();
+        String oldBetterGsBlockId = config.getBetterGravestoneBlockId();
+        int oldBetterGsInterval = config.getBetterGravestoneWatchIntervalSeconds();
+
         config.reload();
+        storage.onConfigReload(config);
 
         // Reschedule timed subsystems with updated intervals
         snapshotScheduler.reschedule();
         keepaliveManager.reschedule();
         if (ttlEnforcer != null) ttlEnforcer.reschedule();
 
-        // Restart warp watcher in case path or interval changed
-        warpFileWatcher.stop();
-        warpFileWatcher = new WarpFileWatcher(config, storage, warmZoneManager, executor,
-                teleportInterceptor::refreshPortalCache,
-                id -> {
-                    portalLinkRegistry.removeLink(id);
-                    teleportInterceptor.onPortalDeleted(id);
-                });
-        warpFileWatcher.start();
+        // Restart warp watcher only if relevant settings changed (old vs new comparison)
+        boolean newWarpsWatch = config.isWarpsWatchForChanges();
+        String newWarpsPath = config.getWarpsSourcePath();
+        int newWarpsInterval = config.getWarpsWatchIntervalSeconds();
+
+        boolean warpNeedsRestart = warpFileWatcher != null
+                && (oldWarpsWatch != newWarpsWatch
+                    || !oldWarpsPath.equals(newWarpsPath)
+                    || oldWarpsInterval != newWarpsInterval);
+        if (warpNeedsRestart) {
+            warpFileWatcher.stop();
+            warpFileWatcher = new WarpFileWatcher(config, storage, warmZoneManager, executor,
+                    teleportInterceptor::refreshPortalCache,
+                    id -> {
+                        portalLinkRegistry.removeLink(id);
+                        teleportInterceptor.onPortalDeleted(id);
+                    });
+            warpFileWatcher.start();
+        }
+
+        // Restart HyTeleportersX watcher only if relevant settings changed (old vs new comparison)
+        boolean newHtxEnabled = config.isHyTeleportersXIntegrationEnabled();
+        boolean newHtxWatch = config.isHyTeleportersXWatchForChanges();
+        String newHtxPath = config.getHyTeleportersXSourcePath();
+        int newHtxInterval = config.getHyTeleportersXWatchIntervalSeconds();
+        boolean newBetterGsEnabled = config.isBetterGravestoneIntegrationEnabled();
+        String newBetterGsPluginId = config.getBetterGravestonePluginId();
+        String newBetterGsBlockId = config.getBetterGravestoneBlockId();
+        int newBetterGsInterval = config.getBetterGravestoneWatchIntervalSeconds();
+        boolean newTpsMonitorEnabled = config.isTpsMonitorEnabled();
+        double newTpsLowThreshold = config.getTpsLowThreshold();
+        double newTpsCriticalThreshold = config.getTpsCriticalThreshold();
+        boolean newPortalChunkListenerEnabled = config.isPortalChunkListenerEnabled();
+
+        boolean htxNeedsRestart = hyTeleportersXWatcher != null
+                && (oldHtxEnabled != newHtxEnabled
+                    || oldHtxWatch != newHtxWatch
+                    || !oldHtxPath.equals(newHtxPath)
+                    || oldHtxInterval != newHtxInterval);
+        if (htxNeedsRestart) {
+            hyTeleportersXWatcher.stop();
+            hyTeleportersXWatcher = new HyTeleportersXWatcher(config, storage, warmZoneManager, executor,
+                    teleportInterceptor::refreshPortalCache,
+                    id -> {
+                        portalLinkRegistry.removeLink(id);
+                        teleportInterceptor.onPortalDeleted(id);
+                    });
+            hyTeleportersXWatcher.start();
+        }
+
+        boolean betterGsNeedsRestart = betterGravestoneWatcher != null
+                && (oldBetterGsEnabled != newBetterGsEnabled
+                    || !oldBetterGsPluginId.equals(newBetterGsPluginId)
+                    || !oldBetterGsBlockId.equals(newBetterGsBlockId)
+                    || oldBetterGsInterval != newBetterGsInterval);
+        if (betterGsNeedsRestart) {
+            betterGravestoneWatcher.stop();
+            betterGravestoneWatcher = new BetterGravestoneWatcher(
+                    this,
+                    config,
+                    deathLocationTracker,
+                    gravestoneIntegration,
+                    worldRegistry,
+                    executor
+            );
+            betterGravestoneWatcher.start();
+        }
 
         getLogger().at(java.util.logging.Level.INFO).log("[OptiPortal] Config reloaded via /preload reload.");
 
-        return "Config reloaded. Live: decay, keepalive, snapshot interval, activation, TTLs, warps, UI flags. "
-             + "Restart required for: backend, storage paths, MySQL credentials, startupLoadStrategy.";
+        String restartChanged = "";
+        if (oldTpsMonitorEnabled != newTpsMonitorEnabled
+                || Double.compare(oldTpsLowThreshold, newTpsLowThreshold) != 0
+                || Double.compare(oldTpsCriticalThreshold, newTpsCriticalThreshold) != 0) {
+            restartChanged += " Changed: tpsMonitor settings require restart to affect monitor wiring/thresholds.";
+        }
+        if (oldPortalChunkListenerEnabled != newPortalChunkListenerEnabled) {
+            restartChanged += " Changed: integrations.portalChunkListener.enabled requires restart to affect world hooks.";
+        }
+
+        return "Config reloaded. Live: decay, keepalive, snapshot interval, activation, TTLs, warps, optional integrations, UI flags. "
+             + "Restart required for: backend, storage paths, MySQL credentials, startupLoadStrategy, tpsMonitor wiring, portalChunkListener world hooks."
+             + restartChanged;
     }
 
     // --- Public API for other plugins ---
@@ -398,16 +581,17 @@ public class OptiPortal extends JavaPlugin {
     public ChunkPreloader getChunkPreloader() { return chunkPreloader; }
     public WalManager getWalManager() { return walManager; }
     public WarpFileWatcher getWarpFileWatcher() { return warpFileWatcher; }
+    public HyTeleportersXWatcher getHyTeleportersXWatcher() { return hyTeleportersXWatcher; }
     public RespawnTracker getRespawnTracker() { return respawnTracker; }
     public DeathLocationTracker getDeathLocationTracker() { return deathLocationTracker; }
     public MetricsCollector getMetricsCollector() { return metricsCollector; }
     public ScheduledExecutorService getExecutor() { return executor; }
     public com.optiportal.preload.PortalLinkRegistry getPortalLinkRegistry() { return portalLinkRegistry; }
     public com.optiportal.cache.ZoneTtlEnforcer getTtlEnforcer() { return ttlEnforcer; }
-    public com.optiportal.async.AsyncLoadBalancer getAsyncLoadBalancer() { return null; }
-    public com.optiportal.async.AsyncErrorHandler getAsyncErrorHandler() { return null; }
-    public com.optiportal.async.WorldTpsMonitor getTpsMonitor() { return null; }
-    public com.optiportal.preload.PortalChunkListener getPortalChunkListener() { return null; }
+    public com.optiportal.async.AsyncLoadBalancer getAsyncLoadBalancer() { return asyncLoadBalancer; }
+    public com.optiportal.async.AsyncErrorHandler getAsyncErrorHandler() { return asyncErrorHandler; }
+    public com.optiportal.async.WorldTpsMonitor getTpsMonitor() { return tpsMonitor; }
+    public com.optiportal.preload.PortalChunkListener getPortalChunkListener() { return portalChunkListener; }
     
     /** Check if the plugin is shutting down. Used by listeners to prevent post-shutdown work. */
     public boolean isShuttingDown() {

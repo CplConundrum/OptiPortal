@@ -325,13 +325,15 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
                             final double srcX = capturedPrev[0], srcZ = capturedPrev[1];
                             // Find nearest destination zone to landing position
                             PortalEntry best = null;
-                            double bestD = getPluginConfig().getActivationDistance();
+                            double bestDist = getPluginConfig().getActivationDistance();
+                            double bestDistSq = bestDist * bestDist;
                             for (PortalEntry pe : getPortalCache()) {
                                 if (pe.isInstanced() || pe.getId().contains(":")) continue;
                                 if (!pe.getWorld().equals(wName)) continue;
-                                // D2: Use Math.hypot instead of Math.sqrt for better performance
-                                double d = Math.hypot(pe.getX() - dstX, pe.getZ() - dstZ);
-                                if (d < bestD) { bestD = d; best = pe; }
+                                double dx = pe.getX() - dstX;
+                                double dz = pe.getZ() - dstZ;
+                                double dSq = dx * dx + dz * dz;
+                                if (dSq < bestDistSq) { bestDistSq = dSq; best = pe; }
                             }
                             if (best != null) {
                                 final PortalEntry fBest = best;
@@ -641,7 +643,7 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
                         final double[] srcPos = lastAsyncPosition.get(playerId);
                         final String fDestWorld = destWorld;
                         final double fdx = pos.x, fdy = pos.y, fdz = pos.z;
-                        lingerOriginZone(playerId);
+                        lingerOriginZone(playerId, currentWorldName);
                         String originId = srcPos != null
                                 ? findNearestPortal(currentWorldName, srcPos[0], 0, srcPos[1])
                                 : null;

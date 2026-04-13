@@ -40,7 +40,64 @@ public class WorldThreadBridge {
     private final WorldTpsMonitor tpsMonitor;
     
     // Operation queues for batching
-    private final ConcurrentHashMap<World, Queue<Runnable>> operationQueues;
+    private final ConcurrentHashMap<World, Queue<BatchedOperation>> operationQueues;
+    
+    /**
+     * Batched operation wrapper containing work items and completion future.
+     * Processed one batch at a time to ensure proper exception handling.
+     */
+    private static final class BatchedOperation {
+        private final List<Runnable> workItems;
+        private final CompletableFuture<Void> completionFuture;
+        private int nextIndex;
+        private boolean inFlight;
+        private boolean completed;
+        
+        BatchedOperation(List<Runnable> workItems, CompletableFuture<Void> completionFuture) {
+            this.workItems = List.copyOf(workItems);
+            this.completionFuture = completionFuture;
+        }
+
+        synchronized List<Runnable> claimNextSlice(int batchSize) {
+            if (inFlight || completed || nextIndex >= workItems.size()) {
+                return null;
+            }
+            int endIndex = Math.min(nextIndex + batchSize, workItems.size());
+            inFlight = true;
+            return new ArrayList<>(workItems.subList(nextIndex, endIndex));
+        }
+
+        synchronized boolean finishSuccess(int completedCount) {
+            if (!inFlight || completed) {
+                return completed;
+            }
+            nextIndex += completedCount;
+            inFlight = false;
+            if (nextIndex >= workItems.size()) {
+                completed = true;
+                completionFuture.complete(null);
+                return true;
+            }
+            return false;
+        }
+
+        synchronized void finishFailure(Throwable t) {
+            if (completed) {
+                return;
+            }
+            inFlight = false;
+            completed = true;
+            completionFuture.completeExceptionally(t);
+        }
+
+        synchronized boolean isCompleted() {
+            return completed;
+        }
+
+        void fail(Throwable t) {
+            finishFailure(t);
+        }
+    }
     
     // Batch processing configuration
     private static final int BATCH_SIZE = 10;
@@ -141,7 +198,7 @@ public class WorldThreadBridge {
     
     /**
      * Batch multiple operations to minimize world thread context switching.
-     * 
+     *
      * @param world The world to execute on
      * @param operations List of operations to batch
      * @return CompletableFuture that completes when all operations are done
@@ -152,15 +209,9 @@ public class WorldThreadBridge {
         }
         
         // Add to queue for batched processing
-        Queue<Runnable> queue = operationQueues.computeIfAbsent(world, k -> new ConcurrentLinkedQueue<>());
-        queue.addAll(operations);
-        
-        // Return a future that completes when the batch is processed
+        Queue<BatchedOperation> queue = operationQueues.computeIfAbsent(world, k -> new ConcurrentLinkedQueue<>());
         CompletableFuture<Void> future = new CompletableFuture<>();
-        
-        // Store future for completion when batch is processed
-        queue.add(() -> future.complete(null));
-        
+        queue.add(new BatchedOperation(operations, future));
         return future;
     }
     
@@ -298,9 +349,10 @@ public class WorldThreadBridge {
             return CompletableFuture.completedFuture(null);
         }
         
-        // Guard: do not load chunks in a paused or non-ticking world.
-        // This can happen during world transitions or server startup phases.
-        // world.isTicking() and world.isPaused() are thread-safe reads.
+        // Best-effort guard: these engine-owned state flags are plain fields in
+        // current decompiled sources, so treat them as advisory rather than as a
+        // synchronization boundary. A stale "active" read can still fall through
+        // to engine rejection/error handling during shutdown or world transition.
         if (!world.isTicking() || world.isPaused()) {
             LOG.info("[OptiPortal] WorldThreadBridge: skipping chunk load in non-active world '"
                     + world.getName() + "' (ticking=" + world.isTicking()
@@ -337,35 +389,38 @@ public class WorldThreadBridge {
      */
     private void startBatchProcessor() {
         executor.scheduleAtFixedRate(() -> {
-            operationQueues.forEach(this::processBatch);
+            for (java.util.Map.Entry<World, Queue<BatchedOperation>> entry : operationQueues.entrySet()) {
+                processBatch(entry.getKey(), entry.getValue());
+            }
         }, 0, BATCH_TIMEOUT_MS, TimeUnit.MILLISECONDS);
     }
     
     /**
      * Process a batch of operations for a world.
-     * 
+     *
      * @param world The world to process for
      * @param queue The operation queue
      */
-    private void processBatch(World world, Queue<Runnable> queue) {
+    private void processBatch(World world, Queue<BatchedOperation> queue) {
         if (queue.isEmpty()) {
             operationQueues.remove(world, queue); // evict dead entry; two-arg remove avoids TOCTOU
             return;
         }
-        
-        // A5: Use ArrayDeque instead of ArrayList to avoid allocation overhead
-        java.util.ArrayDeque<Runnable> batch = new java.util.ArrayDeque<>();
-        for (int i = 0; i < BATCH_SIZE && !queue.isEmpty(); i++) {
-            Runnable operation = queue.poll();
-            if (operation != null) {
-                batch.add(operation);
+
+        // Peek current batch so large batches can be processed in slices across ticks.
+        BatchedOperation batch = queue.peek();
+        if (batch == null || batch.isCompleted()) {
+            if (batch != null) {
+                queue.remove(batch);
             }
-        }
-        
-        if (batch.isEmpty()) {
             return;
         }
-        
+
+        List<Runnable> slice = batch.claimNextSlice(BATCH_SIZE);
+        if (slice == null || slice.isEmpty()) {
+            return;
+        }
+
         // Execute batch on world thread.
         // world.execute() throws SkipSentryException (RuntimeException) if the world is
         // shutting down. Catch it here so the scheduleAtFixedRate task does NOT propagate
@@ -373,18 +428,34 @@ public class WorldThreadBridge {
         // exception, which would permanently kill the batch processor for all worlds.
         try {
             world.execute(() -> {
-                for (Runnable operation : batch) {
-                    try {
-                        operation.run();
-                    } catch (Exception e) {
-                        errorHandler.handleWorldThreadError(e, "batchedOperation");
+                try {
+                    for (Runnable work : slice) {
+                        work.run();
                     }
+                    if (batch.finishSuccess(slice.size())) {
+                        queue.remove(batch);
+                    }
+                } catch (Exception e) {
+                    errorHandler.handleWorldThreadError(e, "batchedOperation");
+                    // Exception during batch execution - fail this batch only.
+                    batch.finishFailure(e);
+                    queue.remove(batch);
                 }
             });
         } catch (Exception e) {
             LOG.fine(() -> "[OptiPortal] processBatch: world.execute() rejected for '"
-                    + world.getName() + "' (shutting down) — discarding " + batch.size() + " ops");
+                    + world.getName() + "' (shutting down) — completing queued batches exceptionally");
+            // Rejection during dispatch - fail every queued batch for this world, not just
+            // the currently visible slice, so no futures are orphaned.
+            failQueuedBatches(queue, e);
             operationQueues.remove(world, queue);
+        }
+    }
+
+    private void failQueuedBatches(Queue<BatchedOperation> queue, Throwable failure) {
+        BatchedOperation queued;
+        while ((queued = queue.poll()) != null) {
+            queued.fail(failure);
         }
     }
     

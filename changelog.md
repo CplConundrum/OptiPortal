@@ -2,32 +2,71 @@
 
 ---
 
+## [1.2.3] - 2026-04-13
+
+- **Optional integrations are safer**: Missing companion plugins now stay a clean no-op, and BetterGravestone support can track death-location graves without adding a hard dependency.
+
+- **Startup and reload are lighter**: Non-essential work now starts after the core runtime is up, warm-zone and watcher paths reuse smaller snapshots, and the world registry picks up worlds that were already live.
+
+- **Reload output is clearer**: `/preload reload` now names restart-only changes for `tpsMonitor.*` and `integrations.portalChunkListener.enabled`, and the bundled TPS-monitor config matches the parser while keeping legacy keys compatible.
+
+- **Async status is real now**: Commands and status surfaces read live `AsyncLoadBalancer`, `AsyncErrorHandler`, and `WorldTpsMonitor` services instead of placeholder nulls.
+
+- **Retry and backoff handling is quieter**: `RetryPolicy` uses `CompletableFuture.delayedExecutor(...)` instead of throwaway schedulers, and known engine `"Chunk failure backoff"` responses no longer trigger extra plugin retry work.
+
+- **Operator surfaces tell the truth better**: Command/UI refresh and delete paths handle missing optional services cleanly, and HOT zone displays now distinguish fully owned footprints from partial or assumed HOT state.
+
+- **Cache and lifecycle cleanup landed**: `CacheManager` tier snapshot locking is now named and documented clearly, tier/timestamp snapshots stay consistent, engine-state checks are documented as advisory, and the unused `PlayerDeathSystem` path was removed.
+
+- **Regression coverage and reviewer docs caught up**: Tests now cover the recent batching, budgeting, spatial lookup, retry, and scheduling work. The wiki, complete reference, critique report, and stale LLM notes were cleaned up to match the current source.
+
+---
+
+## [1.2.2] - 2026-04-04
+
+- **OptiPortal can now watch popular portal mods and mirror them into its predictive registry**: External portal data can be refreshed on demand without manually duplicating entries into OptiPortal.
+
+- **Origin-zone linger is working again**: Recently departed portals now stay hot for the intended decay window after teleport instead of silently skipping the linger step.
+
+- **Storage churn is much lower during busy periods**: Sync work and post-load zone-stat updates now batch and coalesce their writes instead of repeatedly saving one entry at a time.
+
+- **Chunk preload budgeting now adapts mid-load**: Batch size and delay are re-evaluated between batches so OptiPortal can back off faster when chunk pressure or load latency rises.
+
+- **Live portal lookups are now much narrower**: The teleport path now uses a spatial index for proximity, nearest-portal, linger-origin, reverse-preload, and same-world jump detection instead of broader per-world scans.
+
+- **Routine proximity work is now staggered into small batches**: Player proximity checks are spread out more evenly, which smooths background load on busier servers without changing teleport-triggered preload behavior.
+
+- **JSON storage now handles bursty updates more cleanly**: Disk writes are debounced and ordered safely, the debounce delay can be reloaded, and shutdown still forces a final flush.
+
+- **Config reload is a little more defensive around watcher restart**: The warp watcher is now null-checked before stop/restart, matching the rest of the reload path.
+
+---
+
 ## [1.2.1] - 2026-04-04
 
 ### Fixed
 
-- **Startup and shutdown now follow the engine properly**: OptiPortal now uses the right `start()` and `shutdown()` hooks, cleans up its listeners on the way down, and gives async work a safer path to finish before storage closes.
+- **Startup and shutdown now follow the engine properly**: OptiPortal uses the right lifecycle hooks, unregisters more cleanly, and gives in-flight async work a safer path to finish before storage closes.
 
-- **A handful of awkward startup and cleanup edge cases are gone**: This round tightens up early-startup retention, chunk-ownership races, and a few legacy shutdown guard paths so zones and preload state stay in sync during reloads and shutdowns.
+- **Several startup and shutdown edge cases were cleaned up**: This tightens early-startup retention, chunk-ownership races, and a few legacy shutdown guards so zone state stays more consistent across reloads.
 
-- **`/preload status` no longer falls over on the base runtime**: If the async subsystem is inactive, the command now says so clearly instead of crashing, while still showing the live runtime information that is available.
+- **`/preload status` no longer crashes on the base runtime**: If the async subsystem is inactive, the command now reports that cleanly instead of failing.
 
-- **TTL expiry now actually runs end to end**: The TTL enforcer is now part of the live plugin lifecycle, and expired zones now get the same cleanup as manual deletion so old links and cached portal state do not hang around.
+- **TTL expiry now runs end to end**: Expired zones now go through the same cleanup path as manual deletion, so old links and cached state do not hang around.
 
-- **Metrics, version reporting, and dormant-system notes are now more consistent**: The live runtime now shares one metrics collector, update checks read version metadata from the plugin manifest, and the code is clearer about which subsystems are present but not currently active.
+- **Version reporting and dormant-system notes are more consistent**: The live runtime now shares one metrics collector, reads version metadata from the manifest, and is clearer about which systems are present but not active.
 
 ---
 
 ### Changed
 
-- **Teleport polling is less aggressive by default**: The base poll interval now defaults to `2` seconds instead of `1`, which cuts the always-on polling cost in half on servers using the default settings without changing the overall detection model.
+- **Teleport polling is less aggressive by default**: The base poll interval now defaults to `2` seconds instead of `1`, cutting always-on polling cost in half on default settings.
 
+- **Portal scans now stay focused on the current world**: The teleport interceptor keeps a per-world in-memory portal cache, so hot lookups no longer scan unrelated worlds every pass.
 
-- **Multi-world portal scans now stay focused on the current world**: The teleport interceptor now keeps a per-world in-memory portal cache, so its hot lookup paths no longer scan and discard portals from unrelated worlds on every pass.
+- **Tiny player movements no longer trigger constant rescans**: Proximity checks now wait for either more meaningful movement or a short cadence gap before running again.
 
-- **Small player movements no longer trigger constant portal rescans**: Proximity checks now wait for either more meaningful movement or a short cadence gap before running another full scan, which trims steady background CPU without changing the broader polling design.
-
-- **The code is clearer about what is live and what is still dormant**: Non-active systems such as the async teleport/keepalive path, ownership auditor, and player death system are now called out more explicitly so future maintenance work has a cleaner picture of the real runtime surface.
+- **The code is clearer about what is live and what is still dormant**: Non-active async and legacy paths are called out more explicitly for future maintenance.
 ---
 
 ## [1.2.0] - 2026-03-29

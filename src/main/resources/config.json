@@ -19,6 +19,9 @@
   "_snapshotIntervalMinutes_info": "How often (in minutes) a full cache snapshot is written to disk. Lower = less data lost on crash, higher = less disk I/O.",
   "snapshotIntervalMinutes": 10,
 
+  "_storageWriteBehindDelayMs_info": "How long OptiPortal waits after a storage mutation before flushing portal-data.json. Higher = less disk churn, lower = less data at risk on crash.",
+  "storageWriteBehindDelayMs": 1000,
+
   "_rebuildFromChunksOnCorruption_info": "If the cache file is corrupted on startup, automatically rebuild it from Hytale's raw chunk files instead of starting empty.",
   "rebuildFromChunksOnCorruption": true,
 
@@ -169,20 +172,17 @@
     "pollIntervalSeconds": 1
   },
 
-  "_section_async": "=== ASYNC TPS MONITORING ===",
-  "_async_info": "Server load sensing: monitors TPS and adjusts chunk loading behavior to reduce load during server stress.",
-  "async": {
-    "_tpsMonitorEnabled_info": "Enable TPS monitoring. When enabled, OptiPortal will reduce chunk loading when server TPS drops.",
-    "tpsMonitorEnabled": true,
+  "_section_tps_monitor": "=== TPS MONITORING ===",
+  "_tpsMonitor_info": "Server load sensing: monitors TPS and adjusts chunk loading behavior to reduce load during server stress. These settings are startup-wired; restart after changing them.",
+  "tpsMonitor": {
+    "_enabled_info": "Enable TPS monitoring. Requires restart to change because monitor wiring happens at startup.",
+    "enabled": true,
 
-    "_tpsLowThreshold_info": "TPS below this value triggers reduced batch sizes. Default: 15.0.",
-    "tpsLowThreshold": 15.0,
+    "_lowThreshold_info": "TPS below this value triggers reduced batch sizes. Requires restart to change because thresholds are captured by the monitor at startup.",
+    "lowThreshold": 18.0,
 
-    "_tpsCriticalThreshold_info": "TPS below this value queues all non-critical operations. Default: 12.0.",
-    "tpsCriticalThreshold": 12.0,
-
-    "_maxLoadedChunksPressureThreshold_info": "If ChunkStore.getLoadedChunksCount() exceeds this across any world, batch size is reduced proportionally. Default: 2000. -1 = disabled.",
-    "maxLoadedChunksPressureThreshold": 2000
+    "_criticalThreshold_info": "TPS below this value queues all non-critical operations. Requires restart to change because thresholds are captured by the monitor at startup.",
+    "criticalThreshold": 12.0
   },
 
   "_section_warps": "=== WARP FILE INTEGRATION ===",
@@ -223,6 +223,36 @@
 
       "_releaseOnEmpty_info": "Stop keeping the gravestone's chunk loaded once the gravestone is emptied (all items collected).",
       "releaseOnEmpty": true
+    },
+    "betterGravestone": {
+      "_enabled_info": "Enable BetterGravestone integration. OptiPortal will track death locations from BetterGravestone and release them when the gravestone is gone or empty.",
+      "enabled": false,
+      "pluginId": "mirko0:BetterGravestone",
+
+      "_blockId_info": "Block asset id used by BetterGravestone. Change this only if the plugin renames its gravestone block.",
+      "blockId": "Furniture_Gravestone",
+
+      "_watchIntervalSeconds_info": "How often OptiPortal checks tracked BetterGravestone blocks for cleanup.",
+      "watchIntervalSeconds": 5
+    },
+    "hyTeleportersX": {
+      "_enabled_info": "Enable HyTeleportersX integration. OptiPortal will mirror teleporter blocks from Teleporters.json as predictive preload zones.",
+      "enabled": false,
+      "pluginId": "HyTeleportersX",
+
+      "_sourcePath_info": "Path to HyTeleportersX's Teleporters.json. Relative to the server root unless you use an absolute path.",
+      "sourcePath": "HyTeleportersX/Teleporters.json",
+
+      "_watchForChanges_info": "Automatically resync teleporter locations when HyTeleportersX updates its Teleporters.json file.",
+      "watchForChanges": true,
+      "watchIntervalSeconds": 30,
+
+      "_idPrefix_info": "Prefix used for imported zone ids so HyTeleportersX entries never collide with regular warp ids.",
+      "idPrefix": "hyteleportersx:"
+    },
+    "portalChunkListener": {
+      "_enabled_info": "Enable world-event hooks for portal chunk indexing. Requires restart to change because world hooks are registered at startup.",
+      "enabled": false
     }
   },
 

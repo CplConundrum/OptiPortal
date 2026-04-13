@@ -120,6 +120,7 @@ public class PreloadCommand extends AbstractCommand {
         reply(ctx, "  /preload preload <id> — force predictive preload");
         reply(ctx, "  /preload ram — RAM usage summary");
         reply(ctx, "  /preload refresh warps — re-read warps.json");
+        reply(ctx, "  /preload refresh teleporters — re-read HyTeleportersX Teleporters.json");
         reply(ctx, "  /preload reload — hot-reload config.json (see output for what takes effect immediately)");
         reply(ctx, "  /preload migrate <JSON|SQLITE|H2|MYSQL> — migration instructions");
         reply(ctx, "  /preload backup <list|restore <date>> — WAL backups");
@@ -142,7 +143,7 @@ public class PreloadCommand extends AbstractCommand {
         for (PortalEntry entry : all) {
             com.optiportal.model.CacheTier storedTier = plugin.getCacheManager().getZoneTier(entry.getId());
             String tierLabel = switch (storedTier) {
-                case HOT -> "HOT";
+                case HOT -> hotResidencyLabel(entry);
                 case WARM -> "WARM";
                 case COLD -> "COLD";
                 case REBUILDING -> "REBUILDING";
@@ -286,11 +287,34 @@ public class PreloadCommand extends AbstractCommand {
     }
 
     private CompletableFuture<Void> handleRefresh(CommandContext ctx, String[] args) {
-        if (args.length < 2 || !args[1].equalsIgnoreCase("warps")) {
-            reply(ctx, "Usage: /preload refresh warps"); return done();
+        if (args.length < 2) {
+            reply(ctx, "Usage: /preload refresh <warps|teleporters>"); return done();
         }
-        int count = plugin.getWarpFileWatcher().forceRefresh();
-        reply(ctx, "[OptiPortal] Refreshed " + count + " warps from warps.json.");
+        if (args[1].equalsIgnoreCase("warps")) {
+            var watcher = plugin.getWarpFileWatcher();
+            if (watcher == null) {
+                reply(ctx, "[OptiPortal] Warp watcher is not available.");
+                return done();
+            }
+            int count = watcher.forceRefresh();
+            reply(ctx, "[OptiPortal] Refreshed " + count + " warps from warps.json.");
+            return done();
+        }
+        if (args[1].equalsIgnoreCase("teleporters")) {
+            var watcher = plugin.getHyTeleportersXWatcher();
+            if (!plugin.getPluginConfig().isHyTeleportersXIntegrationEnabled()) {
+                reply(ctx, "[OptiPortal] HyTeleportersX integration is disabled in config.");
+                return done();
+            }
+            if (watcher == null) {
+                reply(ctx, "[OptiPortal] HyTeleportersX watcher is not available.");
+                return done();
+            }
+            int count = watcher.forceRefresh();
+            reply(ctx, "[OptiPortal] Refreshed " + count + " HyTeleportersX teleporters from Teleporters.json.");
+            return done();
+        }
+        reply(ctx, "Usage: /preload refresh <warps|teleporters>");
         return done();
     }
 
@@ -337,12 +361,14 @@ public class PreloadCommand extends AbstractCommand {
     }
 
     private CompletableFuture<Void> handleStatus(CommandContext ctx) {
-        // Read async components into locals - they may be null in base runtime
+        // Read async components into locals so status degrades cleanly during
+        // partial startup, shutdown, or explicitly disabled monitor states.
         com.optiportal.async.AsyncErrorHandler asyncErrorHandler = plugin.getAsyncErrorHandler();
         com.optiportal.async.AsyncLoadBalancer asyncLoadBalancer = plugin.getAsyncLoadBalancer();
         com.optiportal.async.WorldTpsMonitor tps = plugin.getTpsMonitor();
         
         java.util.Map<com.optiportal.model.CacheTier, Integer> tiers = plugin.getCacheManager().getTierCounts();
+        int verifiedHotZones = countVerifiedHotZones();
         int totalChunks = plugin.getChunkPreloader().getWorldRegistry().getTotalLoadedChunkCount();
 
         // Build CircuitBreakerStats from locals
@@ -364,7 +390,7 @@ public class PreloadCommand extends AbstractCommand {
                      : "nominal";
         }
 
-        reply(ctx, "[OptiPortal] Status — 1.2.1");
+        reply(ctx, "[OptiPortal] Status — 1.2.3");
         
         // Circuit breaker info
         if (cb != null) {
@@ -390,8 +416,9 @@ public class PreloadCommand extends AbstractCommand {
         }
         
         reply(ctx, String.format("  Server chunks   : %d loaded", totalChunks));
-        reply(ctx, String.format("  Zone registry   : %d HOT  |  %d WARM  |  %d COLD  |  %d UNVISITED",
+        reply(ctx, String.format("  Zone registry   : %d HOT (%d verified)  |  %d WARM  |  %d COLD  |  %d UNVISITED",
                 tiers.getOrDefault(com.optiportal.model.CacheTier.HOT, 0),
+                verifiedHotZones,
                 tiers.getOrDefault(com.optiportal.model.CacheTier.WARM, 0),
                 tiers.getOrDefault(com.optiportal.model.CacheTier.COLD, 0),
                 tiers.getOrDefault(com.optiportal.model.CacheTier.UNVISITED, 0)));
@@ -535,6 +562,7 @@ public class PreloadCommand extends AbstractCommand {
             com.optiportal.model.CacheTier tier = plugin.getCacheManager().getZoneTier(id);
             long tierAgeMs = plugin.getCacheManager().getZoneTierAgeMs(id);
             int ownedChunks = plugin.getCacheManager().getOwnedChunkCount(id);
+            int expectedChunks = expectedChunkCount(entry);
             
             reply(ctx, "[OptiPortal] Zone diagnostics for '" + id + "':");
             reply(ctx, "  Strategy: " + entry.getStrategy());
@@ -547,6 +575,8 @@ public class PreloadCommand extends AbstractCommand {
             reply(ctx, "  Activation distance (H): " + (entry.getActivationDistanceHorizontal() != null ? entry.getActivationDistanceHorizontal() : "global"));
             reply(ctx, "  Activation distance (V): " + (entry.getActivationDistanceVertical() != null ? entry.getActivationDistanceVertical() : "global"));
             reply(ctx, "  Cache tier: " + tier);
+            reply(ctx, "  Residency: " + residencyLabel(tier, ownedChunks, expectedChunks)
+                    + " (" + ownedChunks + "/" + expectedChunks + " expected ownership pins)");
             reply(ctx, "  Tier age: " + (tierAgeMs > 0 ? String.format("%.1fs", tierAgeMs / 1000.0) : "N/A"));
             reply(ctx, "  Owned chunks: " + ownedChunks);
             reply(ctx, "  RAM est: " + String.format("%.1fMB", entry.getRamEstimatedMB()));
@@ -606,7 +636,10 @@ public class PreloadCommand extends AbstractCommand {
             }
 
             // Step 4: Remove any confirmed or pending portal links
-            plugin.getPortalLinkRegistry().removeLink(id);
+            var portalLinkRegistry = plugin.getPortalLinkRegistry();
+            if (portalLinkRegistry != null) {
+                portalLinkRegistry.removeLink(id);
+            }
 
             // Step 5: Delete from storage
             plugin.getStorage().delete(id);
@@ -637,5 +670,59 @@ public class PreloadCommand extends AbstractCommand {
 
     private int parseIntOrDefault(String s, int def) {
         try { return Integer.parseInt(s); } catch (NumberFormatException e) { return def; }
+    }
+
+    private String hotResidencyLabel(PortalEntry entry) {
+        int owned = plugin.getCacheManager().getOwnedChunkCount(entry.getId());
+        int expected = expectedChunkCount(entry);
+        if (owned >= expected) return "HOT:verified";
+        if (owned > 0) return "HOT:partial";
+        return "HOT:assumed";
+    }
+
+    private int countVerifiedHotZones() {
+        int count = 0;
+        for (PortalEntry entry : plugin.getStorage().loadAllCached()) {
+            if (plugin.getCacheManager().getZoneTier(entry.getId()) != com.optiportal.model.CacheTier.HOT) continue;
+            if (plugin.getCacheManager().getOwnedChunkCount(entry.getId()) >= expectedChunkCount(entry)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private String residencyLabel(com.optiportal.model.CacheTier tier, int ownedChunks, int expectedChunks) {
+        if (tier != com.optiportal.model.CacheTier.HOT) {
+            return "not HOT; residency is not asserted";
+        }
+        if (ownedChunks >= expectedChunks) {
+            return "verified by OptiPortal ownership pins";
+        }
+        if (ownedChunks > 0) {
+            return "partial ownership; keepalive should downgrade or refresh";
+        }
+        return "assumed only; no ownership pins recorded";
+    }
+
+    private int expectedChunkCount(PortalEntry entry) {
+        int radiusX = resolveRadiusX(entry);
+        int radiusZ = resolveRadiusZ(entry);
+        return (2 * radiusX + 1) * (2 * radiusZ + 1);
+    }
+
+    private int resolveRadiusX(PortalEntry entry) {
+        if (entry.getWarmRadiusX() != null) return entry.getWarmRadiusX();
+        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
+        return entry.getStrategy() == WarmStrategy.WARM
+                ? plugin.getPluginConfig().getDefaultWarmRadius()
+                : plugin.getPluginConfig().getPredictiveRadius();
+    }
+
+    private int resolveRadiusZ(PortalEntry entry) {
+        if (entry.getWarmRadiusZ() != null) return entry.getWarmRadiusZ();
+        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
+        return entry.getStrategy() == WarmStrategy.WARM
+                ? plugin.getPluginConfig().getDefaultWarmRadius()
+                : plugin.getPluginConfig().getPredictiveRadius();
     }
 }

@@ -268,6 +268,28 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
         return cachedList;
     }
 
+    @Override
+    public List<PortalEntry> loadEntriesWithIdPrefix(String prefix) {
+        // Filter cached snapshot - no additional DB round-trip needed
+        // This avoids reading all rows and filtering in application code
+        if (prefix == null || prefix.isEmpty()) {
+            return cachedList;
+        }
+        return cachedList.stream()
+                .filter(entry -> entry.getId() != null && entry.getId().startsWith(prefix))
+                .toList();
+    }
+
+    @Override
+    public List<PortalEntry> loadWarpSyncEntries(String excludedIdPrefix) {
+        // Filter cached snapshot - no additional DB round-trip needed
+        // Returns only PORTAL-type entries not owned by HyTeleportersX
+        return cachedList.stream()
+                .filter(entry -> entry.getType() == PortalEntry.EntryType.PORTAL
+                               && (excludedIdPrefix == null || !entry.getId().startsWith(excludedIdPrefix)))
+                .toList();
+    }
+
     protected void bindEntry(PreparedStatement ps, PortalEntry e) throws SQLException {
         ps.setString(1, e.getId());
         ps.setString(2, e.getWorld());

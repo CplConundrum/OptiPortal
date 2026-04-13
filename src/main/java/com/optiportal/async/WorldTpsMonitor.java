@@ -14,9 +14,8 @@ import com.optiportal.preload.WorldRegistry;
  * Observes server TPS by reading World.getBufferedTickLengthMetricSet() each
  * sample interval and converting the most recent tick duration to TPS.
  *
- * <p><b>DORMANT: This class is intentionally not wired into OptiPortal startup.</b>
- * It provides TPS monitoring utilities that may be activated by other subsystems
- * (e.g., AsyncLoadBalancer) if load-aware scheduling is needed.
+ * This monitor is active in the live OptiPortal runtime and provides TPS-aware
+ * observability for async status and future load-aware scheduling.
  *
  * <p>Threading: volatile double for currentTps. All reads are safe from any thread.
  *
@@ -33,8 +32,10 @@ import com.optiportal.preload.WorldRegistry;
  * cap, slow, or otherwise influence the engine's tick rate.
  *
  * If multiple worlds are loaded, we use the MINIMUM TPS across all ticking
- * worlds (most conservative for backpressure decisions). EMA smoothing is applied
- * to suppress single-tick spikes.
+ * worlds (most conservative for backpressure decisions). The world activity
+ * flags are engine-owned advisory reads, so stale active/inactive observations
+ * should be handled as a transient sampling artifact rather than a correctness
+ * signal. EMA smoothing is applied to suppress single-tick spikes.
  *
  * Threading: volatile double for currentTps. All reads are safe from any thread.
  */
@@ -123,6 +124,9 @@ public class WorldTpsMonitor {
 
         for (World world : worlds) {
             try {
+                // Best-effort advisory gate. The backing engine fields are plain
+                // booleans in current decompiled sources, so this avoids obvious
+                // inactive worlds without treating the read as a hard memory barrier.
                 if (!world.isTicking() || world.isPaused()) continue;
                 HistoricMetric tickLen = world.getBufferedTickLengthMetricSet();
                 long lastTickNanos = tickLen.getLastValue();

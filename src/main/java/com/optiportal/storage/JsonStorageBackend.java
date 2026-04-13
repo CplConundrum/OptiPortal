@@ -12,6 +12,12 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
@@ -48,6 +54,8 @@ public class JsonStorageBackend implements StorageBackend {
     private final File dataFile;
     private final File tmpFile;
     private final File bakFile;
+    private volatile int writeBehindDelayMs;
+    private final ScheduledExecutorService flushExecutor;
 
     // In-memory map for fast access
     private final Map<String, PortalEntry> entries = new LinkedHashMap<>();
@@ -58,6 +66,14 @@ public class JsonStorageBackend implements StorageBackend {
 
     // Optional cache updater for async invalidation
     private CacheUpdater cacheUpdater;
+    private final Object flushLock = new Object();
+    private final Object ioLock = new Object();
+    private final AtomicLong snapshotVersion = new AtomicLong(0);
+    private volatile ScheduledFuture<?> pendingFlushTask;
+    private volatile List<PortalEntry> pendingFlushSnapshot;
+    private volatile long pendingFlushVersion;
+    private volatile long flushedVersion;
+    private volatile boolean closed;
 
     /**
      * Interface for cache update notifications.
@@ -79,6 +95,17 @@ public class JsonStorageBackend implements StorageBackend {
         this.dataFile = new File(dataFolder, "portal-data.json");
         this.tmpFile  = new File(dataFolder, "portal-data.json.tmp");
         this.bakFile  = new File(dataFolder, "portal-data.json.bak");
+        this.writeBehindDelayMs = Math.max(0, config.getStorageWriteBehindDelayMs());
+        ScheduledThreadPoolExecutor executor = new ScheduledThreadPoolExecutor(1, new ThreadFactory() {
+            @Override
+            public Thread newThread(Runnable r) {
+                Thread thread = new Thread(r, "OptiPortal-JsonFlush");
+                thread.setDaemon(true);
+                return thread;
+            }
+        });
+        executor.setRemoveOnCancelPolicy(true);
+        this.flushExecutor = executor;
     }
 
     @Override
@@ -89,7 +116,7 @@ public class JsonStorageBackend implements StorageBackend {
             loadFromDisk();
         } else {
             // Fresh install - write empty structure
-            flush(List.of());
+            flush(List.<PortalEntry>of(), snapshotVersion.incrementAndGet());
         }
         // Initialize cachedList and entryIndex after loading
         entryIndex.putAll(entries);
@@ -142,20 +169,49 @@ public class JsonStorageBackend implements StorageBackend {
     }
 
     @Override
+    public List<PortalEntry> loadEntriesWithIdPrefix(String prefix) {
+        // Use the existing cached list to filter without rebuilding from disk
+        // This avoids the full JSON deserialization overhead during startup/reload
+        if (prefix == null || prefix.isEmpty()) {
+            return loadAllCached();
+        }
+        return cachedList.stream()
+                .filter(entry -> entry.getId() != null && entry.getId().startsWith(prefix))
+                .toList();
+    }
+
+    @Override
+    public List<PortalEntry> loadWarpSyncEntries(String excludedIdPrefix) {
+        // Use the existing cached list to filter without rebuilding from disk
+        // Returns only PORTAL-type entries not owned by HyTeleportersX
+        return cachedList.stream()
+                .filter(entry -> entry.getType() == PortalEntry.EntryType.PORTAL
+                               && (excludedIdPrefix == null || !entry.getId().startsWith(excludedIdPrefix)))
+                .toList();
+    }
+
+    @Override
     public Optional<PortalEntry> loadById(String id) {
         return Optional.ofNullable(entryIndex.get(id));
     }
 
     @Override
+    public void onConfigReload(PluginConfig config) {
+        this.writeBehindDelayMs = Math.max(0, config.getStorageWriteBehindDelayMs());
+    }
+
+    @Override
     public void save(PortalEntry entry) {
         List<PortalEntry> snapshot;
+        long version;
         synchronized (this) {
             entries.put(entry.getId(), entry);
             entryIndex.put(entry.getId(), entry);
             snapshot = new ArrayList<>(entries.values());
+            version = snapshotVersion.incrementAndGet();
         }
         cachedList = java.util.Collections.unmodifiableList(snapshot);
-        flush(snapshot);
+        queueFlush(snapshot, version);
         if (cacheUpdater != null) {
             cacheUpdater.onUpdate(snapshot);
         }
@@ -164,15 +220,17 @@ public class JsonStorageBackend implements StorageBackend {
     @Override
     public void saveAll(List<PortalEntry> newEntries) {
         List<PortalEntry> snapshot;
+        long version;
         synchronized (this) {
             for (PortalEntry e : newEntries) {
                 entries.put(e.getId(), e);
                 entryIndex.put(e.getId(), e);
             }
             snapshot = new ArrayList<>(entries.values());
+            version = snapshotVersion.incrementAndGet();
         }
         cachedList = java.util.Collections.unmodifiableList(snapshot);
-        flush(snapshot);
+        queueFlush(snapshot, version);
         if (cacheUpdater != null) {
             cacheUpdater.onUpdate(snapshot);
         }
@@ -181,15 +239,17 @@ public class JsonStorageBackend implements StorageBackend {
     @Override
     public void delete(String id) {
         List<PortalEntry> snapshot = null;
+        long version = -1;
         synchronized (this) {
             if (entries.remove(id) != null) {
                 entryIndex.remove(id);
                 snapshot = new ArrayList<>(entries.values());
+                version = snapshotVersion.incrementAndGet();
             }
         }
         if (snapshot != null) {
             cachedList = java.util.Collections.unmodifiableList(snapshot);
-            flush(snapshot);
+            queueFlush(snapshot, version);
             if (cacheUpdater != null) {
                 cacheUpdater.onUpdate(snapshot);
             }
@@ -204,11 +264,61 @@ public class JsonStorageBackend implements StorageBackend {
     @Override
     public void close() {
         List<PortalEntry> snapshot;
+        long version;
         synchronized (this) {
             snapshot = new ArrayList<>(entries.values());
+            version = snapshotVersion.incrementAndGet();
+        }
+        synchronized (flushLock) {
+            closed = true;
+            ScheduledFuture<?> task = pendingFlushTask;
+            if (task != null) {
+                task.cancel(false);
+                pendingFlushTask = null;
+            }
+            pendingFlushSnapshot = null;
+            pendingFlushVersion = 0;
         }
         cachedList = java.util.Collections.unmodifiableList(snapshot);
-        flush(snapshot);
+        flush(snapshot, version);
+        flushExecutor.shutdown();
+    }
+
+    private void queueFlush(List<PortalEntry> snapshot, long version) {
+        if (closed) {
+            flush(snapshot, version);
+            return;
+        }
+        if (writeBehindDelayMs <= 0) {
+            flush(snapshot, version);
+            return;
+        }
+
+        synchronized (flushLock) {
+            pendingFlushSnapshot = snapshot;
+            pendingFlushVersion = version;
+            ScheduledFuture<?> task = pendingFlushTask;
+            if (task != null) {
+                task.cancel(false);
+            }
+            pendingFlushTask = flushExecutor.schedule(this::flushPendingSnapshot,
+                    writeBehindDelayMs, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    private void flushPendingSnapshot() {
+        List<PortalEntry> snapshot;
+        long version;
+        synchronized (flushLock) {
+            snapshot = pendingFlushSnapshot;
+            version = pendingFlushVersion;
+            pendingFlushSnapshot = null;
+            pendingFlushVersion = 0;
+            pendingFlushTask = null;
+        }
+        if (snapshot != null) {
+            flush(snapshot, version);
+        }
     }
 
     /**
@@ -216,38 +326,39 @@ public class JsonStorageBackend implements StorageBackend {
      * Snapshot is taken by the caller under the lock before this is called,
      * so disk I/O (serialize + fsync + rename) never blocks concurrent readers.
      */
-    private void flush(List<PortalEntry> snapshot) {
-        try {
-            // Build JSON
-            JsonObject root = new JsonObject();
-            root.addProperty("_backendType", "JSON");
-            root.addProperty("_lastSaved", Instant.now().toString());
-
-            JsonArray array = new JsonArray();
-            for (PortalEntry entry : snapshot) {
-                array.add(GSON.toJsonTree(entry));
+    private void flush(List<PortalEntry> snapshot, long version) {
+        synchronized (ioLock) {
+            if (version <= flushedVersion) {
+                return;
             }
-            root.add("portals", array);
+            try {
+                JsonObject root = new JsonObject();
+                root.addProperty("_backendType", "JSON");
+                root.addProperty("_lastSaved", Instant.now().toString());
 
-            // Write to tmp with fsync before rename to prevent partial-write corruption
-            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(tmpFile);
-                 java.nio.channels.FileChannel ch = fos.getChannel();
-                 java.io.OutputStreamWriter writer = new java.io.OutputStreamWriter(fos, java.nio.charset.StandardCharsets.UTF_8)) {
-                GSON.toJson(root, writer);
-                writer.flush();
-                ch.force(true);
+                JsonArray array = new JsonArray();
+                for (PortalEntry entry : snapshot) {
+                    array.add(GSON.toJsonTree(entry));
+                }
+                root.add("portals", array);
+
+                try (java.io.FileOutputStream fos = new java.io.FileOutputStream(tmpFile);
+                     java.nio.channels.FileChannel ch = fos.getChannel();
+                     java.io.OutputStreamWriter writer = new java.io.OutputStreamWriter(fos, java.nio.charset.StandardCharsets.UTF_8)) {
+                    GSON.toJson(root, writer);
+                    writer.flush();
+                    ch.force(true);
+                }
+
+                if (dataFile.exists()) {
+                    Files.copy(dataFile.toPath(), bakFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                }
+
+                Files.move(tmpFile.toPath(), dataFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                flushedVersion = version;
+            } catch (IOException e) {
+                LOG.warning("[OptiPortal] Failed to flush portal-data.json: " + e.getMessage());
             }
-
-            // Backup existing file
-            if (dataFile.exists()) {
-                Files.copy(dataFile.toPath(), bakFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
-            }
-
-            // Atomic rename
-            Files.move(tmpFile.toPath(), dataFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
-
-        } catch (IOException e) {
-            LOG.warning("[OptiPortal] Failed to flush portal-data.json: " + e.getMessage());
         }
     }
 }

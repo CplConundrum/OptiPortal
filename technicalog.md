@@ -6,6 +6,706 @@ mirror the version numbers in `changelog.md`.
 
 ---
 
+## [1.2.3] - 2026-04-08
+
+---
+
+### Warm-zone lifecycle paths now reuse one registry snapshot per operation
+
+**Files:** `WarmZoneManager.java`
+
+**Root cause:**
+Startup-side world seeding had already been tightened to reuse one storage snapshot across all
+world scans, but other `WarmZoneManager` lifecycle paths were still pulling their own broad
+`storage.loadAll()` snapshot internally:
+
+- `onWorldRemoved(...)`
+- `serializeAll()`
+- direct `scanWorldForPortalDestination(world)` callers
+
+That was not a steady-state hotspot, but it still added avoidable allocation and storage-view
+rebuild work during startup-adjacent lifecycle operations, world removal, and shutdown.
+
+**Fix:**
+- kept the existing startup snapshot reuse for `AllWorldsLoadedEvent`
+- added snapshot-aware overloads for:
+  - `onWorldRemoved(world, snapshot)`
+  - `serializeAll(snapshot)`
+- kept public entry points intact while delegating into the snapshot-aware overloads
+- preserved the existing `scanWorldForPortalDestination(world, snapshot)` pattern for callers
+  that already hold a registry snapshot
+
+**Behavioral note:**
+This change only affects how registry state is read during lifecycle operations. It does not
+change preload behavior, zone tier semantics, or portal-destination detection rules.
+
+---
+
+### Watcher diff paths now use watcher-owned storage views instead of broad registry reads
+
+**Files:** `StorageBackend.java`, `JsonStorageBackend.java`,
+`AbstractSqlStorageBackend.java`, `WarpFileWatcher.java`, `HyTeleportersXWatcher.java`
+
+**Root cause:**
+Watcher sync logic had already been improved to batch writes and filter to watcher-owned entries,
+but both watchers still began their diff pass by reading the full registry and then filtering it
+locally. On JSON this meant unnecessary snapshot scanning; on SQL it meant broad cached-view
+filtering even when the watcher only owned a small subset of entries.
+
+**Fix:**
+- added watcher-oriented storage helpers:
+  - `loadEntriesWithIdPrefix(...)`
+  - `loadWarpSyncEntries(...)`
+- updated `WarpFileWatcher` to diff against only warp-owned entries
+- updated `HyTeleportersXWatcher` to diff against only entries with its configured ID prefix
+- implemented the helpers against the already-cached in-memory snapshot for both JSON and SQL
+  backends so watcher sync no longer begins with a broad `loadAll()` call
+
+**Ownership note:**
+The helper semantics preserve the existing ownership boundaries:
+
+- warp sync still excludes HyTeleportersX-owned entries
+- HyTeleportersX sync still owns only prefixed IDs
+
+So the delete/update boundaries for the two watchers remain unchanged.
+
+---
+
+### Reload now compares watcher settings against the pre-reload config correctly
+
+**Files:** `OptiPortal.java`
+
+**Root cause:**
+The first surgical reload pass tried to restart watchers only when relevant settings changed,
+but it was comparing watcher settings *after* `config.reload()` against accessors that also read
+from the same already-reloaded mutable config object. That meant source-path and interval changes
+could be missed because both sides of the comparison had already become “new config.”
+
+**Fix:**
+- captured the old watcher-relevant settings before `config.reload()`
+- compared old vs new explicitly for:
+  - warp source path / interval / watch toggle
+  - HyTeleportersX enabled state / watch toggle / source path / interval
+- kept the existing safe recreate-on-restart behavior for watcher instances after `stop()`
+
+**Behavioral note:**
+This is a correctness fix for reload lifecycle behavior. It does not change watcher semantics
+outside reload; it only ensures they restart when they truly need to.
+
+---
+
+### Startup now defers a small set of non-critical follow-up tasks until after core enable
+
+**Files:** `OptiPortal.java`
+
+**Root cause:**
+`OptiPortal.start()` had accumulated a mix of core runtime bring-up and non-critical follow-up
+tasks. Even after storage/read optimizations, startup still blocked on work that did not need to
+finish before the plugin could be considered live.
+
+After one false start that duplicated some eager startup calls, the final sequencing pass left
+core runtime wiring eager and moved only clearly non-critical follow-up work into a deferred
+executor task.
+
+**Fix:**
+- kept core runtime bring-up eager:
+  - storage
+  - cache manager
+  - world registry
+  - preloader / warm manager
+  - teleport interceptor
+  - event and command registration
+  - shutdown hook and world callbacks
+- deferred only the non-critical follow-up starts:
+  - `warpFileWatcher.start()`
+  - `hyTeleportersXWatcher.start()`
+  - `warmZoneManager.startStagedLoad()`
+  - `keepaliveManager.start()`
+  - `snapshotScheduler.start()`
+- left metrics integration and update checking eager to avoid duplicate one-shot init/check paths
+
+**Shutdown note:**
+Deferred components are still instantiated before the follow-up task is queued, so shutdown
+remains null-safe even if the server begins shutting down before deferred startup finishes.
+
+---
+
+### Focused regression tests now cover the recent lifecycle and optimization work
+
+**Files:** `src/test/java/com/optiportal/...`, `TeleportInterceptor.java`,
+`ChunkPreloader.java`
+
+**Root cause:**
+The earlier optimization passes improved several hot and lifecycle-sensitive paths, but the
+codebase still had little local test coverage around those changes. That made future cleanup or
+follow-up optimizations riskier than they needed to be.
+
+**Fix:**
+- added a focused JUnit suite covering:
+  - spatial portal index behavior
+  - staggered routine proximity scheduling
+  - JSON write-behind ordering and reload-aware delay
+  - adaptive preload budgeting
+- added only small production seams where needed for testability:
+  - package-private/protected access for selected teleport batching helpers
+  - package-private latency injection for adaptive-budget tests
+
+**Verification note:**
+The suite is intentionally narrow and fast so it can serve as a normal local regression guardrail
+instead of a one-off validation artifact.
+
+---
+
+### JSON backend writes are now debounced, ordered, and reload-aware
+
+**Files:** `JsonStorageBackend.java`, `StorageBackend.java`, `PluginConfig.java`,
+`config.json`, `OptiPortal.java`
+
+**Root cause:**
+The JSON backend already exposed a volatile cached snapshot for fast reads, but each
+`save()`, `saveAll()`, and `delete()` still flushed `portal-data.json` immediately. On
+busy servers, watcher syncs and post-load stat updates could trigger many full-file writes
+in quick succession even when operators would never observe those intermediate states.
+
+The first write-behind pass reduced disk churn but left two correctness hazards:
+
+- shutdown/manual flush could overlap a scheduled flush
+- the new debounce delay was captured only at backend construction time, so config reloads
+  could not adjust it without a restart
+
+**Fix:**
+- added `storageWriteBehindDelayMs` config surface
+- `JsonStorageBackend` now queues snapshot flushes through a dedicated daemon scheduler
+- added versioned flush ordering so older queued snapshots cannot overwrite newer ones
+- serialized file writes behind an internal I/O lock
+- added `StorageBackend.onConfigReload(...)` and wired `OptiPortal.reloadConfig()` to call it
+- fresh-install init path now writes the initial empty JSON file through the versioned flush path
+
+**Threading:**
+- in-memory maps and `cachedList` still update immediately on the caller thread
+- delayed file writes run on a dedicated single-thread scheduler local to `JsonStorageBackend`
+- version checks plus the `ioLock` guarantee only one physical file write mutates
+  `portal-data.json(.tmp/.bak)` at a time
+- shutdown still performs a synchronous final flush before storage close
+
+---
+
+### Watcher syncs now batch changed entries instead of saving each one individually
+
+**Files:** `WarpFileWatcher.java`, `HyTeleportersXWatcher.java`
+
+**Root cause:**
+Both watcher syncers already did the expensive part efficiently by loading the current
+registry once into a map, but they still persisted each new or changed entry with its own
+`storage.save(...)` call. On JSON this meant repeated full-file rewrite scheduling; on SQL
+it meant unnecessary individual upserts.
+
+`HyTeleportersXWatcher` also saved existing entries even when no fields had changed, causing
+pure write churn on steady-state polls.
+
+**Fix:**
+- `WarpFileWatcher.syncWarps(...)` now accumulates new/moved entries and persists them with
+  one `storage.saveAll(...)` call
+- `HyTeleportersXWatcher.syncTeleporters(...)` now:
+  - detects whether a mirrored teleporter actually changed
+  - skips unchanged entries entirely
+  - persists changed/new entries via one `storage.saveAll(...)` batch
+- delete behavior is unchanged and still runs through per-id deletion so portal-delete side
+  effects remain explicit
+
+**Threading:**
+Watcher work still runs on OptiPortal's shared executor. The change is about persistence
+granularity only; it does not alter watch cadence or portal-cache invalidation timing.
+
+---
+
+### Post-load zone-stat writes are now coalesced safely across concurrent completions
+
+**Files:** `ChunkPreloader.java`, `WarmZoneManager.java`, `TeleportInterceptor.java`,
+`OptiPortal.java`
+
+**Root cause:**
+Warm/predictive completion handlers and predictive RAM estimation paths all followed the same
+pattern:
+
+- `storage.loadById(zoneId)`
+- mutate the loaded `PortalEntry`
+- `storage.save(entry)`
+
+That was correct but noisy. Bursty portal activity or staged startup could update the same
+zone's RAM/preload counters multiple times in a short window, sending repeated writes for
+what is fundamentally bookkeeping rather than operator-visible control flow.
+
+The first coalescing pass used a shared map plus snapshot-then-clear, but that introduced a
+race where a save arriving during the drain window could be cleared without ever making it
+into the persisted batch.
+
+**Fix:**
+- added `ChunkPreloader.queueEntrySave(...)` for stat-only persistence
+- `ChunkPreloader`, `WarmZoneManager`, and `TeleportInterceptor` now route their post-load
+  stat updates through that queue instead of immediate `storage.save(...)`
+- the queue now uses:
+  - a single flush-ownership guard (`entrySaveFlushRunning`)
+  - atomic map swapping during drain
+  - a loop that keeps draining newly-arrived entries before exiting
+  - end-of-flush rescheduling if new entries arrive after the final empty check
+- `OptiPortal.doShutdown()` now calls `chunkPreloader.flushPendingEntrySaves()` before
+  executor shutdown so the final stat batch is not left waiting on the debounce window
+
+**Threading:**
+- preload behavior is unchanged: chunk loading, tier promotion, and destination preloading
+  still happen on the same futures as before
+- only the persistence of derived stats was delayed/coalesced
+- queue state lives on `ChunkPreloader` and is flushed on the shared plugin executor
+- atomic drain via map swap avoids losing concurrent updates while still batching writes
+
+---
+
+### Adaptive preload budgeting now re-checks conditions before each batch
+
+**Files:** `ChunkPreloader.java`
+
+**Root cause:**
+The first adaptive-budgeting pass improved batch sizing by considering chunk pressure and
+observed batch latency, but it still computed `batchSize` and `batchDelay` once at the
+start of `loadChunks(...)`. A long-running preload would therefore continue using a stale
+budget even if the world slowed down halfway through the chain.
+
+There was also an early global-latency issue: one world's slow batches could influence
+another world's budgeting. That was corrected by moving the latency EMA to a per-world map.
+
+**Fix:**
+- batch latency tracking is now per-world
+- `loadChunks(...)` now recomputes:
+  - `getEffectiveBatchSize(worldName)`
+  - `getEffectiveBatchDelay(worldName)`
+  before each batch rather than once per load
+- this lets long warm/predictive loads back off sooner when chunk pressure rises or batch
+  completions start taking longer
+
+**Threading:**
+The batching model remains sequential: each batch still starts only after the previous batch
+completes. The change only updates how the next batch's budget is chosen.
+
+---
+
+### Live teleport lookups now use a world-scoped spatial portal index
+
+**Files:** `TeleportInterceptor.java`, `PortalSpatialIndex.java`
+
+**Root cause:**
+The live interceptor already avoided cross-world scans by maintaining `portalCacheByWorld`, but
+its hottest portal-selection paths still linearly iterated the full per-world list:
+
+- `checkProximityAndPreload(...)`
+- `reversePreloadOrigin(...)`
+- `findNearestPortal(...)`
+- `lingerOriginZone(...)`
+
+That meant runtime cost still scaled with the total number of portals in the world even when the
+player was standing near only a small local cluster.
+
+The first spatial-index pass had one correctness gap: candidate lookup for
+`checkProximityAndPreload(...)` used only the global activation distance, which could undercut a
+portal whose per-zone horizontal override was larger than the global default. The final pass fixes
+that by expanding the candidate query radius to the maximum of:
+
+- `config.getActivationDistance()`
+- the indexed world's maximum per-zone horizontal activation override
+
+**Fix:**
+- added `PortalSpatialIndex` as an immutable world-scoped chunk-bucket index
+- `TeleportInterceptor.rebuildPortalCachesFrom(...)` now publishes:
+  - flat cache snapshot
+  - per-world entry lists
+  - per-world spatial index snapshots
+- added candidate helpers:
+  - `getSpatialIndexForWorld(...)`
+  - `getNearbyPlainPortalCandidates(...)`
+  - `getNearbyPortalDeviceCandidates(...)`
+- switched the live plain-portal hot paths to spatial candidate lookup before exact distance checks:
+  - `checkProximityAndPreload(...)`
+  - `reversePreloadOrigin(...)`
+  - `findNearestPortal(...)`
+  - `lingerOriginZone(...)`
+- `onWorldRemoved(...)` now also evicts the removed world from the spatial index map
+- `PortalSpatialIndex` now precomputes the world's maximum horizontal activation override so
+  candidate queries do not exclude portals that rely on larger per-zone radii
+
+**Behavioral note:**
+This change is intended to reduce the candidate set only. The exact distance checks, cooldowns,
+strategy branching, linked-preload logic, and reverse-preload destination selection remain in the
+existing methods after candidate collection, so destination preloading semantics stay the same.
+
+**Threading:**
+- the index is rebuilt only during cache refresh/rebuild on the plugin executor path
+- published index maps are immutable and stored behind volatile fields, matching the existing
+  interceptor cache model
+- candidate lookups are read-only and allocation-light relative to the previous full-list scans
+
+---
+
+### Routine live proximity work is now staggered instead of piggybacking on broad poll sweeps
+
+**Files:** `TeleportInterceptor.java`
+
+**Root cause:**
+The live interceptor already had movement gating (`lastProximityCheckPosition`,
+`lastProximityCheckMs`) and teleport polling, but routine proximity checks were still tied to
+the broad `pollTeleportRecords()` sweep. That meant routine portal proximity work tended to run
+in larger synchronized bursts rather than being smoothed across smaller recurring batches.
+
+The first staggered-scheduling pass added a batch scheduler but accidentally left the old broad
+routine proximity path active as well, creating two routine scan sources. The final pass fixes
+that by making the staggered scheduler the sole owner of routine proximity checks while leaving
+teleport/jump detection in the poll path.
+
+**Fix:**
+- added a dedicated staggered proximity task in `TeleportInterceptor`
+- added round-robin batch selection over online `playerRefs`
+- moved routine `checkProximityAndPreload(...)` cadence onto that staggered path
+- removed the old routine proximity trigger from `pollTeleportRecords()`
+- kept `pollTeleportRecords()` responsible for:
+  - TeleportRecord detection
+  - same-world jump detection
+  - `lastKnownPosition` updates for origin/jump tracking
+- restored thread-safety by resolving player transforms inside `world.execute(...)`
+- stabilized batch order with sorted UUID snapshots so cursor rotation is deterministic
+
+**Behavioral note:**
+Teleport-triggered preload behavior is unchanged. The change is about *when routine proximity
+checks run*, not about which portals qualify or which preload paths fire once a check occurs.
+
+**Threading:**
+- routine proximity scheduling now runs on a dedicated recurring task on the plugin executor
+- transform reads for staggered batches are still marshalled onto the world execution path
+- actual preload logic still continues on the plugin executor after the world-thread read
+
+---
+
+### Same-world jump detection now uses indexed portal candidates too
+
+**Files:** `TeleportInterceptor.java`
+
+**Root cause:**
+After the spatial-index pass, most live teleport lookups had been moved off full per-world scans,
+but one leftover path remained: the same-world jump detector inside `pollTeleportRecords()`.
+
+When a player appeared to jump more than 32 blocks between position polls, OptiPortal treated it
+as a likely same-world portal teleport and searched for the nearest destination portal in the
+current world. That nearest-portal search still linearly iterated `getPortalEntriesForWorld(...)`,
+so portal-heavy worlds were still paying O(portals-in-world) cost for each detected same-world
+jump.
+
+**Fix:**
+- replaced the jump-detection nearest-portal scan with `getNearbyPlainPortalCandidates(...)`
+- kept the same nearest-distance selection logic over the reduced candidate set
+- preserved the same hotspot-learning call and "no zone found" logging path
+
+**Behavioral note:**
+The candidate helper still uses the same plain-portal definition as the rest of the live
+teleport path:
+
+- non-instanced entries only
+- no special IDs containing `:`
+
+So hotspot learning remains constrained to normal portal entries even though the scan is now
+spatially narrowed.
+
+---
+
+### Focused regression tests now cover the recent optimization work
+
+**Files:** `src/test/java/com/optiportal/teleport/PortalSpatialIndexTest.java`,
+`src/test/java/com/optiportal/teleport/TeleportInterceptorStaggeredSchedulingTest.java`,
+`src/test/java/com/optiportal/storage/JsonStorageBackendTest.java`,
+`src/test/java/com/optiportal/preload/ChunkPreloaderAdaptiveBudgetingTest.java`,
+`TeleportInterceptor.java`, `ChunkPreloader.java`
+
+**Root cause:**
+The recent performance passes changed several hot or concurrency-sensitive paths:
+
+- JSON write-behind persistence ordering
+- adaptive per-world preload budgeting
+- spatial portal candidate lookup
+- staggered routine proximity scheduling
+
+Those changes were behaving correctly in local compile and server testing, but without focused
+automated coverage they were still exposed to quiet regressions during later refactors.
+
+**Fix:**
+- added a focused JUnit regression suite covering:
+  - chunk-boundary and per-zone-override spatial index behavior
+  - world-scoped portal-device candidate filtering
+  - indexed nearest-portal selection vs linear scan behavior
+  - staggered routine proximity batching and ownership
+  - JSON write-behind coalescing, close-time flush, version ordering, and config reload
+  - adaptive preload budgeting world isolation, rebudgeting, and bounds handling
+- added only minimal production test seams:
+  - package-private access for `TeleportInterceptor` batch helpers/state used by tests
+  - `protected` access for `processPlayerProximity(...)`
+  - package-private latency injection in `ChunkPreloader` for adaptive-budget tests
+
+**Behavioral note:**
+These seams were added only to make the recent optimization logic locally testable. They do not
+change runtime semantics, scheduling ownership, or preload decision paths.
+
+**Verification:**
+The focused suite currently contains 18 tests and runs quickly enough to serve as a normal local
+guardrail during development rather than a one-off validation pass.
+
+---
+
+### Async status services are now live instead of null-backed placeholders
+
+**Files:** `OptiPortal.java`, `PreloadCommand.java`
+
+**Root cause:**
+The public plugin surface exposed:
+
+- `getAsyncLoadBalancer()`
+- `getAsyncErrorHandler()`
+- `getTpsMonitor()`
+
+but the base runtime returned `null` for all three. Command/status code already had defensive
+null handling, so the immediate effect was not crashes; the real problem was that the runtime
+advertised async infrastructure that did not actually exist.
+
+**Fix:**
+- instantiated `AsyncMetrics`, `CircuitBreaker`, `AsyncErrorHandler`, and `AsyncLoadBalancer`
+  during plugin startup
+- wired `WorldTpsMonitor` at startup when `tpsMonitor.enabled` is true
+- kept `PreloadCommand.handleStatus(...)` on the same null-safe reporting path so status output
+  still degrades cleanly if the TPS monitor is disabled by config
+
+**Behavioral note:**
+This does not move chunk preloading onto the dormant async pipeline. It only makes the async
+status/runtime-protection services real so the public API and `/preload status` reflect the
+actual runtime.
+
+---
+
+### PortalChunkListener is now a real service, but world-event activation is config-gated
+
+**Files:** `OptiPortal.java`, `PluginConfig.java`, `PortalChunkListener.java`,
+`PreloadCommand.java`, `OptiPortalUIPage.java`
+
+**Root cause:**
+`getPortalChunkListener()` was part of the plugin API and command/UI cleanup paths, but the base
+runtime returned `null`. Fully wiring the listener immediately would also have enabled
+auto-registration and chunk-preload event behavior that had previously been treated as dormant.
+
+**Fix:**
+- always construct a real `PortalChunkListener` so delete/index cleanup paths can use it safely
+- added `integrations.portalChunkListener.enabled` to config, default `false`
+- only register world-local event hooks when that config flag is enabled
+- kept command/UI delete flows using the concrete listener instance regardless of whether
+  world-event activation is enabled
+
+**Behavioral note:**
+This splits the old all-or-nothing dormant state into two layers:
+
+- service object available for cleanup/index maintenance
+- world-event activation opt-in via config
+
+That removes the misleading null getter without silently changing live server behavior.
+
+---
+
+### Startup now seeds pre-existing worlds after callback wiring
+
+**Files:** `OptiPortal.java`, `WorldRegistry.java`, `PortalChunkListener.java`
+
+**Root cause:**
+`WorldRegistry` already supported `seedFromUniverse()`, but startup was not calling it. Any
+world-scoped listener attached through `addWorldLoadCallback(...)` only saw worlds created after
+plugin enable unless some other path happened to re-register them.
+
+This became more important once `PortalChunkListener` activation was made config-gated via the
+world-load callback path.
+
+**Fix:**
+- attached world callbacks first
+- then called `worldRegistry.seedFromUniverse()`
+
+This preserves the existing once-only callback guard in `WorldRegistry.initializedWorlds` while
+ensuring already-live worlds are visible to newly-attached world-scoped services.
+
+---
+
+### Reload messaging now matches startup-wired service semantics
+
+**Files:** `OptiPortal.java`, `PluginConfig.java`, `changelog.md`,
+`OPTIPORTAL_LLM_WIKI.md`, `docs/INDEX.md`
+
+**Root cause:**
+Once `tpsMonitor.enabled` and `integrations.portalChunkListener.enabled` became meaningful
+startup-wired settings, the existing `/preload reload` summary text became misleading. It still
+grouped “integrations” into the live-reloadable bucket even though these two settings require
+startup-time wiring.
+
+The reviewer-facing docs had also drifted: they still described null-backed getters and older
+critique findings that no longer matched the current workspace.
+
+**Fix:**
+- updated `/preload reload` summary text to explicitly call out restart-required wiring for:
+  - `tpsMonitor`
+  - `portalChunkListener` world hooks
+- refreshed the compact LLM/wiki/index docs to describe the current runtime state instead of the
+  earlier null-getter issue
+- removed the stale `docs/LLM_FIXES.md` brief after its content had stopped matching the live repo
+
+**Documentation note:**
+This was mostly a truth-maintenance pass: no runtime preload behavior changed here beyond the
+already-implemented config gating and startup wiring.
+
+---
+
+## [1.2.2] - 2026-04-06
+
+---
+
+### Optional HyTeleportersX teleporter sync added as a file-backed integration
+
+**Files:** `HyTeleportersXWatcher.java`, `OptiPortal.java`, `PluginConfig.java`,
+`PreloadCommand.java`, `manifest.json`, `config.json`
+
+**Root cause:**
+OptiPortal already had a clean integration pattern for external warp-like data through
+`WarpFileWatcher`, but there was no equivalent path for HyTeleportersX teleporter blocks.
+That meant HyTeleportersX destinations existed as real teleport surfaces on the server yet
+were invisible to OptiPortal's preload registry unless an operator duplicated them manually.
+
+Decompiled inspection of `hyteleportersx-1.1.1.jar` showed two important constraints:
+
+- the runtime API surface is centered around `TeleporterService`, but most useful state is
+  persisted to `HyTeleportersX/Teleporters.json`
+- `StoragePaths.getTeleportersFile()` resolves to a jar-adjacent `HyTeleportersX` data
+  directory, making file sync the least-coupled integration path
+
+Using the persisted file avoids taking a hard compile-time dependency on HyTeleportersX
+internals while still tracking live teleporter additions, moves, and removals.
+
+**Fix:**
+- added `HyTeleportersXWatcher` as a sibling to `WarpFileWatcher`
+- watcher reads `Teleporters.json`, parses `World` plus `Pos.{X,Y,Z}`, and mirrors each
+  teleporter into OptiPortal storage as a `PORTAL` entry
+- imported ids are prefixed with `hyteleportersx:` by default so they cannot collide with
+  normal warp ids
+- startup, shutdown, and config reload now create/start/stop/reschedule the watcher through
+  `OptiPortal`
+- added config surface:
+  - `integrations.hyTeleportersX.enabled`
+  - `integrations.hyTeleportersX.pluginId`
+  - `integrations.hyTeleportersX.sourcePath`
+  - `integrations.hyTeleportersX.watchForChanges`
+  - `integrations.hyTeleportersX.watchIntervalSeconds`
+  - `integrations.hyTeleportersX.idPrefix`
+- added manifest optional dependency for `xyz.thelegacyvoyage:HyTeleportersX`
+
+**Threading:**
+The watcher follows the same model as `WarpFileWatcher`:
+
+- initial sync and polling run on OptiPortal's shared scheduled executor
+- `stop()` flips an `AtomicBoolean` guard and cancels the polling task
+- post-sync cache invalidation is delegated through the existing
+  `teleportInterceptor.refreshPortalCache()` and portal-delete callback path
+
+This keeps file I/O off the world thread and preserves the plugin's current shutdown model.
+
+---
+
+### Refresh command surface renamed to `/preload refresh teleporters`
+
+**Files:** `PreloadCommand.java`, `README.md`, `changelog.md`
+
+**Root cause:**
+The first operator-facing command used the full integration name
+`/preload refresh hyteleportersx`. While accurate, it was unnecessarily long for routine
+administrative use and inconsistent with the simpler `/preload refresh warps` shape.
+
+**Fix:**
+- command help text now advertises `/preload refresh teleporters`
+- command parser accepts `teleporters` as the refresh target for the HyTeleportersX watcher
+- README and changelog references were updated to the shorter command form
+
+**Threading:** None. This is command-surface and documentation work only.
+
+---
+
+### `lingerOriginZone(...)` was silently non-functional because it tried to recover world identity from a 3-slot position array
+
+**Files:** `TeleportInterceptor.java`, `AsyncTeleportInterceptor.java`
+
+**Root cause:**
+`lastKnownPosition` is written as a plain `[x, y, z]` array on the live path when capturing
+the player's pre-teleport location. However, `lingerOriginZone(...)` delegated world recovery
+to `getWorldNameFromPosition(...)`, and that helper expected a four-element encoded payload:
+
+- `[x, z, worldMsb, worldLsb]`
+
+That encoding was never actually written into `lastKnownPosition` on the live path. As a
+result, `getWorldNameFromPosition(...)` returned `null` for every normal call, and
+`lingerOriginZone(...)` exited before it could promote the previous portal zone back to HOT.
+
+This was an older latent bug in the linger path rather than a regression introduced by the
+recent storage/performance work.
+
+**Fix:**
+- changed `lingerOriginZone(...)` to accept the already-known `worldName` directly
+- updated live call sites to pass the source world from the surrounding event/teleport context
+- removed the dead `getWorldNameFromPosition(...)` recovery helper entirely
+- updated the dormant `AsyncTeleportInterceptor` call site as well so the signature stays
+  consistent if that path is ever reactivated
+
+**Threading:**
+No change to scheduling. The linger promotion still runs on the plugin executor rather than
+the world thread; the fix only corrects how the world context is supplied to the lookup.
+
+---
+
+### HyTeleportersX sync now skips malformed `Pos` objects instead of crashing the watcher
+
+**Files:** `HyTeleportersXWatcher.java`
+
+**Root cause:**
+The first HyTeleportersX integration pass validated that each teleporter entry had a `World`
+string and a `Pos` object, but it then read `Pos.X`, `Pos.Y`, and `Pos.Z` directly without
+checking whether those keys actually existed. Gson's `JsonObject.get(...)` returns `null` for
+missing keys, so a malformed `Teleporters.json` entry with an incomplete `Pos` object could
+throw a `NullPointerException` and abort the sync pass.
+
+This was not a regression from an earlier shipped HyTeleportersX implementation; it was a
+hardening gap in the initial `1.2.2` integration itself.
+
+**Fix:**
+- `parseTeleportersFile(...)` now checks `pos.has("X")`, `pos.has("Y")`, and `pos.has("Z")`
+  before reading coordinates
+- malformed teleporter entries are skipped instead of failing the entire parse/sync pass
+
+**Threading:**
+No threading model changes. The watcher still parses on OptiPortal's shared executor; the
+fix only narrows bad-input handling so one malformed teleporter does not poison the whole run.
+
+---
+
+### `reloadConfig()` now treats the warp watcher restart path the same way as HyTeleportersX restart
+
+**Files:** `OptiPortal.java`
+
+**Root cause:**
+The reload path already null-checked `hyTeleportersXWatcher` before calling `stop()`, but
+called `warpFileWatcher.stop()` unconditionally. In the normal live startup path the watcher
+is expected to be present, so this was low risk, but the asymmetry made the reload code less
+defensive than the watcher block immediately below it.
+
+**Fix:**
+- added a null guard around `warpFileWatcher.stop()` during config reload
+
+**Threading:** None. This is reload-path null-safety only.
+
+---
+
 ## [1.2.1] - 2026-04-04
 
 ---

@@ -12,6 +12,7 @@ OptiPortal manages zones through `HOT`, `WARM`, and `COLD` cache tiers, persists
 - Supports `JSON`, `SQLITE`, `H2`, and `MYSQL` storage backends
 - Watches `warps.json` for live updates
 - Optionally integrates with the Gravestones plugin
+- Optionally mirrors HyTeleportersX teleporters from `Teleporters.json`
 - Exposes a native in-game UI when you run `/preload` with no arguments
 - Includes operator commands for zone cleanup, link management, TTL overrides, and runtime status checks
 
@@ -85,6 +86,7 @@ Running `/preload` with no arguments opens the native UI panel for players in-wo
 | Command | Description |
 |---|---|
 | `/preload refresh warps` | Re-read `warps.json` immediately |
+| `/preload refresh teleporters` | Re-read `HyTeleportersX/Teleporters.json` immediately |
 | `/preload reload` | Hot-reload `config.json` where supported |
 | `/preload migrate <JSON\|SQLITE\|H2\|MYSQL>` | Print backend migration guidance |
 | `/preload backup list` | List WAL backups |
@@ -101,6 +103,10 @@ The field names are configurable through the `warps.*` settings if your warp dat
 ### Gravestones
 
 When enabled, OptiPortal can watch gravestone data and preload around death or recovery locations. This integration is optional and depends on the Gravestones plugin being installed.
+
+### HyTeleportersX
+
+When enabled, OptiPortal watches `HyTeleportersX/Teleporters.json` and mirrors each teleporter block into OptiPortal storage as a predictive zone. Imported ids are prefixed with `hyteleportersx:` by default so they stay separate from normal warp entries.
 
 ## Storage Backends
 
@@ -128,8 +134,14 @@ A full server restart is still required for settings that wire core infrastructu
 - `cache.maxCacheAgeDays`
 - `immuneToSimulationReduction`
 - `updateChecker.enabled`
+- `tpsMonitor.enabled`
+- `tpsMonitor.lowThreshold`
+- `tpsMonitor.criticalThreshold`
+- `integrations.portalChunkListener.enabled`
 - `integrations.gravestone.pluginId`
 - `metrics.bstatsPluginId`
+
+If `/preload reload` sees `tpsMonitor.*` or `integrations.portalChunkListener.enabled` change, it reports that the reload succeeded but those specific changes need a restart before they affect runtime wiring.
 
 If `config.json` contains invalid JSON, the reload is rejected and the current runtime config remains in place.
 
@@ -148,8 +160,11 @@ The settings operators usually care about first are:
 - `keepalive.*`
 - `decay.*`
 - `ttl.*`
+- `tpsMonitor.*`
 - `warps.*`
 - `integrations.gravestone.*`
+- `integrations.hyTeleportersX.*`
+- `integrations.portalChunkListener.enabled`
 - `portalLinks.confidenceThreshold`
 
 ## Runtime Notes

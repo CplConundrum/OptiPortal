@@ -93,11 +93,13 @@ public class WarmZoneManager {
             // Seed WorldRegistry from Universe — this is the authoritative world map
             Universe universe = Universe.get();
             if (universe != null && chunkPreloader != null) {
+                // Load one snapshot for all per-world scans rather than one loadAll() per world
+                java.util.List<PortalEntry> startupSnapshot = storage.loadAll();
                 universe.getWorlds().values().forEach(world -> {
                     chunkPreloader.getWorldRegistry().addWorld(world);
                     LOG.info(() -> "[OptiPortal] Seeded world from Universe: " + world.getName());
                     // Auto-detect portal destination worlds from PortalWorld resource
-                    scanWorldForPortalDestination(world);
+                    scanWorldForPortalDestination(world, startupSnapshot);
                 });
             } else {
                 LOG.warning(() -> "[OptiPortal] AllWorldsLoadedEvent: Universe.get()="
@@ -381,7 +383,7 @@ public class WarmZoneManager {
                         loaded.setRamEstimatedMB(estimatedMB);
                         loaded.setLastActive(java.time.Instant.now());
                         chunkPreloader.updateEntryStats(loaded, chunkCount);
-                        storage.save(loaded);
+                        chunkPreloader.queueEntrySave(loaded);
                     });
                     LOG.fine(() -> "[OptiPortal] WARM zone loaded: " + entry.getId()
                             + " est=" + String.format("%.1f", estimatedMB) + "MB");
@@ -418,9 +420,17 @@ public class WarmZoneManager {
      * Does nothing if PortalsPlugin is not installed.
      */
     public void scanWorldForPortalDestination(World world) {
+        scanWorldForPortalDestination(world, storage.loadAll());
+    }
+
+    /**
+     * Snapshot-aware variant. Callers that already hold a registry snapshot (e.g. the
+     * AllWorldsLoadedEvent loop) should pass it here to avoid a redundant loadAll() per world.
+     */
+    public void scanWorldForPortalDestination(World world, java.util.List<PortalEntry> snapshot) {
         if (PortalsPlugin.getInstance() == null) return;
 
-        java.util.List<PortalEntry> worldEntries = storage.loadAll().stream()
+        java.util.List<PortalEntry> worldEntries = snapshot.stream()
                 .filter(e -> e.getWorld().equals(world.getName()))
                 .filter(e -> !e.isInstanced())
                 .filter(e -> e.getType() == PortalEntry.EntryType.PORTAL)
@@ -491,10 +501,18 @@ public class WarmZoneManager {
      * storage so they re-warm automatically when the world is re-created.
      */
     public void onWorldRemoved(com.hypixel.hytale.server.core.universe.world.World world) {
+        onWorldRemoved(world, storage.loadAll());
+    }
+
+    /**
+     * Snapshot-aware variant. Load the registry once per world removal event and reuse the snapshot.
+     * The public method delegates to this snapshot-aware overload.
+     */
+    private void onWorldRemoved(com.hypixel.hytale.server.core.universe.world.World world, java.util.List<PortalEntry> snapshot) {
         String worldName = world.getName();
         LOG.info("[OptiPortal] World removed: " + worldName + " — evicting warm zones.");
 
-        java.util.List<String> toEvict = storage.loadAll().stream()
+        java.util.List<String> toEvict = snapshot.stream()
                 .filter(e -> e.getWorld().equals(worldName))
                 .map(PortalEntry::getId)
                 .collect(java.util.stream.Collectors.toList());
@@ -515,8 +533,16 @@ public class WarmZoneManager {
      * Serialize all HOT/WARM zones to COLD on shutdown.
      */
     public void serializeAll() {
+        serializeAll(storage.loadAll());
+    }
+
+    /**
+     * Snapshot-aware variant. Load the registry once per shutdown and reuse the snapshot.
+     * The public method delegates to this snapshot-aware overload.
+     */
+    private void serializeAll(java.util.List<PortalEntry> snapshot) {
         managedZones.forEach((id, zone) -> cacheManager.setZoneTier(id, CacheTier.COLD));
-        storage.loadAll().stream()
+        snapshot.stream()
                 .filter(e -> e.getStrategy() == WarmStrategy.WARM)
                 .forEach(e -> cacheManager.setZoneTier(e.getId(), CacheTier.COLD));
     }

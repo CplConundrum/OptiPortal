@@ -2,6 +2,7 @@ package com.optiportal.async;
 
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
@@ -63,6 +64,10 @@ public class AsyncErrorHandler {
         metrics.recordChunkLoadError(cx, cz, 0);
 
         String chunkKey = cx + ":" + cz;
+        if (isEngineChunkBackoff(e)) {
+            LOG.fine("[OptiPortal] Chunk load retry skipped (engine backoff): " + chunkKey);
+            return;
+        }
 
         retryPolicy.executeWithRetry(() -> {
             LOG.fine("[OptiPortal] Retrying chunk load for " + chunkKey);
@@ -183,13 +188,32 @@ public class AsyncErrorHandler {
 
         LOG.info("[OptiPortal] Retrying chunk load: " + cx + "," + cz);
         return world.getChunkAsync(chunkIndex)
-                .thenApply(chunk -> {
+                .handle((chunk, ex) -> {
+                    if (ex != null) {
+                        if (isEngineChunkBackoff(ex)) {
+                            LOG.fine("[OptiPortal] Retry stopped (engine backoff): " + cx + "," + cz);
+                            return null;
+                        }
+                        throw new CompletionException(ex);
+                    }
                     if (chunk != null) {
                         circuitBreaker.recordSuccess();
                         LOG.fine("[OptiPortal] Retry succeeded: " + cx + "," + cz);
                     }
                     return chunk;
                 });
+    }
+
+    static boolean isEngineChunkBackoff(Throwable throwable) {
+        Throwable current = throwable;
+        while (current != null) {
+            String message = current.getMessage();
+            if (message != null && message.startsWith("Chunk failure backoff")) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
     }
     
     /** Expose the circuit breaker for status reporting. */

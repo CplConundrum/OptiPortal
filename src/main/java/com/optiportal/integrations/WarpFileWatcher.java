@@ -98,6 +98,18 @@ public class WarpFileWatcher {
         }
     }
 
+    public boolean isWatchingForChanges() {
+        return config.isWarpsWatchForChanges() && task != null;
+    }
+
+    public String getSourcePath() {
+        return config.getWarpsSourcePath();
+    }
+
+    public int getWatchInterval() {
+        return config.isWarpsWatchForChanges() ? config.getWarpsWatchIntervalSeconds() : 0;
+    }
+
     /** Force immediate re-read (called by /preload refresh warps). Returns count of warps synced. */
     public int forceRefresh() {
         // Try native path first
@@ -227,10 +239,14 @@ public class WarpFileWatcher {
     }
 
     private void syncWarps(List<PortalEntry> incomingWarps) {
-        // Single bulk load replaces N per-warp loadById() calls
-        Map<String, PortalEntry> existing = storage.loadAll()
-                .stream().collect(Collectors.toMap(PortalEntry::getId, e -> e));
-    
+        // Load registry snapshot filtered to warp-owned entries only.
+        // Warp entries have type PORTAL (the default). HyTeleportersX entries also
+        // default to PORTAL, so we exclude them by ID prefix to avoid cross-watcher deletion.
+        // Use watcher-owned helper to avoid full registry read + local filtering.
+        String htxPrefix = config.getHyTeleportersXIdPrefix();
+        Map<String, PortalEntry> existing = storage.loadWarpSyncEntries(htxPrefix).stream()
+                .collect(Collectors.toMap(PortalEntry::getId, e -> e));
+        List<PortalEntry> changedEntries = new ArrayList<>();
         Set<String> incomingIds = new HashSet<>();
     
         for (PortalEntry incoming : incomingWarps) {
@@ -240,7 +256,7 @@ public class WarpFileWatcher {
             if (ex == null) {
                 // New warp - register with default strategy
                 incoming.setStrategy(WarmStrategy.PREDICTIVE);
-                storage.save(incoming);
+                changedEntries.add(incoming);
                 LOG.info("[OptiPortal] New warp registered: " + incoming.getId()
                         + " [" + incoming.getX() + ", " + incoming.getY() + ", " + incoming.getZ() + "] → PREDICTIVE");
             } else {
@@ -251,10 +267,14 @@ public class WarpFileWatcher {
                     ex.setY(incoming.getY());
                     ex.setZ(incoming.getZ());
                     ex.setYaw(incoming.getYaw());
-                    storage.save(ex);
+                    changedEntries.add(ex);
                     LOG.info("[OptiPortal] Warp moved, cache purged: " + incoming.getId());
                 }
             }
+        }
+
+        if (!changedEntries.isEmpty()) {
+            storage.saveAll(changedEntries);
         }
     
         // Remove warps that are in storage but no longer exist in file.
@@ -263,7 +283,7 @@ public class WarpFileWatcher {
         for (String existingId : existing.keySet()) {
             if (!incomingIds.contains(existingId)) {
                 PortalEntry ex = existing.get(existingId);
-                if (ex != null && ex.getType() == PortalEntry.EntryType.PORTAL) {
+                if (ex != null) {
                     onPortalDeleted.accept(existingId);
                     storage.delete(existingId);
                     LOG.info("[OptiPortal] Warp removed: " + existingId);

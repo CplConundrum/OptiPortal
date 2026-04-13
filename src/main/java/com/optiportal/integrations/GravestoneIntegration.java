@@ -3,15 +3,13 @@ package com.optiportal.integrations;
 import com.hypixel.hytale.event.EventRegistry;
 import com.optiportal.config.PluginConfig;
 import com.optiportal.player.DeathLocationTracker;
-import zurku.gravestones.event.GravestoneBrokenEvent;
-import zurku.gravestones.event.GravestoneCollectedEvent;
-import zurku.gravestones.event.GravestoneCreatedEvent;
 
 import java.util.Collections;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
+import java.util.function.Consumer;
 
 /**
  * Integration with Zurku's Gravestones plugin (1.1.0+).
@@ -65,31 +63,60 @@ public class GravestoneIntegration {
             return;
         }
 
+        Class<?> createdEventClass = loadEventClass("zurku.gravestones.event.GravestoneCreatedEvent");
+        Class<?> collectedEventClass = loadEventClass("zurku.gravestones.event.GravestoneCollectedEvent");
+        Class<?> brokenEventClass = loadEventClass("zurku.gravestones.event.GravestoneBrokenEvent");
+        if (createdEventClass == null || collectedEventClass == null || brokenEventClass == null) {
+            LOG.warning("[OptiPortal] Gravestone integration enabled, but Gravestones event classes were not found. Integration will stay inactive.");
+            return;
+        }
+
         // Gravestone created → pre-load chunks around death location, flag for respawn capture
-        events.register(GravestoneCreatedEvent.class, event -> {
-            UUID owner = event.getOwnerUuid();
-            int x = event.getX();
-            int y = event.getY();
-            int z = event.getZ();
-            String world = event.getWorldName();
+        registerReflective(events, createdEventClass, event -> {
+            UUID owner = (UUID) invoke(event, "getOwnerUuid");
+            int x = ((Number) invoke(event, "getX")).intValue();
+            int y = ((Number) invoke(event, "getY")).intValue();
+            int z = ((Number) invoke(event, "getZ")).intValue();
+            String world = (String) invoke(event, "getWorldName");
             deathTracker.onPlayerDeath(owner, x, y, z, world);
             pendingRespawnCapture.add(owner);
         });
 
         // Gravestone collected (all items picked up) → release cache
-        events.register(GravestoneCollectedEvent.class, event -> {
+        registerReflective(events, collectedEventClass, event -> {
             if (config.isGravestoneReleaseOnEmpty()) {
-                deathTracker.onGravestoneReleased(event.getOwnerUuid());
+                deathTracker.onGravestoneReleased((UUID) invoke(event, "getOwnerUuid"));
             }
         });
 
         // Gravestone broken (block broken by anyone) → release cache
-        events.register(GravestoneBrokenEvent.class, event -> {
+        registerReflective(events, brokenEventClass, event -> {
             if (config.isGravestoneReleaseOnBreak()) {
-                deathTracker.onGravestoneReleased(event.getOwnerUuid());
+                deathTracker.onGravestoneReleased((UUID) invoke(event, "getOwnerUuid"));
             }
         });
 
         LOG.info("[OptiPortal] Gravestone integration active — listening for Created/Collected/Broken events.");
+    }
+
+    private Class<?> loadEventClass(String className) {
+        try {
+            return Class.forName(className, false, getClass().getClassLoader());
+        } catch (ClassNotFoundException e) {
+            return null;
+        }
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private void registerReflective(EventRegistry events, Class<?> eventClass, Consumer<Object> handler) {
+        events.register((Class) eventClass, event -> handler.accept(event));
+    }
+
+    private Object invoke(Object target, String methodName) {
+        try {
+            return target.getClass().getMethod(methodName).invoke(target);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Failed to read Gravestones event method " + methodName, e);
+        }
     }
 }

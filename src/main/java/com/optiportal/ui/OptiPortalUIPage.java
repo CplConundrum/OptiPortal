@@ -94,7 +94,8 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.P
                 plugin.getCacheManager().removeTierEntry(id);
                 var pcl = plugin.getPortalChunkListener();
                 if (pcl != null) pcl.removeFromIndex(id);
-                plugin.getPortalLinkRegistry().removeLink(id);
+                var portalLinkRegistry = plugin.getPortalLinkRegistry();
+                if (portalLinkRegistry != null) portalLinkRegistry.removeLink(id);
                 plugin.getTeleportInterceptor().onPortalDeleted(id);
                 plugin.getStorage().delete(id);
                 plugin.getTeleportInterceptor().refreshPortalCache();
@@ -134,7 +135,7 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.P
             PortalEntry z    = zones.get(i);
             CacheTier   tier = cache.getZoneTier(z.getId());
             boolean     sel  = z.getId().equals(selectedZoneId);
-            String      text = tierLabel(tier) + "  " + (sel ? "> " + z.getId() : z.getId());
+            String      text = tierLabel(tier, z, cache) + "  " + (sel ? "> " + z.getId() : z.getId());
 
             // BasicTextButton is a root button — text via .TextSpans, binding directly on the index element
             cmd.append("#PluginList", "Pages/BasicTextButton.ui");
@@ -220,7 +221,8 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.P
             detail.append("TTL (days): ").append(entry.getCacheTTLDays()).append("\n");
         if (entry.getActivationShape() != null)
             detail.append("Shape: ").append(entry.getActivationShape()).append("\n");
-        if (detail.length() == 0) detail.append("No overrides set.");
+        if (detail.length() == 0) detail.append("No overrides set.\n");
+        detail.append("Residency: ").append(residencyLabel(entry, tier, cache)).append("\n");
         cmd.set("#PluginDescription.Text", detail.toString().trim());
 
         // Bottom bar: stats label (FlexWeight: 1 pushes it left) + Flush + Delete buttons
@@ -246,10 +248,15 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.P
         PluginConfig cfg   = plugin.getPluginConfig();
         List<PortalEntry> all = plugin.getStorage().loadAllCached();
         int hot = 0, warm = 0, cold = 0, unvisited = 0;
+        int verifiedHot = 0;
         double totalRam = 0;
         for (PortalEntry z : all) {
-            switch (cache.getZoneTier(z.getId())) {
-                case HOT        -> hot++;
+            CacheTier tier = cache.getZoneTier(z.getId());
+            switch (tier) {
+                case HOT        -> {
+                    hot++;
+                    if (cache.getOwnedChunkCount(z.getId()) >= expectedChunkCount(z)) verifiedHot++;
+                }
                 case WARM       -> warm++;
                 case COLD       -> cold++;
                 case UNVISITED  -> unvisited++;
@@ -257,8 +264,8 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.P
             }
             totalRam += z.getRamMarginalMB();
         }
-        return String.format("HOT %d  WARM %d  COLD %d  Unvisited %d  |  RAM %.1f MB  Shared %d chunks  |  Storage: %s",
-                hot, warm, cold, unvisited, totalRam,
+        return String.format("HOT %d (%d verified)  WARM %d  COLD %d  Unvisited %d  |  RAM %.1f MB  Shared %d chunks  |  Storage: %s",
+                hot, verifiedHot, warm, cold, unvisited, totalRam,
                 cache.getTotalSharedChunks(), cfg.getBackend().toUpperCase());
     }
 
@@ -271,6 +278,52 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.P
             case UNVISITED  -> "[--]";
             default         -> "[-]";
         };
+    }
+
+    private String tierLabel(CacheTier tier, PortalEntry entry, CacheManager cache) {
+        if (tier != CacheTier.HOT) return tierLabel(tier);
+        int owned = cache.getOwnedChunkCount(entry.getId());
+        int expected = expectedChunkCount(entry);
+        if (owned >= expected) return "[HOT:OK]";
+        if (owned > 0) return "[HOT:PART]";
+        return "[HOT:?]";
+    }
+
+    private String residencyLabel(PortalEntry entry, CacheTier tier, CacheManager cache) {
+        if (tier != CacheTier.HOT) {
+            return "not asserted while tier is " + tier;
+        }
+        int owned = cache.getOwnedChunkCount(entry.getId());
+        int expected = expectedChunkCount(entry);
+        if (owned >= expected) {
+            return "verified ownership pins (" + owned + "/" + expected + ")";
+        }
+        if (owned > 0) {
+            return "partial ownership pins (" + owned + "/" + expected + ")";
+        }
+        return "assumed only; no ownership pins recorded";
+    }
+
+    private int expectedChunkCount(PortalEntry entry) {
+        int radiusX = resolveRadiusX(entry);
+        int radiusZ = resolveRadiusZ(entry);
+        return (2 * radiusX + 1) * (2 * radiusZ + 1);
+    }
+
+    private int resolveRadiusX(PortalEntry entry) {
+        if (entry.getWarmRadiusX() != null) return entry.getWarmRadiusX();
+        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
+        return entry.getStrategy() == WarmStrategy.WARM
+                ? plugin.getPluginConfig().getDefaultWarmRadius()
+                : plugin.getPluginConfig().getPredictiveRadius();
+    }
+
+    private int resolveRadiusZ(PortalEntry entry) {
+        if (entry.getWarmRadiusZ() != null) return entry.getWarmRadiusZ();
+        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
+        return entry.getStrategy() == WarmStrategy.WARM
+                ? plugin.getPluginConfig().getDefaultWarmRadius()
+                : plugin.getPluginConfig().getPredictiveRadius();
     }
 
     // -------------------------------------------------------------------------

@@ -1,5 +1,6 @@
 package com.optiportal.teleport;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -10,6 +11,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 
 import com.hypixel.hytale.builtin.adventure.teleporter.interaction.server.UsedTeleporter;
@@ -73,6 +75,8 @@ public class TeleportInterceptor {
     private final GravestoneIntegration gravestoneIntegration;
     private volatile List<PortalEntry> portalCache = Collections.emptyList();
     private volatile Map<String, List<PortalEntry>> portalCacheByWorld = Collections.emptyMap();
+    /** Spatial index by world: worldName → chunk-bucketed portal entries. */
+    private volatile Map<String, PortalSpatialIndex> portalSpatialIndexByWorld = Collections.emptyMap();
 
     /**
      * Fallback pending respawn set used when GravestoneIntegration is null
@@ -90,7 +94,7 @@ public class TeleportInterceptor {
             = new ConcurrentHashMap<>();
 
     // Online player ref cache: populated on PlayerReadyEvent, used by command UI lookup
-    private final ConcurrentHashMap<UUID, PlayerRef> playerRefs = new ConcurrentHashMap<>();
+    final ConcurrentHashMap<UUID, PlayerRef> playerRefs = new ConcurrentHashMap<>();
     private final ScheduledExecutorService executor;
     // Track last-seen TeleportRecord timestamp per player to avoid re-triggering
     private final ConcurrentHashMap<UUID, Long> lastSeenTeleportNanos = new ConcurrentHashMap<>();
@@ -121,6 +125,14 @@ public class TeleportInterceptor {
     private ScheduledFuture<?> pollTask;
     private ScheduledFuture<?> cleanupTask;
     private ScheduledFuture<?> cooldownCleanupTask;
+    /** Round-robin cursor for fair player batch selection */
+    private final AtomicInteger proximityBatchCursor = new AtomicInteger(0);
+    /** Task for staggered routine proximity scanning */
+    private volatile ScheduledFuture<?> staggeredProximityTask;
+
+    // Staggered proximity update configuration
+    private static final int POSITION_UPDATE_BATCH_SIZE = 10;
+    private static final int POSITION_UPDATE_INTERVAL_MS = 200;
 
     private static final int  HOTSPOT_CONFIDENCE_THRESHOLD  = 3;
     private static final long PENDING_HOTSPOT_TTL_MS        = 7L  * 24 * 60 * 60 * 1000;
@@ -158,6 +170,12 @@ public class TeleportInterceptor {
         cooldownCleanupTask = executor.scheduleWithFixedDelay(
                 this::pruneStaleCooldowns,
                 COOLDOWN_CLEANUP_INTERVAL_H, COOLDOWN_CLEANUP_INTERVAL_H, TimeUnit.HOURS);
+        // Start staggered routine proximity scanning to reduce burstiness in proximity work
+        staggeredProximityTask = executor.scheduleAtFixedRate(
+                this::runStaggeredProximityBatch,
+                POSITION_UPDATE_INTERVAL_MS,
+                POSITION_UPDATE_INTERVAL_MS,
+                TimeUnit.MILLISECONDS);
     }
 
     // Protected getters for subclass access
@@ -195,11 +213,13 @@ public class TeleportInterceptor {
     private void rebuildPortalCachesFrom(List<PortalEntry> entries) {
         List<PortalEntry> allSnapshot = Collections.unmodifiableList(new java.util.ArrayList<>(entries));
 
+        // Group entries by world
         Map<String, List<PortalEntry>> grouped = new HashMap<>();
         for (PortalEntry entry : allSnapshot) {
             grouped.computeIfAbsent(entry.getWorld(), k -> new java.util.ArrayList<>()).add(entry);
         }
 
+        // Build immutable portalCacheByWorld
         Map<String, List<PortalEntry>> byWorldSnapshot = new HashMap<>();
         for (Map.Entry<String, List<PortalEntry>> e : grouped.entrySet()) {
             byWorldSnapshot.put(
@@ -208,8 +228,16 @@ public class TeleportInterceptor {
             );
         }
 
+        // Build immutable portalSpatialIndexByWorld
+        Map<String, PortalSpatialIndex> spatialIndexSnapshot = new java.util.HashMap<>(grouped.size());
+        for (Map.Entry<String, List<PortalEntry>> e : grouped.entrySet()) {
+            spatialIndexSnapshot.put(e.getKey(), new PortalSpatialIndex(e.getValue()));
+        }
+
+        // Publish all three caches via volatile writes
         this.portalCache = allSnapshot;
         this.portalCacheByWorld = Collections.unmodifiableMap(byWorldSnapshot);
+        this.portalSpatialIndexByWorld = Collections.unmodifiableMap(spatialIndexSnapshot);
     }
 
     /**
@@ -222,6 +250,93 @@ public class TeleportInterceptor {
     protected List<PortalEntry> getPortalEntriesForWorld(String worldName) {
         if (worldName == null) return Collections.emptyList();
         return portalCacheByWorld.getOrDefault(worldName, Collections.emptyList());
+    }
+
+    /** Returns the spatial index for a world, or null if world has no portals. */
+    protected PortalSpatialIndex getSpatialIndexForWorld(String worldName) {
+        if (worldName == null) return null;
+        return portalSpatialIndexByWorld.get(worldName);
+    }
+
+    /**
+     * Gets nearby plain portal candidates using chunk-bucketed spatial index.
+     * Queries chunk neighborhoods around (x, z) and returns a deduplicated candidate set.
+     *
+     * @param worldName World name to search in
+     * @param x X coordinate (world space)
+     * @param z Z coordinate (world space)
+     * @param radiusBlocks Search radius in blocks
+     * @return Deduplicated list of plain portal candidates
+     */
+    protected List<PortalEntry> getNearbyPlainPortalCandidates(String worldName, double x, double z, double radiusBlocks) {
+        if (worldName == null || radiusBlocks < 0) return Collections.emptyList();
+
+        PortalSpatialIndex index = getSpatialIndexForWorld(worldName);
+        if (index == null) return Collections.emptyList();
+
+        // Convert to chunk coordinates
+        int cx = ChunkPreloader.toChunkCoord(x);
+        int cz = ChunkPreloader.toChunkCoord(z);
+
+        // Calculate chunk search radius (1 chunk per 32 blocks)
+        int radiusChunks = Math.max(1, (int) Math.ceil(radiusBlocks / 32.0));
+
+        // Collect candidates from chunk neighborhood
+        java.util.Set<String> seenIds = new java.util.HashSet<>();
+        java.util.ArrayList<PortalEntry> candidates = new java.util.ArrayList<>();
+
+        for (int dx = -radiusChunks; dx <= radiusChunks; dx++) {
+            for (int dz = -radiusChunks; dz <= radiusChunks; dz++) {
+                long chunkKey = ChunkPreloader.packChunk(cx + dx, cz + dz);
+                for (PortalEntry entry : index.getPlainPortalsInChunk(chunkKey)) {
+                    if (seenIds.add(entry.getId())) {
+                        candidates.add(entry);
+                    }
+                }
+            }
+        }
+
+        return candidates;
+    }
+
+    /**
+     * Gets nearby portal device candidates using chunk-bucketed spatial index.
+     *
+     * @param worldName World name to search in
+     * @param x X coordinate (world space)
+     * @param z Z coordinate (world space)
+     * @param radiusBlocks Search radius in blocks
+     * @return Deduplicated list of portal device candidates
+     */
+    protected List<PortalEntry> getNearbyPortalDeviceCandidates(String worldName, double x, double z, double radiusBlocks) {
+        if (worldName == null || radiusBlocks < 0) return Collections.emptyList();
+
+        PortalSpatialIndex index = getSpatialIndexForWorld(worldName);
+        if (index == null) return Collections.emptyList();
+
+        // Convert to chunk coordinates
+        int cx = ChunkPreloader.toChunkCoord(x);
+        int cz = ChunkPreloader.toChunkCoord(z);
+
+        // Calculate chunk search radius
+        int radiusChunks = Math.max(1, (int) Math.ceil(radiusBlocks / 32.0));
+
+        // Collect candidates from chunk neighborhood
+        java.util.Set<String> seenIds = new java.util.HashSet<>();
+        java.util.ArrayList<PortalEntry> candidates = new java.util.ArrayList<>();
+
+        for (int dx = -radiusChunks; dx <= radiusChunks; dx++) {
+            for (int dz = -radiusChunks; dz <= radiusChunks; dz++) {
+                long chunkKey = ChunkPreloader.packChunk(cx + dx, cz + dz);
+                for (PortalEntry entry : index.getPortalDevicesInChunk(chunkKey)) {
+                    if (seenIds.add(entry.getId())) {
+                        candidates.add(entry);
+                    }
+                }
+            }
+        }
+
+        return candidates;
     }
 
     protected ConcurrentHashMap<UUID, Long> getLastSeenTeleportNanos() {
@@ -421,7 +536,7 @@ public class TeleportInterceptor {
                                                     
                                                     LOG.fine(() -> "[OptiPortal] Poll teleport → "
                                                         + dx + "," + dy + "," + dz + " world=" + dw);
-                                                    lingerOriginZone(fUuid);
+                                                    lingerOriginZone(fUuid, sourceWorld);
                                                     checkProximityAndPreload(fUuid, dw, dx, dy, dz);
                                                     // Derive origin portal from pre-teleport position
                                                     String originId = prePos != null
@@ -465,13 +580,20 @@ public class TeleportInterceptor {
                                         // Guard against post-shutdown execution
                                         if (plugin.isShuttingDown()) return;
                                         
+                                        // Use spatial-index candidate lookup instead of full-world scan
                                         PortalEntry best = null;
-                                        double bestD = config.getActivationDistance() * 2;
-                                        for (PortalEntry pe : getPortalEntriesForWorld(jWorld)) {
-                                            if (pe.isInstanced() || pe.getId().contains(":")) continue;
-                                            // D2: Use Math.hypot instead of Math.sqrt for better performance
-                                            double d = Math.hypot(pe.getX() - dstX, pe.getZ() - dstZ);
-                                            if (d < bestD) { bestD = d; best = pe; }
+                                        double bestDist = config.getActivationDistance() * 2;
+                                        double bestDistSq = bestDist * bestDist;
+                                        List<PortalEntry> candidates = getNearbyPlainPortalCandidates(jWorld, dstX, dstZ, bestDist);
+
+                                        for (PortalEntry pe : candidates) {
+                                            double dx = pe.getX() - dstX;
+                                            double dz = pe.getZ() - dstZ;
+                                            double dSq = dx * dx + dz * dz;
+                                            if (dSq < bestDistSq) {
+                                                bestDistSq = dSq;
+                                                best = pe;
+                                            }
                                         }
                                         if (best != null) {
                                             final PortalEntry fBest = best;
@@ -486,16 +608,10 @@ public class TeleportInterceptor {
                                 }
                             }
 
-                            // Save position for origin detection on next teleport
+                            // Save position for origin detection on next teleport.
+                            // Routine proximity checks are handled exclusively by the
+                            // staggered scheduler — do not duplicate them here.
                             lastKnownPosition.put(uuid, new double[]{cx, cy, cz});
-                            final UUID fUuid2 = uuid;
-                            if (shouldRunProximityCheck(fUuid2, cx, cy, cz)) {
-                                executor.execute(() -> {
-                                    // Guard against post-shutdown execution
-                                    if (plugin.isShuttingDown()) return;
-                                    checkProximityAndPreload(fUuid2, curWorld, cx, cy, cz);
-                                });
-                            }
                         }
                     } catch (Exception e) {
                         LOG.warning(() -> "[OptiPortal] poll error: " + e);
@@ -552,7 +668,15 @@ public class TeleportInterceptor {
      * Check proximity to all portals and trigger preload if within activation distance.
      */
     private void checkProximityAndPreload(UUID playerUuid, String worldName, double px, double py, double pz) {
-        for (com.optiportal.model.PortalEntry entry : getPortalEntriesForWorld(worldName)) {
+        // Use the larger of the global activation distance and any per-portal horizontal override
+        // so portals with a wider override radius are not missed by the spatial index query.
+        PortalSpatialIndex idx = getSpatialIndexForWorld(worldName);
+        double queryRadius = (idx != null && idx.getMaxHorizontalActivationDistance() > config.getActivationDistance())
+                ? idx.getMaxHorizontalActivationDistance()
+                : config.getActivationDistance();
+        List<PortalEntry> candidates = getNearbyPlainPortalCandidates(worldName, px, pz, queryRadius);
+        
+        for (PortalEntry entry : candidates) {
             if (entry.isInstanced()) continue;
             if (entry.getId().contains(":")) continue; // skip death:, respawn:, etc.
 
@@ -565,13 +689,11 @@ public class TeleportInterceptor {
                     ? entry.getActivationDistanceVertical()
                     : config.getActivationDistanceVertical();
             double dy = Math.abs(py - entry.getY());
-            double toX = entry.getX() - px;
-            double toZ = entry.getZ() - pz;
-            // D2: Use Math.hypot instead of Math.sqrt for better performance
-            double horizDist = Math.hypot(toX, toZ);
+            double dx = entry.getX() - px;
+            double dz = entry.getZ() - pz;
+            double horizDistSq = dx * dx + dz * dz;
             if (dy > vertBound) continue;
-            if (horizDist > maxDist) continue;
-
+            if (horizDistSq > maxDist * maxDist) continue;
             String id = entry.getId();
             int cx = ChunkPreloader.toChunkCoord(entry.getX());
             int cz = ChunkPreloader.toChunkCoord(entry.getZ());
@@ -585,7 +707,7 @@ public class TeleportInterceptor {
                     if (cm.getOwnedChunkCount(id) > 0) {
                         cm.setZoneTier(id, com.optiportal.model.CacheTier.HOT);
                         LOG.fine(() -> "[OptiPortal] Proximity HOT: " + id
-                            + " dist=" + String.format("%.1f", horizDist)
+                            + " dist=" + String.format("%.1f", Math.sqrt(horizDistSq))
                             + " (was " + current + ")");
                     } else {
                         // Zone not yet loaded — re-trigger; HOT will be set on load completion
@@ -603,7 +725,7 @@ public class TeleportInterceptor {
                 if (!com.optiportal.preload.WarmZoneManager.isPortalWorldUsable(destWorld)) continue;
                 recordCooldown(null, id);
                 LOG.fine(() -> "[OptiPortal] Proximity PREDICTIVE: " + id
-                    + " dist=" + String.format("%.1f", horizDist) + " → load cx=" + cx + " cz=" + cz);
+                    + " dist=" + String.format("%.1f", Math.sqrt(horizDistSq)) + " → load cx=" + cx + " cz=" + cz);
                 predictiveLoadWithRam(id, worldName, cx, cz, radius);
             }
 
@@ -645,28 +767,33 @@ public class TeleportInterceptor {
         }
 
         PortalEntry destEntry = null;
-        double bestDist = Double.MAX_VALUE;
+        double bestDistSq = Double.MAX_VALUE;
 
-        for (PortalEntry entry : getPortalEntriesForWorld(destWorld)) {
-            if (entry.isInstanced()) continue;
-            if (entry.getId().contains(":")) continue;
-            // D2: Use Math.hypot instead of Math.sqrt for better performance
-            double dist = Math.hypot(entry.getX() - dx, entry.getZ() - dz);
-
+        // Use spatial index for candidate reduction
+        double maxDist = config.getActivationDistance() * 2;
+        double maxDistSq = maxDist * maxDist;
+        double exactMatchDistSq = 1.0 * 1.0;
+        
+        List<PortalEntry> candidates = getNearbyPlainPortalCandidates(destWorld, dx, dz, maxDist);
+        
+        for (PortalEntry entry : candidates) {
             // Exact match (within 1 block) — teleporter lands the player precisely on the warp coords
-            if (dist <= 1.0) {
+            double entryDx = entry.getX() - dx;
+            double entryDz = entry.getZ() - dz;
+            double distSq = entryDx * entryDx + entryDz * entryDz;
+            if (distSq <= exactMatchDistSq) {
                 destEntry = entry;
-                bestDist = dist;
+                bestDistSq = distSq;
                 break;
             }
-            if (dist < bestDist) {
-                bestDist = dist;
+            if (distSq < bestDistSq) {
+                bestDistSq = distSq;
                 destEntry = entry;
             }
         }
 
         if (destEntry == null) return;
-        if (bestDist > config.getActivationDistance() * 2) return; // sanity bound
+        if (bestDistSq > maxDistSq) return; // sanity bound
 
         // Learn portal hotspot so future approaches pre-warm this destination.
         // srcPos is captured at the call site before the world thread advances lastKnownPosition
@@ -680,14 +807,15 @@ public class TeleportInterceptor {
         }
 
         // Preload the destination portal
-        long lastReverseLoad = reversePreloadCooldowns.getOrDefault(destEntry.getId(), 0L);
-        if (System.currentTimeMillis() - lastReverseLoad < 30_000L) return;
-        reversePreloadCooldowns.put(destEntry.getId(), System.currentTimeMillis());
+        long now = System.currentTimeMillis();
+        boolean shouldFire = reversePreloadCooldowns.compute(destEntry.getId(), (k, last) ->
+                (last == null || now - last >= 30_000L) ? now : last) == now;
+        if (!shouldFire) return;
         int cx = ChunkPreloader.toChunkCoord(destEntry.getX());
         int cz = ChunkPreloader.toChunkCoord(destEntry.getZ());
         int radius = resolveRadius(destEntry);
         final PortalEntry logEntry = destEntry;
-        final double logDist = bestDist;
+        final double logDist = Math.sqrt(bestDistSq);
         LOG.fine(() -> "[OptiPortal] Reverse preload destination: " + logEntry.getId()
             + " dist=" + String.format("%.1f", logDist) + " cx=" + cx + " cz=" + cz);
         predictiveLoadWithRam(destEntry.getId(), destEntry.getWorld(), cx, cz, radius);
@@ -698,41 +826,46 @@ public class TeleportInterceptor {
      * The existing HOT→WARM decay timer handles cleanup — no extra scheduling needed.
      */
     protected String findNearestPortal(String worldName, double px, double py, double pz) {
+        // Use spatial index for candidate reduction
+        double maxDist = config.getActivationDistance();
+        List<PortalEntry> candidates = getNearbyPlainPortalCandidates(worldName, px, pz, maxDist);
+        
         String best = null;
-        double bestDist = config.getActivationDistance();
-        for (PortalEntry entry : getPortalEntriesForWorld(worldName)) {
-            if (entry.isInstanced()) continue;
-            if (entry.getId().contains(":")) continue;
-            // D2: Use Math.hypot instead of Math.sqrt for better performance
-            double dist = Math.hypot(entry.getX() - px, entry.getZ() - pz);
-            if (dist <= bestDist) {
-                bestDist = dist;
+        double bestDistSq = Double.MAX_VALUE;
+        for (PortalEntry entry : candidates) {
+            double dx = entry.getX() - px;
+            double dz = entry.getZ() - pz;
+            double distSq = dx * dx + dz * dz;
+            if (distSq < bestDistSq) {
+                bestDistSq = distSq;
                 best = entry.getId();
             }
         }
+        
         return best;
     }
 
-    protected void lingerOriginZone(UUID playerUuid) {
+    protected void lingerOriginZone(UUID playerUuid, String worldName) {
         double[] prePos = lastKnownPosition.get(playerUuid);
-        if (prePos == null) return;
-        // D3: Only consider portals in the same world as the pre-teleport position
-        String worldName = getWorldNameFromPosition(prePos);
-        if (worldName == null) return;
+        if (prePos == null || worldName == null) return;
+        
+        // Use spatial index for candidate reduction
+        double maxDist = config.getActivationDistance();
+        double maxDistSq = maxDist * maxDist;
+        List<PortalEntry> candidates = getNearbyPlainPortalCandidates(worldName, prePos[0], prePos[2], maxDist);
         
         String prevZoneId = null;
-        double bestDist = Double.MAX_VALUE;
-        for (PortalEntry entry : getPortalEntriesForWorld(worldName)) {
-            if (entry.isInstanced()) continue;
-            if (entry.getId().contains(":")) continue;
-            // D2: Use Math.hypot instead of Math.sqrt for better performance
-            double dist = Math.hypot(entry.getX() - prePos[0], entry.getZ() - prePos[2]);
-            if (dist < bestDist) {
-                bestDist = dist;
+        double bestDistSq = Double.MAX_VALUE;
+        for (PortalEntry entry : candidates) {
+            double dx = entry.getX() - prePos[0];
+            double dz = entry.getZ() - prePos[2];
+            double distSq = dx * dx + dz * dz;
+            if (distSq < bestDistSq) {
+                bestDistSq = distSq;
                 prevZoneId = entry.getId();
             }
         }
-        if (prevZoneId == null || bestDist > config.getActivationDistance()) return;
+        if (prevZoneId == null || bestDistSq > maxDistSq) return;
         final String lingerZoneId = prevZoneId;
         // Guard: only linger-HOT if the zone's chunks are actually owned/pinned in memory.
         // If owned chunk count is 0, the zone was never loaded — setting HOT would be a false
@@ -742,20 +875,6 @@ public class TeleportInterceptor {
             LOG.fine(() -> "[OptiPortal] Linger HOT: " + lingerZoneId + " (30s decay will clean up)");
         }
     }
-
-   /** Helper method to get world name from position data */
-   private String getWorldNameFromPosition(double[] position) {
-       // position format: [x, z, worldMsb, worldLsb]
-       if (position.length < 4) return null;
-       long worldMsb = (long) position[2];
-       long worldLsb = (long) position[3];
-       return java.util.UUID.nameUUIDFromBytes(new byte[] {
-           (byte) (worldMsb >>> 56), (byte) (worldMsb >>> 48), (byte) (worldMsb >>> 40), (byte) (worldMsb >>> 32),
-           (byte) (worldMsb >>> 24), (byte) (worldMsb >>> 16), (byte) (worldMsb >>> 8), (byte) worldMsb,
-           (byte) (worldLsb >>> 56), (byte) (worldLsb >>> 48), (byte) (worldLsb >>> 40), (byte) (worldLsb >>> 32),
-           (byte) (worldLsb >>> 24), (byte) (worldLsb >>> 16), (byte) (worldLsb >>> 8), (byte) worldLsb
-       }).toString();
-   }
 
     /**
      * Player client is fully ready (spawned, UI loaded).
@@ -901,7 +1020,7 @@ public class TeleportInterceptor {
 
             // 2. Immediately linger the origin zone HOT.
             //    lingerOriginZone() reads lastKnownPosition which we just set.
-            lingerOriginZone(fUuid);
+            lingerOriginZone(fUuid, world.getName());
         });
     }
 
@@ -993,7 +1112,11 @@ public class TeleportInterceptor {
             cooldownCleanupTask.cancel(false);
             cooldownCleanupTask = null;
         }
-        
+        if (staggeredProximityTask != null) {
+            staggeredProximityTask.cancel(false);
+            staggeredProximityTask = null;
+        }
+
         // Clear all interceptor-owned tracking collections to prevent retention
         pendingRespawnCapture.clear();
         reversePreloadCooldowns.clear();
@@ -1018,7 +1141,13 @@ public class TeleportInterceptor {
         portalHotspots.remove(worldName);
         // Remove all pending hotspot keys that start with this world name
         pendingHotspotCounts.keySet().removeIf(key -> key.startsWith(worldName + ":"));
-        LOG.fine(() -> "[OptiPortal] Cleared hotspot state for removed world: " + worldName);
+        
+        // Remove world from spatial index to prevent stale lookups
+        Map<String, PortalSpatialIndex> newSpatialIndex = new java.util.HashMap<>(portalSpatialIndexByWorld);
+        newSpatialIndex.remove(worldName);
+        portalSpatialIndexByWorld = Collections.unmodifiableMap(newSpatialIndex);
+        
+        LOG.fine(() -> "[OptiPortal] Cleared hotspot and spatial index state for removed world: " + worldName);
     }
 
     /**
@@ -1101,6 +1230,98 @@ public class TeleportInterceptor {
         lastProximityCheckMs.remove(uuid);
         lastSeenTeleportNanos.remove(uuid);
         pendingRespawnCapture.remove(uuid);
+    }
+
+    /**
+     * Get the next batch of players for proximity checks using round-robin fairness.
+     *
+     * Package-private for focused regression tests.
+     *
+     * @return List of player UUIDs to check in this batch
+     */
+    List<UUID> getNextProximityBatch() {
+        // Snapshot player refs to avoid concurrent modification
+        List<UUID> allPlayers = new ArrayList<>(playerRefs.keySet());
+        // Sort for a stable iteration order — ConcurrentHashMap.keySet() ordering
+        // is not guaranteed, so without this the cursor rotation does not produce a
+        // consistent round-robin cycle when the map changes between ticks.
+        Collections.sort(allPlayers);
+        int total = allPlayers.size();
+        if (total == 0) {
+            return Collections.emptyList();
+        }
+
+        // Advance cursor by one batch size for round-robin fairness
+        int start = Math.floorMod(proximityBatchCursor.getAndAdd(POSITION_UPDATE_BATCH_SIZE), total);
+
+        // Collect up to batch size
+        List<UUID> batch = new ArrayList<>(POSITION_UPDATE_BATCH_SIZE);
+        for (int i = 0; i < total && batch.size() < POSITION_UPDATE_BATCH_SIZE; i++) {
+            batch.add(allPlayers.get((start + i) % total));
+        }
+
+        return batch;
+    }
+
+    /**
+     * Process a single player's proximity check using the live-safe access patterns.
+     * Package-private for focused regression tests.
+     *
+     * @param playerUuid Player UUID to check
+     */
+    protected void processPlayerProximity(UUID playerUuid) {
+        PlayerRef playerRef = playerRefs.get(playerUuid);
+        if (playerRef == null) {
+            return; // Player ref missing — skip
+        }
+
+        try {
+            World world = chunkPreloader.getWorldRegistry().getWorldForPlayer(playerRef);
+            if (world == null) {
+                return; // Missing world — skip
+            }
+
+            // Mirror the thread-safety model of pollTeleportRecords: read getTransform()
+            // only on the world execution path, never from the scheduler thread.
+            world.execute(() -> {
+                com.hypixel.hytale.math.vector.Transform transform = playerRef.getTransform();
+                final String curWorld = world.getName();
+                final double cx = transform.getPosition().x;
+                final double cy = transform.getPosition().y;
+                final double cz = transform.getPosition().z;
+
+                // Use existing skip logic based on last scan time and movement thresholds
+                if (!shouldRunProximityCheck(playerUuid, cx, cy, cz)) return;
+
+                // Submit to executor for actual proximity check
+                executor.execute(() -> {
+                    if (plugin.isShuttingDown()) return;
+                    checkProximityAndPreload(playerUuid, curWorld, cx, cy, cz);
+                });
+            });
+        } catch (Exception e) {
+            // Log but don't fail the batch
+            LOG.warning(() -> "[OptiPortal] Error processing player proximity for " + playerUuid + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * Run a single batch of staggered proximity checks.
+     * Package-private for focused regression tests.
+     */
+    void runStaggeredProximityBatch() {
+        try {
+            List<UUID> batch = getNextProximityBatch();
+            if (batch.isEmpty()) {
+                return;
+            }
+
+            for (UUID playerId : batch) {
+                processPlayerProximity(playerId);
+            }
+        } catch (Exception e) {
+            LOG.warning(() -> "[OptiPortal] Error in staggered proximity batch: " + e.getMessage());
+        }
     }
 
     /**
@@ -1233,7 +1454,7 @@ public class TeleportInterceptor {
                         com.optiportal.model.PortalEntry e = opt.get();
                         e.setRamEstimatedMB(estimatedMB);
                         e.setLastActive(java.time.Instant.now());
-                        storage.save(e);
+                        chunkPreloader.queueEntrySave(e);
                     }
                 }, executor)
                 .exceptionally(ex -> {
@@ -1305,7 +1526,7 @@ public class TeleportInterceptor {
     /**
      * When a player is near a known portal hotspot, promote the destination zone
      * from WARM → HOT so chunks are not evicted before the player arrives.
-     * Called from checkProximityAndPreload and AsyncTeleportInterceptor's async variant.
+     * Called from checkProximityAndPreload.
      */
     protected void checkHotspotPromotion(String worldName, double px, double pz) {
         java.util.concurrent.CopyOnWriteArrayList<PortalHotspot> list = portalHotspots.get(worldName);

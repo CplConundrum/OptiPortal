@@ -16,9 +16,8 @@ import com.optiportal.preload.WorldRegistry;
 /**
  * Load balancer for async operations to prevent world thread overload.
  *
- * <p><b>DORMANT: This class is intentionally not wired into OptiPortal startup.</b>
- * It manages the scheduling and execution of async operations with load balancing,
- * adaptive batch sizing, and priority-based scheduling.
+ * This component is available in the live OptiPortal runtime for async status,
+ * load metrics, and future async integrations.
  *
  * <p><b>Lifecycle safety note:</b> This class schedules recurring tasks via
  * {@code executor.scheduleAtFixedRate()} for load adjustment and task processing.
@@ -27,9 +26,9 @@ import com.optiportal.preload.WorldRegistry;
  * as {@link com.hypixel.hytale.server.core.plugin.PluginBase} does not automatically
  * cancel arbitrary executor tasks during cleanup.
  *
- * This component manages the scheduling and execution of async operations,
- * implementing load balancing, adaptive batch sizing, and priority-based
- * scheduling to optimize world thread usage.
+ * It manages the scheduling and execution of async operations, implementing
+ * load balancing, adaptive batch sizing, and priority-based scheduling to
+ * optimize world thread usage.
  */
 public class AsyncLoadBalancer {
     
@@ -257,37 +256,50 @@ public class AsyncLoadBalancer {
      */
     private CompletableFuture<Void> executeOperation(Supplier<CompletableFuture<Void>> operation,
                                                     AsyncMetrics.AsyncTaskPriority priority) {
-        activeOperations.incrementAndGet();
-        totalOperations.incrementAndGet();
-        
-        long startTime = System.currentTimeMillis();
-        
-        if (metrics != null) {
-            metrics.recordAsyncTaskStart(priority);
-        }
-        
-        return operation.get().whenComplete((result, ex) -> {
-            long duration = System.currentTimeMillis() - startTime;
-            activeOperations.decrementAndGet();
-
-            // A2: Update EMA using lock-free CAS loop on emaBits.
-            // α=0.1: new = 0.1*sample + 0.9*previous. Seed from 0 on first sample.
-            long prevBits, nextBits;
-            do {
-                prevBits = emaBits.get();
-                double prev = Double.longBitsToDouble(prevBits);
-                double next = (prev == 0.0) ? duration : EMA_ALPHA * duration + (1.0 - EMA_ALPHA) * prev;
-                nextBits = Double.doubleToLongBits(next);
-            } while (!emaBits.compareAndSet(prevBits, nextBits));
-
+        // Guard against synchronous throw from operation.get()
+        try {
+            activeOperations.incrementAndGet();
+            totalOperations.incrementAndGet();
+            
+            long startTime = System.currentTimeMillis();
+            
             if (metrics != null) {
-                metrics.recordAsyncTaskComplete(priority, duration);
+                metrics.recordAsyncTaskStart(priority);
             }
-            if (ex != null) {
-                errorHandler.handleWorldThreadError(
-                        ex instanceof Exception ? (Exception) ex : new Exception(ex), "loadBalancer");
+            
+            CompletableFuture<Void> future = operation.get();
+            return future.whenComplete((result, ex) -> {
+                long duration = System.currentTimeMillis() - startTime;
+                activeOperations.decrementAndGet();
+
+                // A2: Update EMA using lock-free CAS loop on emaBits.
+                // α=0.1: new = 0.1*sample + 0.9*previous. Seed from 0 on first sample.
+                long prevBits, nextBits;
+                do {
+                    prevBits = emaBits.get();
+                    double prev = Double.longBitsToDouble(prevBits);
+                    double next = (prev == 0.0) ? duration : EMA_ALPHA * duration + (1.0 - EMA_ALPHA) * prev;
+                    nextBits = Double.doubleToLongBits(next);
+                } while (!emaBits.compareAndSet(prevBits, nextBits));
+
+                if (metrics != null) {
+                    metrics.recordAsyncTaskComplete(priority, duration);
+                }
+                if (ex != null) {
+                    errorHandler.handleWorldThreadError(
+                            ex instanceof Exception ? (Exception) ex : new Exception(ex), "loadBalancer");
+                }
+            });
+        } catch (Exception e) {
+            // Synchronous throw: decrement counter and return failed future
+            activeOperations.decrementAndGet();
+            if (metrics != null) {
+                // Record as failed operation with zero duration
+                metrics.recordAsyncTaskComplete(priority, 0);
             }
-        });
+            errorHandler.handleWorldThreadError(e, "loadBalancer");
+            return CompletableFuture.failedFuture(e);
+        }
     }
     
     /**

@@ -70,9 +70,13 @@ public class CacheManager {
     private final File registryFile;
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
 
-    // ReadWriteLock: setZoneTier() uses read lock (concurrent callers don't block each other),
-    // saveRegistry() uses write lock (pauses new writes only during the snapshot, which is milliseconds at most).
-    private final ReentrantReadWriteLock tierLock = new ReentrantReadWriteLock();
+    // Snapshot barrier for zoneTiers + tierTimestamps.
+    //
+    // This is not a conventional "readers vs writers" lock. Tier mutations take the
+    // read side so normal concurrent promotions/demotions do not serialize on each
+    // other. saveRegistry() takes the write side only long enough to block new tier
+    // mutations while it copies both maps, preventing tier/timestamp skew in snapshots.
+    private final ReentrantReadWriteLock tierSnapshotLock = new ReentrantReadWriteLock();
 
     public CacheManager(PluginConfig config, WalManager walManager,
                         ScheduledExecutorService executor, WorldRegistry worldRegistry,
@@ -192,7 +196,7 @@ public class CacheManager {
         // zoneTiers and tierTimestamps must be consistent with each other.
         final Map<String, String> tierSnapshot;
         final Map<String, Long> tsSnapshot;
-        tierLock.writeLock().lock();
+        tierSnapshotLock.writeLock().lock();
         try {
             tierSnapshot = new HashMap<>();
             for (Map.Entry<String, CacheTier> e : zoneTiers.entrySet()) {
@@ -200,7 +204,7 @@ public class CacheManager {
             }
             tsSnapshot = new HashMap<>(tierTimestamps);
         } finally {
-            tierLock.writeLock().unlock();
+            tierSnapshotLock.writeLock().unlock();
         }
 
         RegistrySnapshot snapshot = new RegistrySnapshot(tierSnapshot, tsSnapshot);
@@ -262,10 +266,12 @@ public class CacheManager {
 
     /**
      * Set a zone's tier. HOT and WARM record a timestamp for decay scheduling.
-     * Uses read lock to allow concurrent callers (teleport, proximity, chunk load, keepalive).
+     * Uses the read side of tierSnapshotLock as a snapshot barrier: concurrent tier
+     * updates may proceed together, but saveRegistry() can briefly block new updates
+     * while it copies zoneTiers and tierTimestamps consistently.
      */
     public void setZoneTier(String zoneId, CacheTier tier) {
-        tierLock.readLock().lock();
+        tierSnapshotLock.readLock().lock();
         try {
             zoneTiers.put(zoneId, tier);
             if (tier == CacheTier.HOT || tier == CacheTier.WARM) {
@@ -280,7 +286,7 @@ public class CacheManager {
                 tierTimestamps.remove(zoneId);
             }
         } finally {
-            tierLock.readLock().unlock();
+            tierSnapshotLock.readLock().unlock();
         }
     }
 
@@ -301,12 +307,17 @@ public class CacheManager {
      * Used by zone deletion to fully clean up cache state.
      */
     public void removeTierEntry(String zoneId) {
-        CacheTier oldTier = zoneTiers.remove(zoneId);
-        if (oldTier != null) {
-            tierTimestamps.remove(zoneId);
-            noDecayZones.remove(zoneId);
-            warmFloorZones.remove(zoneId);
-            LOG.fine(() -> "[OptiPortal] Removed tier entry: " + zoneId + " (was " + oldTier + ")");
+        tierSnapshotLock.readLock().lock();
+        try {
+            CacheTier oldTier = zoneTiers.remove(zoneId);
+            if (oldTier != null) {
+                tierTimestamps.remove(zoneId);
+                noDecayZones.remove(zoneId);
+                warmFloorZones.remove(zoneId);
+                LOG.fine(() -> "[OptiPortal] Removed tier entry: " + zoneId + " (was " + oldTier + ")");
+            }
+        } finally {
+            tierSnapshotLock.readLock().unlock();
         }
     }
 
@@ -357,40 +368,44 @@ public class CacheManager {
         long warmMs = config.getWarmDecayMinutes() * 60_000L;
         long nextEarliest = Long.MAX_VALUE;
 
-        for (Map.Entry<String, CacheTier> entry : zoneTiers.entrySet()) {
-            String zoneId = entry.getKey();
-            CacheTier tier = entry.getValue();
-            // Skip no-decay zones — their chunks never unload, decay is meaningless
-            if (noDecayZones.contains(zoneId)) continue;
-            Long ts = tierTimestamps.get(zoneId);
-            if (ts == null) continue;
+        tierSnapshotLock.readLock().lock();
+        try {
+            for (Map.Entry<String, CacheTier> entry : zoneTiers.entrySet()) {
+                String zoneId = entry.getKey();
+                CacheTier tier = entry.getValue();
+                // Skip no-decay zones — their chunks never unload, decay is meaningless
+                if (noDecayZones.contains(zoneId)) continue;
+                Long ts = tierTimestamps.get(zoneId);
+                if (ts == null) continue;
 
-            long age = now - ts;
-            if (tier == CacheTier.HOT && age >= hotMs) {
-                zoneTiers.put(zoneId, CacheTier.WARM);
-                tierTimestamps.put(zoneId, now); // reset clock for WARM→COLD
-                nextEarliest = Math.min(nextEarliest, now + warmMs);
-                LOG.fine(() -> "[OptiPortal] Tier decay: " + zoneId + " HOT → WARM");
-            } else if (tier == CacheTier.WARM && age >= warmMs) {
-                if (warmFloorZones.contains(zoneId)) {
-                    // WARM-floor zone: reset the timer to keep it at WARM indefinitely
-                    tierTimestamps.put(zoneId, now);
+                long age = now - ts;
+                if (tier == CacheTier.HOT && age >= hotMs) {
+                    zoneTiers.put(zoneId, CacheTier.WARM);
+                    tierTimestamps.put(zoneId, now); // reset clock for WARM→COLD
                     nextEarliest = Math.min(nextEarliest, now + warmMs);
+                    LOG.fine(() -> "[OptiPortal] Tier decay: " + zoneId + " HOT → WARM");
+                } else if (tier == CacheTier.WARM && age >= warmMs) {
+                    if (warmFloorZones.contains(zoneId)) {
+                        // WARM-floor zone: reset the timer to keep it at WARM indefinitely
+                        tierTimestamps.put(zoneId, now);
+                        nextEarliest = Math.min(nextEarliest, now + warmMs);
+                    } else {
+                        zoneTiers.put(zoneId, CacheTier.COLD);
+                        tierTimestamps.remove(zoneId);
+                        final String decayedZone = zoneId;
+                        executor.submit(() -> deregisterAllChunks(decayedZone));   // non-blocking
+                        LOG.fine(() -> "[OptiPortal] Tier decay: " + zoneId + " WARM → COLD");
+                    }
                 } else {
-                    zoneTiers.put(zoneId, CacheTier.COLD);
-                    tierTimestamps.remove(zoneId);
-                    final String decayedZone = zoneId;
-                    executor.submit(() -> deregisterAllChunks(decayedZone));   // non-blocking
-                    LOG.fine(() -> "[OptiPortal] Tier decay: " + zoneId + " WARM → COLD");
+                    // Not yet due — contribute to next earliest
+                    long decayMs = (tier == CacheTier.HOT) ? hotMs : warmMs;
+                    nextEarliest = Math.min(nextEarliest, ts + decayMs);
                 }
-            } else {
-                // Not yet due — contribute to next earliest
-                long decayMs = (tier == CacheTier.HOT) ? hotMs : warmMs;
-                nextEarliest = Math.min(nextEarliest, ts + decayMs);
             }
+            earliestDecayMs.set(nextEarliest);
+        } finally {
+            tierSnapshotLock.readLock().unlock();
         }
-
-        earliestDecayMs.set(nextEarliest);
     }
 
     public MetricsCollector getMetricsCollector() {
@@ -690,26 +705,31 @@ public class CacheManager {
                 Set<Long> zoneKeys = zoneWorldMap.get(worldName);
                 if (zoneKeys != null) zoneKeys.remove(key);
             }
-            // noDecay zones keep their tier regardless of eviction
-            if (noDecayZones.contains(zoneId)) continue;
-            // Tier downgrade — warmFloor zones cannot drop below WARM
-            CacheTier current = zoneTiers.getOrDefault(zoneId, CacheTier.COLD);
-            CacheTier downgraded;
-            switch (current) {
-                case HOT:  downgraded = CacheTier.WARM; break;
-                case WARM: downgraded = warmFloorZones.contains(zoneId) ? CacheTier.WARM : CacheTier.COLD; break;
-                default:   downgraded = current; break;
-            }
-            if (downgraded != current) {
-                zoneTiers.put(zoneId, downgraded);
-                if (downgraded == CacheTier.COLD) {
-                    tierTimestamps.remove(zoneId);
-                } else {
-                    tierTimestamps.put(zoneId, System.currentTimeMillis());
+            tierSnapshotLock.readLock().lock();
+            try {
+                // noDecay zones keep their tier regardless of eviction
+                if (noDecayZones.contains(zoneId)) continue;
+                // Tier downgrade — warmFloor zones cannot drop below WARM
+                CacheTier current = zoneTiers.getOrDefault(zoneId, CacheTier.COLD);
+                CacheTier downgraded;
+                switch (current) {
+                    case HOT:  downgraded = CacheTier.WARM; break;
+                    case WARM: downgraded = warmFloorZones.contains(zoneId) ? CacheTier.WARM : CacheTier.COLD; break;
+                    default:   downgraded = current; break;
                 }
-                LOG.info("[OptiPortal] onChunkEvicted: zone '" + zoneId
-                        + "' downgraded " + current + " → " + downgraded
-                        + " (chunk evicted: " + worldName + ":" + cx + ":" + cz + ")");
+                if (downgraded != current) {
+                    zoneTiers.put(zoneId, downgraded);
+                    if (downgraded == CacheTier.COLD) {
+                        tierTimestamps.remove(zoneId);
+                    } else {
+                        tierTimestamps.put(zoneId, System.currentTimeMillis());
+                    }
+                    LOG.info("[OptiPortal] onChunkEvicted: zone '" + zoneId
+                            + "' downgraded " + current + " → " + downgraded
+                            + " (chunk evicted: " + worldName + ":" + cx + ":" + cz + ")");
+                }
+            } finally {
+                tierSnapshotLock.readLock().unlock();
             }
         }
 
@@ -751,24 +771,29 @@ public class CacheManager {
         }
 
         long now = System.currentTimeMillis();
-        for (Map.Entry<String, CacheTier> entry : downgrades.entrySet()) {
-            String zoneId = entry.getKey();
-            CacheTier current = entry.getValue();
-            // noDecay zones keep their tier regardless of eviction
-            if (noDecayZones.contains(zoneId)) continue;
-            CacheTier downgraded;
-            switch (current) {
-                case HOT:  downgraded = CacheTier.WARM; break;
-                case WARM: downgraded = warmFloorZones.contains(zoneId) ? CacheTier.WARM : CacheTier.COLD; break;
-                default:   downgraded = current; break;
+        tierSnapshotLock.readLock().lock();
+        try {
+            for (Map.Entry<String, CacheTier> entry : downgrades.entrySet()) {
+                String zoneId = entry.getKey();
+                CacheTier current = entry.getValue();
+                // noDecay zones keep their tier regardless of eviction
+                if (noDecayZones.contains(zoneId)) continue;
+                CacheTier downgraded;
+                switch (current) {
+                    case HOT:  downgraded = CacheTier.WARM; break;
+                    case WARM: downgraded = warmFloorZones.contains(zoneId) ? CacheTier.WARM : CacheTier.COLD; break;
+                    default:   downgraded = current; break;
+                }
+                if (downgraded != current) {
+                    zoneTiers.put(zoneId, downgraded);
+                    if (downgraded == CacheTier.COLD) tierTimestamps.remove(zoneId);
+                    else tierTimestamps.put(zoneId, now);
+                    LOG.info(() -> "[OptiPortal] onChunksEvicted: zone '" + zoneId
+                            + "' downgraded " + current + " → " + downgraded);
+                }
             }
-            if (downgraded != current) {
-                zoneTiers.put(zoneId, downgraded);
-                if (downgraded == CacheTier.COLD) tierTimestamps.remove(zoneId);
-                else tierTimestamps.put(zoneId, now);
-                LOG.info(() -> "[OptiPortal] onChunksEvicted: zone '" + zoneId
-                        + "' downgraded " + current + " → " + downgraded);
-            }
+        } finally {
+            tierSnapshotLock.readLock().unlock();
         }
 
         // Prune empty world bucket immediately
