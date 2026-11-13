@@ -474,6 +474,39 @@ The proof was re-run after the hook: both statements succeeded on real PG 16.
 
 ---
 
+### Command-surface consistency pass: `migrate` learns Postgres, `radiusxz` deleted
+
+**Files:** `PreloadCommand.java`, `OptiPortal.java` (javadoc), `README.md`
+
+**Root cause:**
+Two loose ends left in the command surface after the 1.3.0 work:
+- the `/preload migrate` validator only accepted `JSON|SQLITE|H2|MYSQL` although the
+  `StorageMigrator` matrix (any-to-any, including PostgreSQL) had supported the target
+  since the Postgres backend landed - an operator typing `/preload migrate POSTGRES`
+  was refused with "Unknown backend" even though the real migration path (set backend
+  in config.json, restart, `StorageFactory` + `StorageMigrator`) works fine
+- `/preload radiusxz` was a legacy duplicate of `/preload radius <id> <X> [Z]`:
+  byte-identical handler body (same fields, same save, same WARM reload) differing only
+  in a required-Z argument and a deprecation suffix on the reply; it was already
+  flagged deprecated in the help text, the README, and its own reply strings, with
+  zero references in the UI, tests, or docs
+
+**Fix:**
+- `migrate` validator, usage, and help now accept `POSTGRES`; the README command
+  table matches
+- `radiusxz` removed entirely (dispatch case, handler, help line, README row) -
+  asymmetric radii remain available through `/preload radius <id> <X> <Z>`
+- `OptiPortal` reload javadoc: `postgres.*` and `keepalive.mode` added to the
+  restart-required settings list (both wire at startup; a reload only reschedules
+  the running keepalive manager, it cannot swap implementations)
+
+**Verification:**
+Gate #28: 121/121 (test count unchanged - no test referenced `radiusxz`).
+Commits: `36b1d0a` (migrate validator + README refresh) and `bd95d41`
+(`radiusxz` removal).
+
+---
+
 ### Regression coverage grew across the cycle
 
 **Files:** `src/test/java/com/optiportal/...`

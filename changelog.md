@@ -12,6 +12,7 @@
 
 - **PostgreSQL is now an option for storing portal data**: alongside the built-in file storage, the built-in embedded database, and MariaDB/MySQL, you can now keep your portal data in a PostgreSQL database. All previous options keep working exactly as before; switching is a settings change, not a reinstall.
 - **Switching storage locations keeps your data**: the usual "move my data from where it was saved before" path now works with PostgreSQL too, so moving between storage options does not lose your portal records.
+- **The in-game migration helper knows about PostgreSQL too**: the `/preload migrate` command now lists it as a supported destination, so the step-by-step "move my data" guidance works for every storage option, not just the old ones.
 
 **Lighter on your server**
 
@@ -31,6 +32,7 @@
 ### Notes
 
 - One new optional setting: how many background workers the mod uses (default is 4, which matches the old behavior). Nothing else in the settings changed, and no existing data needs to be moved.
+- **One old command was removed**: `/preload radiusxz` was a leftover duplicate of `/preload radius` for setting different X and Z radii. If you used it, `/preload radius <id> <X> <Z>` does exactly the same thing.
 
 ## [1.2.3] - 2026-04-13
 
