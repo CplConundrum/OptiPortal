@@ -18,6 +18,7 @@ import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
 import java.nio.file.Files;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -95,6 +96,26 @@ class AsyncKeepaliveManagerTest {
         }
     }
 
+    /**
+     * Test seam: records every keep-loaded pin re-acquisition. The engine pin
+     * path itself is a no-op without a booted World, so pin balance (F3
+     * recovery) is only observable through this recording of
+     * {@link #reacquireKeepLoadedPin} calls.
+     */
+    static final class RecordingCacheManager extends CacheManager {
+        final List<String> pinCalls = new ArrayList<>();
+
+        RecordingCacheManager(FakePluginConfig cfg, ScheduledExecutorService exec) throws Exception {
+            super(cfg, new WalManager(cfg), exec, new WorldRegistry(), null, new MetricsCollector());
+        }
+
+        @Override
+        public void reacquireKeepLoadedPin(String worldName, int cx, int cz) {
+            pinCalls.add(worldName + ":" + cx + ":" + cz);
+            super.reacquireKeepLoadedPin(worldName, cx, cz);
+        }
+    }
+
     /** Shared fixture: everything the manager needs, minus a booted World. */
     static final class Fixture {
         final FakePluginConfig cfg;
@@ -110,7 +131,7 @@ class AsyncKeepaliveManagerTest {
             var dir = Files.createTempDirectory("optiporal-ak").toFile();
             cfg = new FakePluginConfig(dir);
             exec = new RecordingScheduledExecutor();
-            cm = new CacheManager(cfg, new WalManager(cfg), exec, new WorldRegistry(), null, new MetricsCollector());
+            cm = new RecordingCacheManager(cfg, exec);
             storage = new FakeStorageBackend();
             preloader = new ChunkPreloader(cfg, cm, new WorldRegistry(), exec, storage, new MetricsCollector());
             metrics = new AsyncMetrics();
@@ -162,6 +183,31 @@ class AsyncKeepaliveManagerTest {
 
         assertTrue(fx.surface.pinged.contains(idx(0, 0)), "the owned evicted chunk is re-pinged (F3 recovery)");
         assertEquals(Set.of("z1"), fx.cm.getChunkOwners("w1", 0, 0), "F3: ownership is re-registered after the ping lands");
+    }
+
+    /**
+     * F3 pin-balance regression (QC 618daa2): a chunk owned by TWO zones that the
+     * engine evicted must come back with exactly ONE keep-loaded pin per owner -
+     * the per-zone release path (deregisterAllChunks) later decrements once per
+     * owner, so a single shared pin would leave the chunk unpinned after the
+     * first owner's release and underflow the counter on the last.
+     */
+    @Test
+    void sharedChunkRecoveryRestoresOnePinPerOwner() throws Exception {
+        Fixture fx = new Fixture(Set.of()); // nothing resident: chunk (0,0) evicted
+        fx.storage.save(zone("z1", 0, 0, 1));
+        fx.storage.save(zone("z2", 0, 0, 1)); // second owner of the SAME chunk (world coords 0,0 -> chunk (0,0))
+        fx.cm.setZoneTier("z1", CacheTier.HOT);
+        fx.cm.setZoneTier("z2", CacheTier.HOT);
+        fx.cm.registerOwnershipBatch("z1", "w1", List.of(new int[]{0, 0}));
+        fx.cm.registerOwnershipBatch("z2", "w1", List.of(new int[]{0, 0}));
+        assertEquals(Set.of("z1", "z2"), fx.cm.getChunkOwners("w1", 0, 0), "precondition: two owners on one chunk");
+
+        fx.ak.pingTier(CacheTier.HOT, "test");
+
+        assertEquals(List.of("w1:0:0", "w1:0:0"), ((RecordingCacheManager) fx.cm).pinCalls,
+                "one re-acquired pin per current owner of the recovered chunk (balanced with the per-zone release path)");
+        assertEquals(Set.of("z1", "z2"), fx.cm.getChunkOwners("w1", 0, 0), "F3: both owners' ownership is re-registered");
     }
 
     @Test

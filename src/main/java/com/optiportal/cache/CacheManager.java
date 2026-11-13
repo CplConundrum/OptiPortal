@@ -632,10 +632,12 @@ public class CacheManager {
     }
 
     /**
-     * F3: re-request the keep-loaded pin for a chunk the engine evicted while zone
-     * ownership stayed intact. The pin request lapsed together with the eviction;
-     * re-issuing is idempotent and does NOT double-count per-zone pin ownership.
-     * Call AFTER the chunk has been re-loaded: the pre-store filter in
+     * F3: re-request ONE keep-loaded pin for a chunk the engine evicted. The pin
+     * request lapsed together with the eviction, and the reloaded chunk's
+     * per-instance counter (engine WorldChunk.keepLoaded) starts at zero, so the
+     * chunk must be re-pinned ONCE PER CURRENT OWNER to stay balanced with the
+     * per-zone release path (deregistration decrements once per zone). Call AFTER
+     * the chunk has been re-loaded: the pre-store filter in
      * addKeepLoadedBatchAsync skips absent chunks, so this is a no-op before the
      * reload lands.
      */
@@ -651,9 +653,13 @@ public class CacheManager {
      * @param zoneId Zone ID to register as owner
      * @param world World name
      * @param chunkCoords List of chunk coordinates [cx, cz] to register
+     * @return the number of keep-loaded pins acquired by this call (chunks for which
+     *         the zone was a new owner) - 0 when the zone already owned every chunk in
+     *         the batch (its pins are intact, or must be re-acquired via
+     *         {@link #reacquireKeepLoadedPin} after an engine eviction re-loaded them)
      */
-    public void registerOwnershipBatch(String zoneId, String world, java.util.List<int[]> chunkCoords) {
-        if (zoneId == null || chunkCoords == null || chunkCoords.isEmpty()) return;
+    public int registerOwnershipBatch(String zoneId, String world, java.util.List<int[]> chunkCoords) {
+        if (zoneId == null || chunkCoords == null || chunkCoords.isEmpty()) return 0;
 
         ConcurrentHashMap<Long, Set<String>> worldMap =
                 chunkOwnership.computeIfAbsent(world, w -> new ConcurrentHashMap<>());
@@ -674,6 +680,7 @@ public class CacheManager {
         if (!engineIndexes.isEmpty()) {
             addKeepLoadedBatchAsync(world, engineIndexes);
         }
+        return engineIndexes.size();
     }
 
     /**

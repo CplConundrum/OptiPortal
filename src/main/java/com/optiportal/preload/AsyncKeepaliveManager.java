@@ -260,14 +260,20 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
                                 return;
                             }
                             for (String zoneId : owners) {
-                                getCacheManager().registerOwnershipBatch(
+                                int pinned = getCacheManager().registerOwnershipBatch(
                                         zoneId, worldName, List.of(new int[]{coord.cx, coord.cz}));
+                                // F3: per-zone pinning - registration only acquires a pin
+                                // when the zone is NEW to the chunk (pinned > 0). After an
+                                // engine eviction the reloaded chunk's per-instance
+                                // keep-loaded counter starts at zero, so every owner whose
+                                // registration acquired no pin must re-acquire exactly one
+                                // of its own: the counter must end with one pin per owner
+                                // to stay balanced with the per-zone release path
+                                // (deregistration decrements once per zone).
+                                if (pinned == 0) {
+                                    getCacheManager().reacquireKeepLoadedPin(worldName, coord.cx, coord.cz);
+                                }
                             }
-                            // F3: the ping re-loaded the chunk (its pin lapsed with the
-                            // eviction) - re-issue the keep-loaded request now that the
-                            // chunk is back in the store (the pre-store filter in
-                            // addKeepLoadedBatchAsync would have skipped an absent chunk).
-                            getCacheManager().reacquireKeepLoadedPin(worldName, coord.cx, coord.cz);
                             stats.succeeded.incrementAndGet();
                         } else {
                             stats.failed.incrementAndGet();
