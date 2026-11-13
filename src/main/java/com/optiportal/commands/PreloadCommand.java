@@ -80,7 +80,6 @@ public class PreloadCommand extends AbstractCommand {
             case "strategy"  -> handleStrategy(context, args);
             case "shape"     -> handleShape(context, args);
             case "radius"    -> handleRadius(context, args);
-            case "radiusxz"  -> handleRadiusXZ(context, args);
             case "activation"-> handleActivation(context, args);
             case "migrate"   -> handleMigrate(context, args);
             case "ram"       -> handleRam(context);
@@ -114,7 +113,6 @@ public class PreloadCommand extends AbstractCommand {
         reply(ctx, "  /preload strategy <id> <WARM|PREDICTIVE> — set strategy");
         reply(ctx, "  /preload shape <id> <ELLIPSOID|CYLINDER|BOX> — set activation shape");
         reply(ctx, "  /preload radius <id> <X> [Z] — set asymmetric radius (Z defaults to X)");
-        reply(ctx, "  /preload radiusxz <id> <rx> <rz> — set asymmetric radius (deprecated, use radius)");
         reply(ctx, "  /preload activation <id> <distance> — set per-zone horizontal activation distance");
         reply(ctx, "  /preload activation <id> reset — reset to global default");
         reply(ctx, "  /preload setwarm <id> [radius] — set WARM and preload now");
@@ -220,29 +218,6 @@ public class PreloadCommand extends AbstractCommand {
                 reply(ctx, "[OptiPortal] " + id + " radius → " + rx + "x" + rz + ". Reloading...");
             } else {
                 reply(ctx, "[OptiPortal] " + id + " radius → " + rx + "x" + rz + ".");
-            }
-            return CompletableFuture.<Void>completedFuture(null);
-        }).orElseGet(() -> { reply(ctx, "[OptiPortal] Portal '" + id + "' not found."); return done(); });
-    }
-
-    private CompletableFuture<Void> handleRadiusXZ(CommandContext ctx, String[] args) {
-        if (args.length < 4) { reply(ctx, "Usage: /preload radiusxz <id> <radiusX> <radiusZ>"); return done(); }
-        String id = args[1];
-        int rx, rz;
-        try { rx = Integer.parseInt(args[2]); rz = Integer.parseInt(args[3]); }
-        catch (NumberFormatException e) { reply(ctx, "[OptiPortal] Radii must be integers."); return done(); }
-        return plugin.getStorage().loadById(id).map(entry -> {
-            entry.setWarmRadius(-1);
-            entry.setWarmRadiusX(rx);
-            entry.setWarmRadiusZ(rz);
-            plugin.getStorage().save(entry);
-            if (entry.getStrategy() == com.optiportal.model.WarmStrategy.WARM) {
-                int cx = ChunkPreloader.toChunkCoord(entry.getX());
-                int cz = ChunkPreloader.toChunkCoord(entry.getZ());
-                plugin.getChunkPreloader().warmLoad(id, entry.getWorld(), cx, cz, rx, rz);
-                reply(ctx, "[OptiPortal] " + id + " radius → " + rx + "x" + rz + ". Reloading... (deprecated: use /preload radius).");
-            } else {
-                reply(ctx, "[OptiPortal] " + id + " radius → " + rx + "x" + rz + " (deprecated: use /preload radius).");
             }
             return CompletableFuture.<Void>completedFuture(null);
         }).orElseGet(() -> { reply(ctx, "[OptiPortal] Portal '" + id + "' not found."); return done(); });

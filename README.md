@@ -61,7 +61,6 @@ Running `/preload` with no arguments opens the native UI panel for players in-wo
 | `/preload strategy <id> <WARM\|PREDICTIVE>` | Change a zone strategy |
 | `/preload shape <id> <ELLIPSOID\|CYLINDER\|BOX>` | Override a zone's activation shape |
 | `/preload radius <id> <X> [Z]` | Set a zone radius, with optional separate Z radius |
-| `/preload radiusxz <id> <rx> <rz>` | Legacy asymmetric radius command; `radius` is preferred |
 | `/preload activation <id> <distance>` | Override horizontal activation distance for one zone |
 | `/preload activation <id> reset` | Reset per-zone activation distance |
 | `/preload setwarm <id> [radius]` | Force a zone to `WARM` and load it now |
