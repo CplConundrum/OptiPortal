@@ -593,7 +593,10 @@ class AsyncKeepaliveManagerTest {
         rec.runQueuedWorldTasks();
         assertEquals(0, pins(rec, idx(0, 0)),
                 "the execution-time check saw the lapsed stamp and left the new instance's counter untouched");
-        assertFalse(rec.hasLivePin("z1", "w1", 0, 0), "the stale stamp was cleared by the task");
+        // QC round-2 P3: noteChunkEvicted already made the old stamp non-live,
+        // so this assert documents liveness state, not physical stamp clearance
+        // (the discriminating behavior of this test is the counter assert above).
+        assertFalse(rec.hasLivePin("z1", "w1", 0, 0), "the lapsed stamp stays non-live across the drain");
     }
 
     @Test
@@ -617,6 +620,28 @@ class AsyncKeepaliveManagerTest {
     }
 
     @Test
+    void droppedReleaseTaskClearsStampOnNonDiagonalKey() throws Exception {
+        // QC round-2 P2: N3's (0,0) coordinate has identical engine and
+        // bookkeeping keys, so it cannot catch a fallback that clears the stamp
+        // under the WRONG (engine) key. Repeat the dropped-task scenario on the
+        // non-diagonal chunk (1,2), where the two key spaces differ - the
+        // fallback must clear under the bookkeeping key.
+        Set<Long> resident = new java.util.LinkedHashSet<>(java.util.Set.of(idx(1, 2)));
+        Fixture fx = new Fixture(resident);
+        ((RecordingCacheManager) fx.cm).presentChunks = resident;
+        fx.storage.save(zone("z1", 1, 2, 1));
+        fx.cm.setZoneTier("z1", CacheTier.HOT);
+        RecordingCacheManager rec = (RecordingCacheManager) fx.cm;
+        rec.registerOwnershipBatch("z1", "w1", List.of(new int[]{1, 2}));
+        assertEquals(1, pins(rec, idx(1, 2)), "precondition: one pin + live stamp on the non-diagonal chunk");
+        rec.rejectPinTasks = true;
+        fx.cm.releaseZoneChunks("z1"); // the decrement task is dropped
+        assertEquals(1, pins(rec, idx(1, 2)), "the dropped task did not decrement the counter");
+        assertFalse(rec.hasLivePin("z1", "w1", 1, 2),
+                "the caller-side fallback cleared the stamp under its bookkeeping key");
+    }
+
+    @Test
     void queuedReleaseThenReacquisitionEndsBalanced() throws Exception {
         // Goldfish battery (release-before-acquisition ordering): a release task
         // queued at deregistration, then a re-registration task, drained in
@@ -634,7 +659,16 @@ class AsyncKeepaliveManagerTest {
         fx.cm.deregisterAllChunks("z1"); // ownership gone; release task queued (held)
         rec.registerOwnershipBatch("z1", "w1", List.of(new int[]{0, 0})); // re-register; reg task queued (held)
         assertEquals(2, rec.queuedWorldTasks.size(), "release task + re-acquisition task are both held");
-        rec.runQueuedWorldTasks(); // queue order: release, then re-acquisition
+        // QC round-2 P2: drain the release ALONE first - a wholly ineffective
+        // release (no decrement AND no stamp clear) would leave the stamp live
+        // and let the re-acquisition skip, passing the final-only assertions.
+        Runnable releaseTask = rec.queuedWorldTasks.remove(0);
+        releaseTask.run();
+        assertEquals(0, pins(rec, idx(0, 0)),
+                "the queued release balanced the counter before the re-acquisition");
+        assertFalse(rec.hasLivePin("z1", "w1", 0, 0),
+                "the release cleared the stamp before the re-acquisition could skip it");
+        rec.runQueuedWorldTasks(); // now only the re-acquisition task
         assertEquals(1, pins(rec, idx(0, 0)),
                 "the release cleared the old pin and the re-acquisition pinned exactly once");
         assertTrue(rec.hasLivePin("z1", "w1", 0, 0), "the re-acquisition stamped the live pin");
@@ -644,8 +678,10 @@ class AsyncKeepaliveManagerTest {
     @Test
     void negativeXChunksDoNotShareOwnershipEntries() throws Exception {
         // Goldfish battery (negative-X packing): before the packChunkIndex mask
-        // fix, every cx<0 chunk collapsed onto a single pack key, merging the
-        // ownership/stamp entries of distinct negative-x chunks.
+        // fix, the sign-extended low word clobbered the cz half of the key for
+        // negative cx - for each fixed negative cx, all cz>=1 values aliased
+        // onto 0xFFFFFFFFFFFFFFFF and cz=0 values aliased across negative cx -
+        // merging the ownership/stamp entries of distinct negative-x chunks.
         Set<Long> resident = new java.util.LinkedHashSet<>(
                 java.util.Set.of(idx(-1, 0), idx(-1, 3)));
         Fixture fx = new Fixture(resident);

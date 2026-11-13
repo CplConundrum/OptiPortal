@@ -1263,9 +1263,12 @@ public class CacheManager {
      */
     private static long packChunkIndex(int cx, int cz) {
         // Mask AFTER the long cast: masking in int first and casting after
-        // sign-extends for negative coordinates (int -1 -> long 0xFFFFFFFFFFFFFFFF),
-        // which collapsed every cx<0 chunk onto one shared key and merged their
-        // ownership/stamp entries. The masked long form is injective for all int pairs.
+        // sign-extends for negative cx (e.g. cx=-2 -> long 0xFFFFFFFFFFFFFFFE),
+        // so the high 32 bits stayed 0xFFFFFFFF for every negative cx and the
+        // cz half was discarded - one shared key per negative cx across all
+        // cz values, merging their ownership/stamp entries (e.g. old (-1,0) and
+        // old (-1,3) both keyed 0xFFFFFFFFFFFFFFFF). The masked long form is
+        // injective for all int pairs.
         return (((long) cx) & 0xFFFFFFFFL) | ((((long) cz) & 0xFFFFFFFFL) << 32);
     }
 
