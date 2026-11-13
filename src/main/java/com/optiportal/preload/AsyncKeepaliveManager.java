@@ -24,6 +24,7 @@ import com.optiportal.cache.CacheManager;
 import com.optiportal.config.PluginConfig;
 import com.optiportal.model.CacheTier;
 import com.optiportal.model.PortalEntry;
+import com.optiportal.model.PortalRadii;
 import com.optiportal.storage.StorageBackend;
 
 /**
@@ -182,8 +183,8 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
             String worldName = entry.getWorld();
             int cx = ChunkPreloader.toChunkCoord(entry.getX());
             int cz = ChunkPreloader.toChunkCoord(entry.getZ());
-            int radiusX = resolveRadiusX(entry);
-            int radiusZ = resolveRadiusZ(entry);
+            int radiusX = PortalRadii.resolveRadiusX(entry, getConfig().getDefaultWarmRadius());
+            int radiusZ = PortalRadii.resolveRadiusZ(entry, getConfig().getDefaultWarmRadius());
 
             if (tier == CacheTier.HOT) {
                 hotCandidates.computeIfAbsent(worldName, k -> new ArrayList<>())

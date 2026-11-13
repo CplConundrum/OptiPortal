@@ -34,6 +34,7 @@ import com.optiportal.OptiPortal;
 import com.optiportal.config.PluginConfig;
 import com.optiportal.integrations.GravestoneIntegration;
 import com.optiportal.model.PortalEntry;
+import com.optiportal.model.PortalRadii;
 import com.optiportal.model.WarmStrategy;
 import com.optiportal.player.DeathLocationTracker;
 import com.optiportal.player.RespawnTracker;
@@ -423,7 +424,7 @@ public class TeleportInterceptor {
                     recordCooldown(null, normalizedZone);
                     int cx = ChunkPreloader.toChunkCoord(entry.getX());
                     int cz = ChunkPreloader.toChunkCoord(entry.getZ());
-                    int radius = resolveRadius(entry);
+                    int radius = PortalRadii.resolveRadius(entry, config.getPredictiveRadius());
                     LOG.fine(() -> "[OptiPortal] Zone discovery trigger: " + normalizedZone
                             + " → predictive load cx=" + cx + " cz=" + cz + " r=" + radius);
                     triggerPredictiveLoad(normalizedZone, entry.getWorld(), cx, cz, radius, null);
@@ -462,7 +463,7 @@ public class TeleportInterceptor {
                         int cz = ChunkPreloader.toChunkCoord(entry.getZ());
                         LOG.fine(() -> "[OptiPortal] Zone discovery trigger (raw): " + zoneName
                                 + " → predictive load cx=" + cx + " cz=" + cz);
-                        triggerPredictiveLoad(zoneName, entry.getWorld(), cx, cz, resolveRadius(entry), null);
+                        triggerPredictiveLoad(zoneName, entry.getWorld(), cx, cz, PortalRadii.resolveRadius(entry, config.getPredictiveRadius()), null);
                         matched = true;
                     }
                 } else if (!entry.isInstanced() && entry.getStrategy() == WarmStrategy.WARM) {
@@ -824,7 +825,7 @@ public class TeleportInterceptor {
             String id = entry.getId();
             int cx = ChunkPreloader.toChunkCoord(entry.getX());
             int cz = ChunkPreloader.toChunkCoord(entry.getZ());
-            int radius = resolveRadius(entry);
+            int radius = PortalRadii.resolveRadius(entry, config.getPredictiveRadius());
 
             if (entry.getStrategy() == WarmStrategy.WARM) {
                 // WARM: no cooldown — tier promotion is a cheap map write
@@ -871,7 +872,7 @@ public class TeleportInterceptor {
                     storage.loadById(linkedId).ifPresent(linked -> {
                         int lcx = ChunkPreloader.toChunkCoord(linked.getX());
                         int lcz = ChunkPreloader.toChunkCoord(linked.getZ());
-                        int lradius = resolveRadius(linked);
+                        int lradius = PortalRadii.resolveRadius(linked, config.getPredictiveRadius());
                         LOG.fine(() -> "[OptiPortal] Linked preload: " + linkedId
                             + " (linked to " + id + ") cx=" + lcx + " cz=" + lcz);
                         predictiveLoadWithRam(linkedId, linked.getWorld(), lcx, lcz, lradius);
@@ -945,7 +946,7 @@ public class TeleportInterceptor {
         if (!shouldFire) return;
         int cx = ChunkPreloader.toChunkCoord(destEntry.getX());
         int cz = ChunkPreloader.toChunkCoord(destEntry.getZ());
-        int radius = resolveRadius(destEntry);
+        int radius = PortalRadii.resolveRadius(destEntry, config.getPredictiveRadius());
         final PortalEntry logEntry = destEntry;
         final double logDist = Math.sqrt(bestDistSq);
         LOG.fine(() -> "[OptiPortal] Reverse preload destination: " + logEntry.getId()
@@ -1556,11 +1557,6 @@ public class TeleportInterceptor {
         if (playerId == null) return;
         cooldowns.computeIfAbsent(playerId, k -> new ConcurrentHashMap<>())
                  .put(zoneId, System.currentTimeMillis());
-    }
-
-    private int resolveRadius(PortalEntry entry) {
-        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
-        return config.getPredictiveRadius();
     }
 
     // -------------------------------------------------------------------------

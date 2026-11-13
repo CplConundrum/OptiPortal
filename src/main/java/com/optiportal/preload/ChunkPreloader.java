@@ -715,26 +715,6 @@ public class ChunkPreloader {
         return list;
     }
 
-    /**
-     * Resolve X-axis radius from entry, falling back to uniform radius then config default.
-     * Protected for subclass access.
-     */
-    protected int resolveRadiusX(com.optiportal.model.PortalEntry entry) {
-        if (entry.getWarmRadiusX() != null) return entry.getWarmRadiusX();
-        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
-        return config.getDefaultWarmRadius();
-    }
-
-    /**
-     * Resolve Z-axis radius from entry, falling back to uniform radius then config default.
-     * Protected for subclass access.
-     */
-    protected int resolveRadiusZ(com.optiportal.model.PortalEntry entry) {
-        if (entry.getWarmRadiusZ() != null) return entry.getWarmRadiusZ();
-        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
-        return config.getDefaultWarmRadius();
-    }
-
     /** Issue async load requests for every coord and return a future over all of them. */
     private CompletableFuture<Void> loadChunks(World world, List<int[]> coords, boolean nonTicking, String zoneId) {
         if (coords.isEmpty()) return CompletableFuture.completedFuture(null);

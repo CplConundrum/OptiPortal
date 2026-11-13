@@ -12,6 +12,7 @@ import com.optiportal.cache.CacheManager;
 import com.optiportal.config.PluginConfig;
 import com.optiportal.model.CacheTier;
 import com.optiportal.model.PortalEntry;
+import com.optiportal.model.PortalRadii;
 import com.optiportal.storage.StorageBackend;
 
 /**
@@ -152,8 +153,8 @@ public class KeepaliveManager {
 
             int cx = ChunkPreloader.toChunkCoord(entry.getX());
             int cz = ChunkPreloader.toChunkCoord(entry.getZ());
-            int radiusX = resolveRadiusX(entry);
-            int radiusZ = resolveRadiusZ(entry);
+            int radiusX = PortalRadii.resolveRadiusX(entry, config.getDefaultWarmRadius());
+            int radiusZ = PortalRadii.resolveRadiusZ(entry, config.getDefaultWarmRadius());
             chunkCount += (2 * radiusX + 1) * (2 * radiusZ + 1);
             zoneCount++;
 
@@ -204,33 +205,4 @@ public class KeepaliveManager {
         }
     }
 
-    /**
-     * Resolve X-axis radius from entry, falling back to uniform radius then config default.
-     * Protected for subclass access.
-     */
-    protected int resolveRadiusX(PortalEntry entry) {
-        if (entry.getWarmRadiusX() != null) return entry.getWarmRadiusX();
-        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
-        return config.getDefaultWarmRadius();
-    }
-
-    /**
-     * Resolve Z-axis radius from entry, falling back to uniform radius then config default.
-     * Protected for subclass access.
-     */
-    protected int resolveRadiusZ(PortalEntry entry) {
-        if (entry.getWarmRadiusZ() != null) return entry.getWarmRadiusZ();
-        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
-        return config.getDefaultWarmRadius();
-    }
-
-    /**
-     * Resolve radius from entry, falling back to config default.
-     * Deprecated — use resolveRadiusX/resolveRadiusZ for asymmetric support.
-     */
-    @Deprecated
-    private int resolveRadius(PortalEntry entry) {
-        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
-        return config.getDefaultWarmRadius();
-    }
 }

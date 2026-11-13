@@ -24,6 +24,7 @@ import com.optiportal.config.PluginConfig;
 import com.optiportal.integrations.GravestoneIntegration;
 import com.optiportal.model.CacheTier;
 import com.optiportal.model.PortalEntry;
+import com.optiportal.model.PortalRadii;
 import com.optiportal.player.DeathLocationTracker;
 import com.optiportal.player.RespawnTracker;
 import com.optiportal.preload.ChunkPreloader;
@@ -137,11 +138,6 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
         getCooldowns()
                 .computeIfAbsent(playerId, k -> new ConcurrentHashMap<>())
                 .put(zoneId, System.currentTimeMillis());
-    }
-    
-    protected int resolveRadius(PortalEntry entry) {
-        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
-        return getConfig().getPredictiveRadius();
     }
     
     /**
@@ -386,7 +382,7 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
                                 linkedId, linked.getWorld(),
                                 ChunkPreloader.toChunkCoord(linked.getX()),
                                 ChunkPreloader.toChunkCoord(linked.getZ()),
-                                resolveRadius(linked)),
+                                PortalRadii.resolveRadius(linked, getConfig().getPredictiveRadius())),
                             AsyncMetrics.AsyncTaskPriority.HIGH)
                         .whenComplete((r, ex) -> {
                             if (ex != null)
@@ -542,7 +538,7 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
                 portal,
                 ChunkPreloader.toChunkCoord(portal.getX()),
                 ChunkPreloader.toChunkCoord(portal.getZ()),
-                resolveRadius(portal)),
+                PortalRadii.resolveRadius(portal, getConfig().getPredictiveRadius())),
         AsyncMetrics.AsyncTaskPriority.HIGH)
         .whenComplete((result, ex) -> {
             if (ex != null) {

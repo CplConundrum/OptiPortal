@@ -25,6 +25,7 @@ import com.optiportal.cache.CacheManager;
 import com.optiportal.config.PluginConfig;
 import com.optiportal.model.CacheTier;
 import com.optiportal.model.PortalEntry;
+import com.optiportal.model.PortalRadii;
 import com.optiportal.model.WarmStrategy;
 import com.optiportal.storage.StorageBackend;
 
@@ -349,8 +350,8 @@ public class WarmZoneManager {
 
         int cx     = ChunkPreloader.toChunkCoord(entry.getX());
         int cz     = ChunkPreloader.toChunkCoord(entry.getZ());
-        int radiusX = resolveRadiusX(entry);
-        int radiusZ = resolveRadiusZ(entry);
+        int radiusX = PortalRadii.resolveRadiusX(entry, config.getDefaultWarmRadius());
+        int radiusZ = PortalRadii.resolveRadiusZ(entry, config.getDefaultWarmRadius());
 
         LOG.fine(() -> "[OptiPortal] Loading WARM zone: " + entry.getId()
                 + " world=" + entry.getWorld()
@@ -545,31 +546,6 @@ public class WarmZoneManager {
         snapshot.stream()
                 .filter(e -> e.getStrategy() == WarmStrategy.WARM)
                 .forEach(e -> cacheManager.setZoneTier(e.getId(), CacheTier.COLD));
-    }
-
-    private int resolveRadius(PortalEntry entry) {
-        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
-        return config.getDefaultWarmRadius();
-    }
-
-    /**
-     * Resolve X-axis radius from entry, falling back to uniform radius then config default.
-     * Private to match existing resolveRadius pattern in this class.
-     */
-    private int resolveRadiusX(PortalEntry entry) {
-        if (entry.getWarmRadiusX() != null) return entry.getWarmRadiusX();
-        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
-        return config.getDefaultWarmRadius();
-    }
-
-    /**
-     * Resolve Z-axis radius from entry, falling back to uniform radius then config default.
-     * Private to match existing resolveRadius pattern in this class.
-     */
-    private int resolveRadiusZ(PortalEntry entry) {
-        if (entry.getWarmRadiusZ() != null) return entry.getWarmRadiusZ();
-        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
-        return config.getDefaultWarmRadius();
     }
 
     public Map<String, PortalEntry> getManagedZones() {
