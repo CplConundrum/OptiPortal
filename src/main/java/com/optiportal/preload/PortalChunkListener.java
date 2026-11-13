@@ -1,5 +1,6 @@
 package com.optiportal.preload;
 
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 
@@ -174,39 +175,61 @@ public class PortalChunkListener {
         }
         if (device == null) return;
 
+        // Engine-bound work stays on the world thread: capture plain values and
+        // run the rare, one-shot destination-world scan (BlockModule reads).
+        final UUID destUuid = device.getDestinationWorldUuid();
+        final String worldName = world.getName();
+        final boolean canUnload = world.getWorldConfig().canUnloadChunks();
+        if (device.getDestinationWorld() != null) {
+            warmZoneManager.scanWorldForPortalDestination(device.getDestinationWorld());
+        }
+
+        // Off-thread bookkeeping: entryCache/reverseIndex/storage/markNoDecay.
+        executor.execute(() ->
+                registerPortalDeviceZoneBookkeeping(worldName, chunkX, chunkZ, destUuid, canUnload));
+    }
+
+    /**
+     * Off-thread bookkeeping for auto-registered PortalDevice zones (dispatched
+     * from autoRegisterPortalDevice on the plugin executor). Pure
+     * entryCache/reverseIndex/storage/cacheManager work — no engine calls.
+     * Package-private for tests.
+     */
+    void registerPortalDeviceZoneBookkeeping(String worldName, int chunkX, int chunkZ,
+                                              UUID destUuid, boolean canUnload) {
         // Chunk center in world coordinates (Hytale chunks are 32x32 blocks)
         double worldX = chunkX * 32.0 + 16.0;
         double worldZ = chunkZ * 32.0 + 16.0;
 
-        String zoneId = "portaldevice:" + world.getName() + ":" + chunkX + ":" + chunkZ;
+        String zoneId = "portaldevice:" + worldName + ":" + chunkX + ":" + chunkZ;
 
         // If already registered, backfill destination UUID if not yet persisted
         PortalEntry existingEntry = entryCache.get(zoneId);
         if (existingEntry != null) {
-            if (existingEntry.getDestinationWorldUuid() == null && device.getDestinationWorldUuid() != null) {
-                existingEntry.setDestinationWorldUuid(device.getDestinationWorldUuid());
+            if (existingEntry.getDestinationWorldUuid() == null && destUuid != null) {
+                existingEntry.setDestinationWorldUuid(destUuid);
                 entryCache.put(zoneId, existingEntry);
-                executor.execute(() -> storage.save(existingEntry));
+                storage.save(existingEntry);
                 LOG.fine(() -> "[OptiPortal] Backfilled destination UUID for existing zone: " + zoneId);
             }
             return;
         }
 
-        PortalEntry entry = new PortalEntry(zoneId, world.getName(), worldX, 64.0, worldZ, 0);
+        PortalEntry entry = new PortalEntry(zoneId, worldName, worldX, 64.0, worldZ, 0);
         entry.setStrategy(WarmStrategy.PREDICTIVE);
         entry.setType(PortalEntry.EntryType.MANUAL);
-        if (device.getDestinationWorldUuid() != null) {
-            entry.setDestinationWorldUuid(device.getDestinationWorldUuid());
+        if (destUuid != null) {
+            entry.setDestinationWorldUuid(destUuid);
         }
         entryCache.put(zoneId, entry);
-        executor.execute(() -> storage.save(entry));
+        storage.save(entry);
 
         // Keep reverse index in sync with new auto-registered zone (full footprint, not just centre)
         int defaultRadius = config.getDefaultWarmRadius();
         int rx = entry.resolvedRadiusX(defaultRadius);
         int rz = entry.resolvedRadiusZ(defaultRadius);
         ConcurrentHashMap<Long, String> worldIdx =
-                reverseIndex.computeIfAbsent(world.getName(), k -> new ConcurrentHashMap<>());
+                reverseIndex.computeIfAbsent(worldName, k -> new ConcurrentHashMap<>());
         for (int dx = -rx; dx <= rx; dx++) {
             for (int dz = -rz; dz <= rz; dz++) {
                 worldIdx.putIfAbsent(packChunk(chunkX + dx, chunkZ + dz), zoneId);
@@ -214,19 +237,20 @@ public class PortalChunkListener {
         }
 
         // Exempt from decay if this portal's world is eternal
-        if (!world.getWorldConfig().canUnloadChunks()) {
+        if (!canUnload) {
             cacheManager.markNoDecay(zoneId);
         }
 
         LOG.info(() -> "[OptiPortal] Auto-registered PortalDevice zone: " + zoneId
                 + " at chunk (" + chunkX + ", " + chunkZ + ")");
-
-        // If the destination world is live, also register its spawn point
-        if (device.getDestinationWorld() != null) {
-            warmZoneManager.scanWorldForPortalDestination(device.getDestinationWorld());
-        }
     }
 
+    // Test accessors (package-private)
+    PortalEntry entryCacheLookup(String zoneId) { return entryCache.get(zoneId); }
+    String reverseIndexLookup(String worldName, long chunkKey) {
+        ConcurrentHashMap<Long, String> idx = reverseIndex.get(worldName);
+        return idx == null ? null : idx.get(chunkKey);
+    }
     /**
      * When any chunk loads, check if its position matches a chunk in a registered
      * zone and promote COLD/UNVISITED zones to WARM. Also reads the PortalDevice

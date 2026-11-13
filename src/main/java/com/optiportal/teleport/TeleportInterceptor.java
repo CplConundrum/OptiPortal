@@ -100,6 +100,13 @@ public class TeleportInterceptor {
     private final ConcurrentHashMap<UUID, Long> lastSeenTeleportNanos = new ConcurrentHashMap<>();
     /** Tracks player's last known position before teleport for origin portal detection */
     private final ConcurrentHashMap<UUID, double[]> lastKnownPosition = new ConcurrentHashMap<>();
+    // Off-thread poll pass: per-poll transform snapshots captured by one world
+    // task per world, processed on the executor (see pollTeleportRecords).
+    final java.util.concurrent.ConcurrentHashMap<UUID, TransformSnap> transformSnaps =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.atomic.AtomicLong pollCycle =
+            new java.util.concurrent.atomic.AtomicLong();
+    protected final java.util.Set<World> pollWorlds = new java.util.HashSet<>();
     /** Last position that actually triggered a proximity scan; used to skip tiny no-op movement. */
     private final ConcurrentHashMap<UUID, double[]> lastProximityCheckPosition = new ConcurrentHashMap<>();
     /** Last wall-clock time a proximity scan actually ran for this player. */
@@ -487,141 +494,219 @@ public class TeleportInterceptor {
      * Detects walk-through portal teleports that fire no player-facing event.
      */
     protected void pollTeleportRecords() {
-        // getComponent must be called on the world tick thread.
-        // Submit the read to the world via World.execute(Runnable).
+        if (playerRefs.isEmpty()) return;
+        final long cycle = pollCycle.incrementAndGet();
         for (java.util.Map.Entry<UUID, PlayerRef> entry : playerRefs.entrySet()) {
             UUID uuid = entry.getKey();
             PlayerRef pRef = entry.getValue();
             try {
-                World world = chunkPreloader.getWorldRegistry().getWorldForPlayer(pRef);
-                if (world == null) {
+                if (!ensureTrackedWorld(pRef)) {
                     // Player is no longer in any world — clean up stale ref
-                    playerRefs.remove(uuid);
-                    lastSeenTeleportNanos.remove(uuid);
-                    lastKnownPosition.remove(uuid);
-                    cooldowns.remove(uuid);
+                    cleanupStalePlayer(uuid);
                     continue;
                 }
-                final World w = world;
-                w.execute(() -> {
-                    try {
-                        // ── Teleport detection ─────────────────────────────
-                        TeleportRecord record = pRef.getComponent(TeleportRecord.getComponentType());
-                        if (record != null) {
-                            TeleportRecord.Entry last = record.getLastTeleport();
-                            if (last != null) {
-                                long ts = last.timestampNanos();
-                                Long prev = lastSeenTeleportNanos.get(uuid);
-                                if (prev == null || prev != ts) {
-                                    lastSeenTeleportNanos.put(uuid, ts);
-                                    long ageNanos = System.nanoTime() - ts;
-                                    if (ageNanos <= 3_000_000_000L) {
-                                        Location dest = last.destination();
-                                        if (dest != null) {
-                                            String destWorld = dest.getWorld();
-                                            // Same-world teleports omit the world name in TeleportRecord
-                                            if (destWorld == null) destWorld = w.getName();
-                                            org.joml.Vector3d pos = dest.getPosition();
-                                            if (pos != null) {
-                                                final String dw = destWorld;
-                                                final double dx = pos.x, dy = pos.y, dz = pos.z;
-                                                final UUID fUuid = uuid;
-                                                // Snapshot pre-teleport position for origin portal lookup
-                                                final double[] prePos = lastKnownPosition.get(fUuid);
-                                                // Compute source world before entering executor lambda
-                                                final String sourceWorld = dw.equals(w.getName()) ? dw : w.getName();
-                                                executor.execute(() -> {
-                                                    // Guard against post-shutdown execution
-                                                    if (plugin.isShuttingDown()) return;
-                                                    
-                                                    LOG.fine(() -> "[OptiPortal] Poll teleport → "
-                                                        + dx + "," + dy + "," + dz + " world=" + dw);
-                                                    lingerOriginZone(fUuid, sourceWorld);
-                                                    checkProximityAndPreload(fUuid, dw, dx, dy, dz);
-                                                    // Derive origin portal from pre-teleport position
-                                                    String originId = prePos != null
-                                                        ? findNearestPortal(sourceWorld, prePos[0], prePos[1], prePos[2])
-                                                        : null;
-                                                    // Pass prePos directly — by the time this executor task
-                                                    // runs, lastKnownPosition may already hold the destination
-                                                    reversePreloadOrigin(fUuid, originId, sourceWorld, dw, dx, dy, dz, prePos);
-                                                });
-                                            }
-                                        }
+                final String worldName = trackedWorldNameFor(pRef);
+                // ── Teleport detection (fully off-thread) ─                         
+                // getComponentConcurrent is concurrent-safe (Holder.getComponent holds
+                // a StampedLock read lock — verified against 0.7.7 bytecode), so this
+                // read no longer needs a world.execute task: detection runs on the
+                // scheduler thread. (getTransform() returns a live, world-mutated
+                // object, so the position read below stays world-bound but is batched
+                // to one world task per world per poll.)
+                TeleportRecord record = readTeleportRecordConcurrent(pRef);
+                if (record != null) {
+                    TeleportRecord.Entry last = record.getLastTeleport();
+                    if (last != null) {
+                        long ts = last.timestampNanos();
+                        Long prev = lastSeenTeleportNanos.get(uuid);
+                        if (prev == null || prev != ts) {
+                            lastSeenTeleportNanos.put(uuid, ts);
+                            long ageNanos = System.nanoTime() - ts;
+                            if (ageNanos <= 3_000_000_000L) {
+                                Location dest = last.destination();
+                                if (dest != null) {
+                                    String destWorld = dest.getWorld();
+                                    // Same-world teleports omit the world name in TeleportRecord
+                                    if (destWorld == null) destWorld = worldName;
+                                    org.joml.Vector3d pos = dest.getPosition();
+                                    if (pos != null) {
+                                        final String dw = destWorld;
+                                        final double dx = pos.x, dy = pos.y, dz = pos.z;
+                                        final UUID fUuid = uuid;
+                                        // Snapshot pre-teleport position for origin portal lookup
+                                        final double[] prePos = lastKnownPosition.get(fUuid);
+                                        // Compute source world before entering executor lambda
+                                        final String sourceWorld = dw.equals(worldName) ? dw : worldName;
+                                        executor.execute(() -> {
+                                            // Guard against post-shutdown execution
+                                            if (plugin != null && plugin.isShuttingDown()) return;
+
+                                            LOG.fine(() -> "[OptiPortal] Poll teleport →  "
+                                                + dx + "," + dy + "," + dz + " world=" + dw);
+                                            lingerOriginZone(fUuid, sourceWorld);
+                                            checkProximityAndPreload(fUuid, dw, dx, dy, dz);
+                                            // Derive origin portal from pre-teleport position
+                                            String originId = prePos != null
+                                                ? findNearestPortal(sourceWorld, prePos[0], prePos[1], prePos[2])
+                                                : null;
+                                            // Pass prePos directly — by the time this executor task
+                                            // runs, lastKnownPosition may already hold the destination
+                                            reversePreloadOrigin(fUuid, originId, sourceWorld, dw, dx, dy, dz, prePos);
+                                        });
                                     }
                                 }
                             }
                         }
-
-                        // ── Position poll (every tick) ──────────────────────
-                        // Runs unconditionally so WARM zones promote HOT as
-                        // the player walks toward them, no teleport required.
-                        com.hypixel.hytale.math.vector.Transform transform = pRef.getTransform();
-                        if (transform != null && transform.getPosition() != null) {
-                            final String curWorld = w.getName();
-                            final double cx = transform.getPosition().x;
-                            final double cy = transform.getPosition().y;
-                            final double cz = transform.getPosition().z;
-
-                            // ── Position-jump detection ──────────────────────
-                            // adventure.teleporter same-world portals may not update TeleportRecord.
-                            // A jump > 16 blocks between poll cycles cannot be normal movement,
-                            // so it reliably signals a same-world teleport.
-                            // srcPos is captured here before lastKnownPosition is overwritten.
-                            double[] prevPos = lastKnownPosition.get(uuid);
-                            if (prevPos != null) {
-                                double jumpSq = (cx - prevPos[0]) * (cx - prevPos[0])
-                                              + (cz - prevPos[2]) * (cz - prevPos[2]);
-                                if (jumpSq > 1024.0) { // > 32 blocks
-                                    final double srcX = prevPos[0], srcZ = prevPos[2];
-                                    final double dstX = cx, dstZ = cz;
-                                    final String jWorld = curWorld;
-                                    executor.execute(() -> {
-                                        // Guard against post-shutdown execution
-                                        if (plugin.isShuttingDown()) return;
-                                        
-                                        // Use spatial-index candidate lookup instead of full-world scan
-                                        PortalEntry best = null;
-                                        double bestDist = config.getActivationDistance() * 2;
-                                        double bestDistSq = bestDist * bestDist;
-                                        List<PortalEntry> candidates = getNearbyPlainPortalCandidates(jWorld, dstX, dstZ, bestDist);
-
-                                        for (PortalEntry pe : candidates) {
-                                            double dx = pe.getX() - dstX;
-                                            double dz = pe.getZ() - dstZ;
-                                            double dSq = dx * dx + dz * dz;
-                                            if (dSq < bestDistSq) {
-                                                bestDistSq = dSq;
-                                                best = pe;
-                                            }
-                                        }
-                                        if (best != null) {
-                                            final PortalEntry fBest = best;
-                                            learnPortalHotspot(jWorld, srcX, srcZ, fBest.getId());
-                                        } else {
-                                            LOG.fine(() -> "[OptiPortal] Jump detected but no zone"
-                                                    + " near (" + (int)dstX + ", " + (int)dstZ
-                                                    + ") in " + jWorld + " within "
-                                                    + (config.getActivationDistance() * 2) + " blocks");
-                                        }
-                                    });
-                                }
-                            }
-
-                            // Save position for origin detection on next teleport.
-                            // Routine proximity checks are handled exclusively by the
-                            // staggered scheduler — do not duplicate them here.
-                            lastKnownPosition.put(uuid, new double[]{cx, cy, cz});
-                        }
-                    } catch (Exception e) {
-                        LOG.warning(() -> "[OptiPortal] poll error: " + e);
                     }
-                });
+                }
             } catch (Exception e) {
-                // ignore
+                LOG.warning(() -> "[OptiPortal] poll error: " + e);
             }
         }
+        // ── Position poll (every poll) ─                                 
+        // Runs unconditionally so WARM zones promote HOT as the player walks
+        // toward them, no teleport required. One world task per world per poll
+        // captures transforms; jump detection + position bookkeeping run on
+        // the executor afterwards.
+        for (World w : snapshotDispatchWorlds()) {
+            dispatchTransformSnapshot(w, cycle);
+        }
     }
+
+    /**
+     * Seams for the off-thread poll (used by TeleportInterceptorOffThreadPollTest).
+     * Production bodies keep the engine calls; tests override the engine-free
+     * surface.
+     */
+
+    /** World lookup + poll-set registration. False = no live world (stale ref). */
+    protected boolean ensureTrackedWorld(PlayerRef pRef) {
+        World world = chunkPreloader.getWorldRegistry().getWorldForPlayer(pRef);
+        if (world == null) return false;
+        pollWorlds.add(world);
+        return true;
+    }
+
+    /** Live world name for a tracked player (null if no world). */
+    protected String trackedWorldNameFor(PlayerRef pRef) {
+        World w = chunkPreloader.getWorldRegistry().getWorldForPlayer(pRef);
+        return w == null ? null : w.getName();
+    }
+
+    /** Stale-ref cleanup for players with no live world. */
+    protected void cleanupStalePlayer(UUID uuid) {
+        playerRefs.remove(uuid);
+        lastSeenTeleportNanos.remove(uuid);
+        lastKnownPosition.remove(uuid);
+        cooldowns.remove(uuid);
+    }
+
+    /** Concurrent-safe TeleportRecord read (engine getComponentConcurrent). */
+    protected TeleportRecord readTeleportRecordConcurrent(PlayerRef pRef) {
+        return pRef.getComponentConcurrent(TeleportRecord.getComponentType());
+    }
+
+    /** Snapshot-dispatch set for this poll (drained exactly once). */
+    protected java.util.Set<World> snapshotDispatchWorlds() {
+        java.util.Set<World> out = new java.util.HashSet<>(pollWorlds);
+        pollWorlds.clear();
+        return out;
+    }
+
+    /**
+     * One world task per world per poll: capture player transforms (the only
+     * world-bound read left in the poll), then run the off-thread snapshot
+     * processing once the capture completes.
+     */
+    protected void dispatchTransformSnapshot(World world, long cycle) {
+        java.util.concurrent.CompletableFuture<Void> done = new java.util.concurrent.CompletableFuture<>();
+        world.execute(() -> {
+            try {
+                for (PlayerRef ref : world.getPlayerRefs()) {
+                    if (ref == null || ref.getUuid() == null) continue;
+                    com.hypixel.hytale.math.vector.Transform t = ref.getTransform();
+                    if (t == null || t.getPosition() == null) continue;
+                    org.joml.Vector3d p = t.getPosition();
+                    transformSnaps.put(ref.getUuid(), new TransformSnap(p.x, p.y, p.z, world.getName(), cycle));
+                }
+            } finally {
+                done.complete(null);
+            }
+        });
+        done.whenComplete((v, e) -> executor.execute(() -> processPositionSnapshots(cycle)));
+    }
+
+    /**
+     * Off-thread position-jump detection + position bookkeeping for the current
+     * poll cycle. Skips players with no fresh snapshot (stale cycle = no capture
+     * this poll, e.g. the world task was dropped during world shutdown).
+     */
+    void processPositionSnapshots(long cycle) {
+        for (UUID uuid : playerRefs.keySet()) {
+            TransformSnap snap = transformSnaps.get(uuid);
+            if (snap == null || snap.cycle != cycle) continue;
+            double cx = snap.x, cy = snap.y, cz = snap.z;
+            double[] prevPos = lastKnownPosition.get(uuid);
+            if (prevPos != null) {
+                double jumpSq = (cx - prevPos[0]) * (cx - prevPos[0])
+                              + (cz - prevPos[2]) * (cz - prevPos[2]);
+                if (jumpSq > 1024.0) { // > 32 blocks
+                    final double srcX = prevPos[0], srcZ = prevPos[2];
+                    final double dstX = cx, dstZ = cz;
+                    final String jWorld = snap.worldName;
+                    executor.execute(() -> {
+                        // Guard against post-shutdown execution
+                        if (plugin != null && plugin.isShuttingDown()) return;
+
+                        // Use spatial-index candidate lookup instead of full-world scan
+                        PortalEntry best = null;
+                        double bestDist = config.getActivationDistance() * 2;
+                        double bestDistSq = bestDist * bestDist;
+                        List<PortalEntry> candidates = getNearbyPlainPortalCandidates(jWorld, dstX, dstZ, bestDist);
+
+                        for (PortalEntry pe : candidates) {
+                            double dx = pe.getX() - dstX;
+                            double dz = pe.getZ() - dstZ;
+                            double dSq = dx * dx + dz * dz;
+                            if (dSq < bestDistSq) {
+                                bestDistSq = dSq;
+                                best = pe;
+                            }
+                        }
+                        if (best != null) {
+                            final PortalEntry fBest = best;
+                            learnPortalHotspot(jWorld, srcX, srcZ, fBest.getId());
+                        } else {
+                            LOG.fine(() -> "[OptiPortal] Jump detected but no zone"
+                                    + " near (" + (int)dstX + ", " + (int)dstZ
+                                    + ") in " + jWorld + " within "
+                                    + (config.getActivationDistance() * 2) + " blocks");
+                        }
+                    });
+                }
+            }
+            // Save position for origin detection on next teleport.
+            // Routine proximity checks are handled exclusively by the
+            // staggered scheduler — do not duplicate them here.
+            lastKnownPosition.put(uuid, new double[]{cx, cy, cz});
+        }
+    }
+
+    /** One poll-cycle transform snapshot captured on the world thread. */
+    static final class TransformSnap {
+        final double x, y, z;
+        final String worldName;
+        final long cycle;
+        TransformSnap(double x, double y, double z, String worldName, long cycle) {
+            this.x = x; this.y = y; this.z = z;
+            this.worldName = worldName;
+            this.cycle = cycle;
+        }
+    }
+
+    // Test accessors (package-private)
+    Long lastSeenTeleportNanosFor(UUID uuid) { return lastSeenTeleportNanos.get(uuid); }
+    double[] lastKnownPositionFor(UUID uuid) { return lastKnownPosition.get(uuid); }
 
     private void onAddPlayerToWorld(AddPlayerToWorldEvent event) {
         // Guard against post-shutdown execution
@@ -1290,35 +1375,45 @@ public class TeleportInterceptor {
         if (playerRef == null) {
             return; // Player ref missing — skip
         }
-
         try {
             World world = chunkPreloader.getWorldRegistry().getWorldForPlayer(playerRef);
             if (world == null) {
                 return; // Missing world — skip
             }
-
-            // Mirror the thread-safety model of pollTeleportRecords: read getTransform()
-            // only on the world execution path, never from the scheduler thread.
+            // Off-thread pass: the world task shrinks to the live-Transform read
+            // (getTransform() returns a world-mutated object — the only
+            // world-bound work left); the skip check + proximity work run on the
+            // executor.
             world.execute(() -> {
                 com.hypixel.hytale.math.vector.Transform transform = playerRef.getTransform();
-                final String curWorld = world.getName();
-                final double cx = transform.getPosition().x;
-                final double cy = transform.getPosition().y;
-                final double cz = transform.getPosition().z;
-
-                // Use existing skip logic based on last scan time and movement thresholds
-                if (!shouldRunProximityCheck(playerUuid, cx, cy, cz)) return;
-
-                // Submit to executor for actual proximity check
-                executor.execute(() -> {
-                    if (plugin.isShuttingDown()) return;
-                    checkProximityAndPreload(playerUuid, curWorld, cx, cy, cz);
-                });
+                if (transform == null || transform.getPosition() == null) return;
+                onProximityTransformCaptured(playerUuid, world.getName(),
+                        transform.getPosition().x,
+                        transform.getPosition().y,
+                        transform.getPosition().z);
             });
         } catch (Exception e) {
             // Log but don't fail the batch
             LOG.warning(() -> "[OptiPortal] Error processing player proximity for " + playerUuid + ": " + e.getMessage());
         }
+    }
+
+    /**
+     * Post-capture proximity work (off-thread). The staggered proximity path now
+     * contains no world-thread work beyond the transform capture above.
+     */
+    protected void onProximityTransformCaptured(UUID playerUuid, String worldName,
+                                                 double cx, double cy, double cz) {
+        executor.execute(() -> {
+            if (plugin != null && plugin.isShuttingDown()) return;
+            if (!shouldRunProximityCheck(playerUuid, cx, cy, cz)) return;
+            performProximityCheck(playerUuid, worldName, cx, cy, cz);
+        });
+    }
+
+    /** Proximity-check dispatch point (seam; default = the full check + preload). */
+    protected void performProximityCheck(UUID playerUuid, String worldName, double cx, double cy, double cz) {
+        checkProximityAndPreload(playerUuid, worldName, cx, cy, cz);
     }
 
     /**
