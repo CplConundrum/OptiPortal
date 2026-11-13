@@ -4,12 +4,14 @@ OptiPortal is a Hytale server optimization plugin focused on reducing or elimina
 
 OptiPortal manages zones through `HOT`, `WARM`, and `COLD` cache tiers, persists useful cache state, and adapts preload behavior when the server is under pressure so chunk readiness improves without keeping everything loaded all the time. It also provides live tools for diagnostics, per-zone tuning, TTL control, backups, and hot config reloads.
 
+Built for Hytale 0.7.7 (engine build 2026.11.09-12fc46560).
+
 ## What It Does
 
 - Preloads destination chunks before portal travel completes
 - Learns portal-to-portal links automatically at runtime and stores them in `portal-links.json`
 - Maintains a three-tier cache model: `HOT`, `WARM`, and `COLD`
-- Supports `JSON`, `SQLITE`, `H2`, and `MYSQL` storage backends
+- Supports `JSON`, `SQLITE`, `H2`, `MYSQL`, and `POSTGRES` storage backends
 - Watches `warps.json` for live updates
 - Optionally integrates with the Gravestones plugin
 - Optionally mirrors HyTeleportersX teleporters from `Teleporters.json`
@@ -88,7 +90,7 @@ Running `/preload` with no arguments opens the native UI panel for players in-wo
 | `/preload refresh warps` | Re-read `warps.json` immediately |
 | `/preload refresh teleporters` | Re-read `HyTeleportersX/Teleporters.json` immediately |
 | `/preload reload` | Hot-reload `config.json` where supported |
-| `/preload migrate <JSON\|SQLITE\|H2\|MYSQL>` | Print backend migration guidance |
+| `/preload migrate <JSON\|SQLITE\|H2\|MYSQL\|POSTGRES>` | Print backend migration guidance |
 | `/preload backup list` | List WAL backups |
 | `/preload backup restore <date>` | Restore a backup and recommend restart |
 
@@ -116,6 +118,7 @@ When enabled, OptiPortal watches `HyTeleportersX/Teleporters.json` and mirrors e
 | SQLite | `SQLITE` | Single-file SQL database, good default upgrade path |
 | H2 | `H2` | Embedded SQL backend with stronger database tooling |
 | MySQL | `MYSQL` | External database for shared or remote setups |
+| PostgreSQL | `POSTGRES` | External database for shared or remote setups, PostgreSQL flavor |
 
 JSON storage uses WAL-safe atomic writes and backup recovery. SQL backends support the same zone model while improving performance on larger or busier servers.
 
@@ -130,6 +133,8 @@ A full server restart is still required for settings that wire core infrastructu
 - `rebuildFromChunksOnCorruption`
 - `scheduledRebuildIntervalHours`
 - `mysql.*`
+- `postgres.*`
+- `keepalive.mode` (reload reschedules the running keepalive manager; it cannot swap the implementation)
 - `cache.cacheDirectory`
 - `cache.maxCacheAgeDays`
 - `immuneToSimulationReduction`
@@ -147,7 +152,7 @@ If `config.json` contains invalid JSON, the reload is rejected and the current r
 
 ## Important Config Areas
 
-The full default config lives at [`src/main/resources/config.json`](/i:/OptiPortal%20-%20Copy%20-%20Copy/OptiPortal%20safe/PreloadPlugin3/src/main/resources/config.json).
+The full default config lives at [`src/main/resources/config.json`](src/main/resources/config.json).
 
 The settings operators usually care about first are:
 
@@ -166,6 +171,9 @@ The settings operators usually care about first are:
 - `integrations.hyTeleportersX.*`
 - `integrations.portalChunkListener.enabled`
 - `portalLinks.confidenceThreshold`
+- `mysql.*` / `postgres.*` (external DB credentials)
+- `chunkPressure.ownershipAudit*` (drift-auditor interval and toggle)
+- `async.executorThreadCount` (shared executor worker threads)
 
 ## Runtime Notes
 
@@ -173,6 +181,7 @@ The settings operators usually care about first are:
 - Cold-cache data can be persisted to `preload-cache/`
 - WAL backups can be listed and restored through `/preload backup ...`
 - `/preload status` is the quickest way to confirm whether load throttling or async infrastructure is affecting behavior
+- The ownership audit (default: every 60 minutes) re-reads zone residency from the engine and repairs ownership entries the engine evicted without telling OptiPortal — chunks get re-pinned, nothing is lost
 
 ## Test Server
 

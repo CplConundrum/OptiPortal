@@ -124,7 +124,7 @@ public class PreloadCommand extends AbstractCommand {
         reply(ctx, "  /preload refresh warps — re-read warps.json");
         reply(ctx, "  /preload refresh teleporters — re-read HyTeleportersX Teleporters.json");
         reply(ctx, "  /preload reload — hot-reload config.json (see output for what takes effect immediately)");
-        reply(ctx, "  /preload migrate <JSON|SQLITE|H2|MYSQL> — migration instructions");
+        reply(ctx, "  /preload migrate <JSON|SQLITE|H2|MYSQL|POSTGRES> — migration instructions");
         reply(ctx, "  /preload backup <list|restore <date>> — WAL backups");
         reply(ctx, "  /preload status — async infrastructure health (circuit breaker, TPS, zone tiers)");
         reply(ctx, "  /preload links [remove <id>|clear-pending] — list or manage portal links");
@@ -332,10 +332,10 @@ public class PreloadCommand extends AbstractCommand {
     }
 
     private CompletableFuture<Void> handleMigrate(CommandContext ctx, String[] args) {
-        if (args.length < 2) { reply(ctx, "Usage: /preload migrate <JSON|SQLITE|H2|MYSQL>"); return done(); }
+        if (args.length < 2) { reply(ctx, "Usage: /preload migrate <JSON|SQLITE|H2|MYSQL|POSTGRES>"); return done(); }
         String target = args[1].toUpperCase();
-        if (!target.equals("JSON") && !target.equals("SQLITE") && !target.equals("H2") && !target.equals("MYSQL")) {
-            reply(ctx, "[OptiPortal] Unknown backend. Use JSON, SQLITE, H2, or MYSQL."); return done();
+        if (!target.equals("JSON") && !target.equals("SQLITE") && !target.equals("H2") && !target.equals("MYSQL") && !target.equals("POSTGRES")) {
+            reply(ctx, "[OptiPortal] Unknown backend. Use JSON, SQLITE, H2, MYSQL, or POSTGRES."); return done();
         }
         reply(ctx, "[OptiPortal] To migrate to " + target + ": set backend in config.json, then restart.");
         return done();

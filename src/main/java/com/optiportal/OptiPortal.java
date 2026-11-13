@@ -464,12 +464,13 @@ public class OptiPortal extends JavaPlugin {
      *   <li>backend — storage backend cannot be swapped at runtime (use /preload migrate)
      *   <li>startupLoadStrategy — only used during boot
      *   <li>rebuildFromChunksOnCorruption / scheduledRebuildIntervalHours
-     *   <li>mysql credentials — connection pool is created once at startup
+     *   <li>mysql / postgres credentials — connection pools are created once at startup
      *   <li>cacheDirectory — cache files are already open
      *   <li>immuneToSimulationReduction — applied to worlds at registration time
      *   <li>updateChecker.enabled — runs once at startup
      *   <li>tpsMonitor.enabled / thresholds — monitor wiring happens at startup
      *   <li>integrations.portalChunkListener.enabled — world-event registration happens at startup
+ *   <li>keepalive.mode — reload reschedules the running manager but cannot swap implementations
      * </ul>
      *
      * @return a human-readable summary of what was reloaded
