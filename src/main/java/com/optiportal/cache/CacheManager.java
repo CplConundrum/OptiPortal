@@ -491,6 +491,23 @@ public class CacheManager {
         return java.util.Collections.unmodifiableSet(worldMap.keySet());
     }
 
+    /**
+     * The zone IDs that currently own the given chunk in a world (live view; callers
+     * must not mutate the returned set). Used by the ownership auditor's revalidation
+     * and by async-keepalive recovery (2026-11-12 wiring).
+     */
+    public java.util.Set<String> getChunkOwners(String world, int cx, int cz) {
+        ConcurrentHashMap<Long, Set<String>> worldMap = chunkOwnership.get(world);
+        if (worldMap == null) return java.util.Collections.emptySet();
+        Set<String> owners = worldMap.get(packChunkIndex(cx, cz));
+        return owners == null ? java.util.Collections.emptySet() : owners;
+    }
+
+    /** Current generation counter for a zone (0 if unknown) - revalidation anchor for keepalive/auditor. */
+    public long getZoneGeneration(String zoneId) {
+        return zoneGenerations.getOrDefault(zoneId, 0L);
+    }
+
     public int getTotalOwnedChunks() {
         int total = 0;
         for (java.util.concurrent.ConcurrentHashMap<Long, Set<String>> worldMap : chunkOwnership.values()) {
@@ -878,6 +895,23 @@ public class CacheManager {
                     else tierTimestamps.put(zoneId, now);
                     LOG.info(() -> "[OptiPortal] onChunksEvicted: zone '" + zoneId
                             + "' downgraded " + current + " → " + downgraded);
+                    // F5: an audit-driven WARM -> COLD must go through the same generation-safe
+                    // release path as a decay scan, or the zone's remaining (non-missing)
+                    // ownership/pins would dangle forever. The tier+generation re-check skips
+                    // the release if the zone was re-promoted before the task runs.
+                    if (current == CacheTier.WARM && downgraded == CacheTier.COLD) {
+                        final String coldZone = zoneId;
+                        final long coldGen = zoneGenerations.getOrDefault(zoneId, 0L);
+                        executor.submit(() -> {
+                            if (zoneTiers.getOrDefault(coldZone, CacheTier.COLD) != CacheTier.COLD
+                                    || zoneGenerations.getOrDefault(coldZone, 0L) != coldGen) {
+                                LOG.info("[OptiPortal] onChunksEvicted: skipping WARM -> COLD cleanup for '"
+                                        + coldZone + "' (zone was re-promoted since the audit)");
+                                return;
+                            }
+                            deregisterAllChunks(coldZone);
+                        });
+                    }
                 }
             }
         } finally {

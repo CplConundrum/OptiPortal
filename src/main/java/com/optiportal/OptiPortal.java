@@ -80,6 +80,9 @@ public class OptiPortal extends JavaPlugin {
     private WarmZoneManager warmZoneManager;
     private ChunkPreloader chunkPreloader;
     private com.optiportal.preload.KeepaliveManager keepaliveManager;
+    // 2026-11-12 wiring: chunk-ownership drift auditor (started/stopped with the keepalive
+    // lifecycle; stopped BEFORE registry serialization, so no audit mutates state during save).
+    private com.optiportal.cache.ChunkOwnershipAuditor ownershipAuditor;
     private com.optiportal.preload.PortalLinkRegistry portalLinkRegistry;
     private com.optiportal.preload.PortalChunkListener portalChunkListener;
 
@@ -254,9 +257,27 @@ public class OptiPortal extends JavaPlugin {
             // Staged startup cache load - called after listeners registered, deferred to post-enable
             // warmZoneManager.startStagedLoad(); // REMOVED: now deferred in executor
 
-            // Keepalive heartbeat - created but .start() deferred to post-enable
-            keepaliveManager = new com.optiportal.preload.KeepaliveManager(
-                    config, cacheManager, chunkPreloader, storage, executor);
+            // Keepalive heartbeat - created but .start() deferred to post-enable.
+            // 2026-11-12 wiring (keepalive.mode, default "async"): the async implementation is
+            // constructed through a subclass-typed local so its portal-cache supplier can be
+            // injected before the base-typed field assignment (F1). Mode changes are restart-only.
+            if (config.isKeepaliveAsync()) {
+                com.optiportal.preload.AsyncKeepaliveManager asyncKeepalive =
+                        new com.optiportal.preload.AsyncKeepaliveManager(
+                                config, cacheManager, chunkPreloader, storage, executor,
+                                asyncLoadBalancer, asyncMetrics);
+                asyncKeepalive.setPortalCacheSupplier(storage::loadAllCached);
+                keepaliveManager = asyncKeepalive;
+            } else {
+                keepaliveManager = new com.optiportal.preload.KeepaliveManager(
+                        config, cacheManager, chunkPreloader, storage, executor);
+            }
+
+            // Chunk-ownership auditor: detects engine-eviction drift the ownership map cannot
+            // see on its own. Started only when enabled (default ON) and stopped before
+            // registry serialization (see the stop block).
+            ownershipAuditor = new com.optiportal.cache.ChunkOwnershipAuditor(
+                    cacheManager, worldRegistry, executor, config);
 
             // Metrics - one-time init, stays eager
             if (config.isMetricsEnabled()) {
@@ -313,6 +334,9 @@ public class OptiPortal extends JavaPlugin {
                 if (keepaliveManager != null) {
                     keepaliveManager.start();
                 }
+                if (ownershipAuditor != null && config.isOwnershipAuditEnabled()) {
+                    ownershipAuditor.start();
+                }
 
                 // Snapshot scheduler - can start after cache state is loaded
                 if (snapshotScheduler != null) {
@@ -349,6 +373,7 @@ public class OptiPortal extends JavaPlugin {
             if (hyTeleportersXWatcher != null) hyTeleportersXWatcher.stop();
             if (betterGravestoneWatcher != null) betterGravestoneWatcher.stop();
             if (snapshotScheduler != null) snapshotScheduler.stop();
+            if (ownershipAuditor != null) ownershipAuditor.stop();
             if (keepaliveManager != null) keepaliveManager.stop();
             if (ttlEnforcer != null) ttlEnforcer.stop();
             if (chunkPreloader != null) chunkPreloader.flushPendingEntrySaves();
@@ -474,7 +499,11 @@ public class OptiPortal extends JavaPlugin {
 
         // Reschedule timed subsystems with updated intervals
         snapshotScheduler.reschedule();
+        // keepalive.mode is restart-only: a config reload reschedules the running manager
+        // but does NOT swap implementations (a live swap would need to invalidate the old
+        // manager's queued work - out of scope for the 2026-11-12 wiring).
         keepaliveManager.reschedule();
+        if (ownershipAuditor != null) ownershipAuditor.reschedule();
         if (ttlEnforcer != null) ttlEnforcer.reschedule();
 
         // Restart warp watcher only if relevant settings changed (old vs new comparison)

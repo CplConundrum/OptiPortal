@@ -22,6 +22,11 @@ public class AsyncMetrics {
     private final LongAdder chunkLoadErrors = new LongAdder();
     private final LongAdder positionUpdateErrors = new LongAdder();
     private final LongAdder keepaliveErrors = new LongAdder();
+
+    /** Total keepalive tier failures recorded (fully-failed pings - F7 accounting). */
+    public long getKeepaliveErrorCount() {
+        return keepaliveErrors.sum();
+    }
     private final LongAdder activeAsyncTasks = new LongAdder();
     
     // Timing

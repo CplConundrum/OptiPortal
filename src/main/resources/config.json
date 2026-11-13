@@ -119,8 +119,8 @@
     "_startupLoadStrategy_info": "Overrides the top-level startupLoadStrategy for the disk cache specifically. Usually keep these in sync.",
     "startupLoadStrategy": "STAGED",
 
-    "_ownershipAuditIntervalMinutes_info": "How often (in minutes) to audit chunk ownership for drift (chunks evicted by the engine without OptiPortal noticing). Default: 5.",
-    "ownershipAuditIntervalMinutes": 5
+    "_ownershipAudit_note": "Ownership-audit settings live under the chunkPressure section (ownershipAuditIntervalMinutes / ownershipAuditEnabled)."
+
   },
 
   "_stagedLoadConcurrency_info": "Number of WARM zones loaded concurrently at startup. Higher = faster startup but more world-thread pressure. Default: 3.",
@@ -136,12 +136,18 @@
   "_section_chunk_pressure": "=== CHUNK PRESSURE LIMIT ===",
   "_chunkPressure_info": "Hard abort: if the world already has this many chunks loaded, OptiPortal will not load more. Set to -1 to disable. Raise this if you see 'chunk pressure limit' warnings caused by permanently-warm zones keeping the count high.",
   "chunkPressure": {
-    "maxLoadedThreshold": 2048
+    "maxLoadedThreshold": 2048,
+    "_ownershipAuditIntervalMinutes_info": "How often (in minutes) the chunk-ownership drift auditor runs. Default: 60.",
+    "ownershipAuditIntervalMinutes": 60,
+    "_ownershipAuditEnabled_info": "Enable the chunk-ownership drift auditor (default: true). It repairs ownership entries the engine evicted without telling OptiPortal.",
+    "ownershipAuditEnabled": true
   },
 
   "_section_keepalive": "=== KEEPALIVE (PREVENT ZONES FROM GOING COLD) ===",
   "_keepalive_info": "Periodically 'pings' zones to prevent them dropping to a lower tier. Useful for warps or hubs you want always-ready.",
   "keepalive": {
+    "_mode_info": "Keepalive implementation: 'async' (default, load-balanced async chunk pings) or 'classic' (direct pings on the shared executor). Changes take effect on server restart.",
+    "mode": "async",
     "_hot_info": "Keep HOT zones hot (re-ping before they cool down).",
     "hot": {
       "enabled": true,

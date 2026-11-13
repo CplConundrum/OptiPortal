@@ -527,20 +527,10 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
             return;
         }
 
-        // H3: skip if the player has already died in this portal world (they will see death UI)
-        if (destWorld != null && playerId != null) {
-            try {
-                PortalWorld pw = destWorld.getEntityStore()
-                        .getStore().getResource(PortalWorld.getResourceType());
-                if (pw != null && pw.getDiedInWorld().contains(playerId)) {
-                    LOG.fine("[OptiPortal] triggerAsyncPreload: player " + playerId
-                            + " died in portal world — skipping predictive load for " + portal.getId());
-                    return;
-                }
-            } catch (Exception ignored) {
-                // Not a portal world resource — proceed normally
-            }
-        }
+        // H3 (0.7.7 note): the engine removed PortalWorld.getDiedInWorld() in 0.7.7 — the portal-death set no longer exists, so the
+        // "player died here -> skip predictive load" guard has no engine data source in this build. The guard is a no-op until an
+        // engine (or mod-owned) per-player died-in-world query exists again.
+
 
         // Record cooldown
         recordCooldown(playerId, portal.getId());
@@ -632,7 +622,7 @@ public class AsyncTeleportInterceptor extends TeleportInterceptor {
                     // Same-world adventure.teleporter portals omit the world name —
                     // fall back to the world the player is currently in.
                     if (destWorld == null) destWorld = currentWorldName;
-                    com.hypixel.hytale.math.vector.Vector3d pos = dest.getPosition();
+                    org.joml.Vector3d pos = dest.getPosition();
                     if (pos != null) {
                         // Process teleport — proximity check / tier promotion
                         processTeleportAsync(playerId, destWorld, pos.x, pos.y, pos.z);

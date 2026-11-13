@@ -165,6 +165,10 @@ public class PluginConfig {
     // Chunk pressure / auditing
     private int maxLoadedChunksPressureThreshold = 2048;
     private int ownershipAuditIntervalMinutes = 60;
+    // 2026-11-12 wiring: keepalive implementation selector ("async" = AsyncKeepaliveManager,
+    // "classic" = KeepaliveManager; mode changes are restart-only) + ownership-audit toggle.
+    private String keepaliveMode = "async";
+    private boolean ownershipAuditEnabled = true;
 
     /**
      * Load configuration from the given data folder.
@@ -381,12 +385,21 @@ public class PluginConfig {
             if (ka.has("hotIntervalMinutes")) keepaliveHotIntervalMinutes = ka.get("hotIntervalMinutes").getAsInt();
             if (ka.has("warmIntervalMinutes")) keepaliveWarmIntervalMinutes = ka.get("warmIntervalMinutes").getAsInt();
             if (ka.has("coldIntervalMinutes")) keepaliveColdIntervalMinutes = ka.get("coldIntervalMinutes").getAsInt();
+            if (ka.has("mode")) {
+                String mode = ka.get("mode").getAsString();
+                if ("async".equalsIgnoreCase(mode) || "classic".equalsIgnoreCase(mode)) {
+                    keepaliveMode = mode.toLowerCase();
+                } else {
+                    LOG.warning("[OptiPortal] config: unknown keepalive.mode '" + mode + "' - using default 'async'");
+                }
+            }
         }
 
         if (json.has("chunkPressure")) {
             JsonObject cp = json.getAsJsonObject("chunkPressure");
             if (cp.has("maxLoadedThreshold")) maxLoadedChunksPressureThreshold = cp.get("maxLoadedThreshold").getAsInt();
             if (cp.has("ownershipAuditIntervalMinutes")) ownershipAuditIntervalMinutes = cp.get("ownershipAuditIntervalMinutes").getAsInt();
+            if (cp.has("ownershipAuditEnabled")) ownershipAuditEnabled = cp.get("ownershipAuditEnabled").getAsBoolean();
         }
 
         if (json.has("cache")) {
@@ -733,5 +746,8 @@ public class PluginConfig {
     public int getKeepaliveColdIntervalMinutes() { return keepaliveColdIntervalMinutes; }
     public int getMaxLoadedChunksPressureThreshold() { return maxLoadedChunksPressureThreshold; }
     public int getOwnershipAuditIntervalMinutes() { return ownershipAuditIntervalMinutes; }
+    public String getKeepaliveMode() { return keepaliveMode; }
+    public boolean isKeepaliveAsync() { return !"classic".equals(keepaliveMode); }
+    public boolean isOwnershipAuditEnabled() { return ownershipAuditEnabled; }
     public File getDataFolder() { return dataFolder; }
 }

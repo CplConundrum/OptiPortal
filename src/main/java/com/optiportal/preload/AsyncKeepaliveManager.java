@@ -2,16 +2,24 @@ package com.optiportal.preload;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 import java.util.logging.Logger;
 
 import com.hypixel.hytale.server.core.universe.world.World;
+import com.hypixel.hytale.server.core.universe.world.storage.ChunkStore;
 import com.optiportal.async.AsyncLoadBalancer;
 import com.optiportal.async.AsyncMetrics;
-import com.optiportal.async.WorldThreadBridge;
 import com.optiportal.cache.CacheManager;
 import com.optiportal.config.PluginConfig;
 import com.optiportal.model.CacheTier;
@@ -19,285 +27,357 @@ import com.optiportal.model.PortalEntry;
 import com.optiportal.storage.StorageBackend;
 
 /**
- * Enhanced keepalive manager with improved async operations.
+ * Asynchronous keepalive variant of {@link KeepaliveManager}: tier pings are dispatched
+ * through the {@link AsyncLoadBalancer} (critical-TPS-aware queueing) and chunk pings go
+ * through the direct ChunkStore reference API (no bridge, no world-thread hop - the same
+ * call the classic manager uses).
  *
- * <p><b>DORMANT: This class is intentionally not wired into startup.</b>
- * It may be activated in a future pass if the original {@link KeepaliveManager} proves insufficient.
+ * <p>Wired by {@code OptiPortal} when {@code keepalive.mode=async} (default; the classic
+ * manager remains available via {@code keepalive.mode=classic}). Mode changes are
+ * restart-only.
  *
- * <p>This extends the original KeepaliveManager with better async handling, batched operations,
- * and reduced world thread impact.
+ * <p>Lifecycle (2026-11-12 wiring, goldfish F2): {@link #stop()} and {@link #reschedule()}
+ * bump a lifecycle epoch; queued batch suppliers capture the epoch at queue time and no-op
+ * when stale, so a stop/reload can never execute queued keepalives against a disabled
+ * plugin or a deleted/decayed zone. A per-tier in-flight gate coalesces interval ticks
+ * while a pass is still draining.
+ *
+ * <p>Retention semantics: pinging a chunk re-requests it from the engine; retention
+ * itself is provided by {@link CacheManager} keep-loaded pins. A missing HOT-tier chunk
+ * triggers a same-world demotion scan (all overlapping HOT zones, deduped and
+ * dispatch-revalidated) and an ownership/pin-aware recovery load - an unowned chunk is
+ * never resurrected by keepalive (the 3-tier model owns that decision).
  */
 public class AsyncKeepaliveManager extends KeepaliveManager {
-    
+
     private static final Logger LOG = Logger.getLogger("OptiPortal");
-    
-    private final WorldThreadBridge worldBridge;
+
     private final AsyncLoadBalancer loadBalancer;
     private final AsyncMetrics metrics;
-    private final com.optiportal.metrics.MetricsCollector metricsCollector;
 
-    /** Injected after construction to avoid circular dependency with AsyncTeleportInterceptor. */
-    private volatile java.util.function.Supplier<java.util.List<com.optiportal.model.PortalEntry>>
-            portalCacheSupplier;
-    
-    // Batch processing configuration
+    /** Injected after construction; defaults to a fresh in-memory storage snapshot (F6). */
+    private volatile Supplier<List<PortalEntry>> portalCacheSupplier;
+
+    /** F2: stop()/reschedule() bump this epoch; queued batches no-op when stale. */
+    private final AtomicLong lifecycleEpoch = new AtomicLong(1);
+
+    /** F2: while a tier pass is in flight, subsequent ticks are coalesced (skipped). */
+    private final Map<CacheTier, AtomicBoolean> tierInFlight = new ConcurrentHashMap<>();
+
     private static final int DEFAULT_BATCH_SIZE = 50;
     private static final int MAX_BATCH_SIZE = 100;
-    
+
     public AsyncKeepaliveManager(PluginConfig config,
-                                CacheManager cacheManager,
-                                ChunkPreloader chunkPreloader,
-                                StorageBackend storage,
-                                ScheduledExecutorService executor,
-                                WorldThreadBridge worldBridge,
-                                AsyncLoadBalancer loadBalancer,
-                                AsyncMetrics metrics,
-                                com.optiportal.metrics.MetricsCollector metricsCollector) {
+                                 CacheManager cacheManager,
+                                 ChunkPreloader chunkPreloader,
+                                 StorageBackend storage,
+                                 ScheduledExecutorService executor,
+                                 AsyncLoadBalancer loadBalancer,
+                                 AsyncMetrics metrics) {
         super(config, cacheManager, chunkPreloader, storage, executor);
-        
-        this.worldBridge = worldBridge;
         this.loadBalancer = loadBalancer;
-        this.metrics = metrics;
-        this.metricsCollector = metricsCollector;
+        this.metrics      = metrics;
     }
 
-    public void setPortalCacheSupplier(
-            java.util.function.Supplier<java.util.List<com.optiportal.model.PortalEntry>> supplier) {
+    /**
+     * Injects the portal-cache supplier (F6: a fresh in-memory storage snapshot). Call
+     * through a subclass-typed reference BEFORE assigning to a base-typed field (F1).
+     */
+    public void setPortalCacheSupplier(Supplier<List<PortalEntry>> supplier) {
         this.portalCacheSupplier = supplier;
     }
-    
-    /**
-     * Enhanced tier ping with batched async operations.
-     *
-     * @param tier Cache tier to ping
-     * @param label Label for logging
-     */
+
+    /** F2: invalidate queued work before the tier timers are cancelled. */
+    @Override
+    public void stop() {
+        lifecycleEpoch.incrementAndGet();
+        super.stop();
+    }
+
+    public AsyncLoadBalancer.LoadStats getAsyncLoadStats() {
+        return loadBalancer.getLoadStats();
+    }
+
+    public AsyncMetrics.PerformanceSummary getAsyncPerformanceSummary() {
+        return metrics.getPerformanceSummary();
+    }
+
     @Override
     protected void pingTier(CacheTier tier, String label) {
-        // Group operations by world to minimize context switching
-        Map<String, List<ChunkCoordinate>> chunksByWorld = groupChunksByWorld(tier);
-        
-        if (chunksByWorld.isEmpty()) {
+        AtomicBoolean inFlight = tierInFlight.computeIfAbsent(tier, t -> new AtomicBoolean(false));
+        if (!inFlight.compareAndSet(false, true)) {
+            LOG.fine(() -> "[OptiPortal] Keepalive " + label + ": previous pass still in flight - tick coalesced");
             return;
         }
-        
-        // Process each world's chunks in batches with load balancer
-        List<CompletableFuture<Void>> worldFutures = new ArrayList<>();
-        
-        for (Map.Entry<String, List<ChunkCoordinate>> entry : chunksByWorld.entrySet()) {
-            String worldName = entry.getKey();
-            List<ChunkCoordinate> chunks = entry.getValue();
-   
-            CompletableFuture<Void> worldFuture = processWorldChunks(worldName, chunks, tier, label);
-            worldFutures.add(worldFuture);
+        final long epoch = lifecycleEpoch.get();
+
+        // One snapshot per pass (F6: the supplier defaults to a fresh in-memory storage
+        // snapshot - never a stale interceptor cache).
+        List<PortalEntry> entries =
+                portalCacheSupplier != null ? portalCacheSupplier.get() : getStorage().loadAllCached();
+
+        Map<String, List<ChunkCoordinate>> chunksByWorld = new HashMap<>();
+        Map<String, List<HotZoneCandidate>> hotCandidates = new HashMap<>();
+        collectPassWork(tier, entries, chunksByWorld, hotCandidates);
+
+        if (chunksByWorld.isEmpty()) {
+            inFlight.set(false);
+            return;
         }
-        
-        // Wait for all worlds with proper error handling
-        CompletableFuture.allOf(worldFutures.toArray(new CompletableFuture[0]))
+
+        // F2/I2.2: concurrency-safe dedupe set shared across delayed batches - a zone
+        // demoted by an early batch is not demoted (or logged) again by a later one.
+        Set<String> demotedThisPass = ConcurrentHashMap.newKeySet();
+
+        List<CompletableFuture<Void>> batchFutures = new ArrayList<>();
+        for (Map.Entry<String, List<ChunkCoordinate>> worldEntry : chunksByWorld.entrySet()) {
+            String worldName = worldEntry.getKey();
+            List<ChunkCoordinate> chunks = worldEntry.getValue();
+            int batchSize = calculateOptimalBatchSize(chunks.size());
+            List<HotZoneCandidate> candidates = hotCandidates.getOrDefault(worldName, List.of());
+            for (int i = 0; i < chunks.size(); i += batchSize) {
+                List<ChunkCoordinate> batch =
+                        List.copyOf(chunks.subList(i, Math.min(i + batchSize, chunks.size())));
+                batchFutures.add(loadBalancer.scheduleLoad(() -> {
+                    // F2: stale-generation guard (stop/reschedule bumped the epoch after queueing).
+                    if (epoch != lifecycleEpoch.get()) {
+                        return CompletableFuture.completedFuture(null);
+                    }
+                    return pingChunkBatch(worldName, batch, tier, candidates, demotedThisPass);
+                }, AsyncMetrics.AsyncTaskPriority.NORMAL));
+            }
+        }
+        CompletableFuture.allOf(batchFutures.toArray(new CompletableFuture[0]))
                 .whenComplete((result, ex) -> {
+                    inFlight.set(false);
+                    if (epoch != lifecycleEpoch.get()) return; // stale generation: no records
                     if (ex != null) {
-                        LOG.warning("Keepalive error for tier " + tier + ": " + ex.getMessage());
+                        LOG.warning("[OptiPortal] Keepalive error for tier " + tier + ": " + ex.getMessage());
                         metrics.recordKeepaliveError(tier.name());
-                    } else {
-                        int totalChunks = chunksByWorld.values().stream()
-                                .mapToInt(List::size).sum();
-                        LOG.info("Keepalive " + label + ": pinged " + totalChunks + 
-                                " chunks across " + chunksByWorld.size() + " worlds");
                     }
                 });
     }
-    
+
     /**
-     * Process chunks for a specific world with batched operations.
-     * 
-     * @param worldName World name
-     * @param chunks List of chunk coordinates
-     * @param tier Cache tier
-     * @param label Label for logging
-     * @return CompletableFuture that completes when processing is done
+     * Groups one tier pass's work: chunk coordinates by world (deduped) and, for the HOT
+     * tier only, the per-world demotion candidates (all non-instanced HOT zones with
+     * pre-resolved radii and a captured tier generation for dispatch-time revalidation).
      */
-    private CompletableFuture<Void> processWorldChunks(String worldName, List<ChunkCoordinate> chunks,
-                                                      CacheTier tier, String label) {
-        // Calculate optimal batch size based on current load
-        int batchSize = calculateOptimalBatchSize(chunks.size());
-        
-        // Process chunks in batches
-        List<CompletableFuture<Void>> batchFutures = new ArrayList<>();
-        
-        for (int i = 0; i < chunks.size(); i += batchSize) {
-            List<ChunkCoordinate> batch = chunks.subList(i, Math.min(i + batchSize, chunks.size()));
-  
-            CompletableFuture<Void> batchFuture = loadBalancer.scheduleLoad(() -> {
-                return pingChunkBatch(worldName, batch, tier);
-            }, AsyncMetrics.AsyncTaskPriority.NORMAL);
-  
-            batchFutures.add(batchFuture);
-        }
-        
-        return CompletableFuture.allOf(batchFutures.toArray(new CompletableFuture[0]));
-    }
-    
-    /**
-     * Ping a batch of chunks for a world.
-     * 
-     * @param worldName World name
-     * @param batch List of chunk coordinates
-     * @param tier Cache tier
-     * @return CompletableFuture that completes when batch is done
-     */
-    private CompletableFuture<Void> pingChunkBatch(String worldName, List<ChunkCoordinate> batch, CacheTier tier) {
-        World world = getChunkPreloader().getWorldRegistry().getWorld(worldName);
-        if (world == null) return CompletableFuture.completedFuture(null);
-
-        List<CompletableFuture<Void>> chunkFutures = new ArrayList<>();
-
-        for (ChunkCoordinate coord : batch) {
-            // U2: Residency check via ChunkStore.getChunkReference() — a StampedLock map
-            // lookup that is safe to call from any thread and never triggers a load.
-            // Returns null if the chunk is not currently in the store (evicted or never loaded).
-            // Formula matches ChunkUtil.indexChunk(x, z) from the engine source.
-            long index = (long) coord.cx << 32 | (coord.cz & 0xFFFFFFFFL);
-            boolean resident = world.getChunkStore().getChunkReference(index) != null;
-
-            if (!resident && tier == CacheTier.HOT) {
-                // Chunk was evicted since the last keepalive ping. Find every HOT zone
-                // that contains this coordinate and demote it to WARM so the UI reflects
-                // the actual state rather than claiming the chunks are in memory.
-                List<PortalEntry> entries = portalCacheSupplier != null
-                        ? portalCacheSupplier.get()
-                        : getStorage().loadAll();
-                for (PortalEntry entry : entries) {
-                    if (entry.isInstanced()) continue;
-                    if (getCacheManager().getZoneTier(entry.getId()) != CacheTier.HOT) continue;
-
-                    int cx = ChunkPreloader.toChunkCoord(entry.getX());
-                    int cz = ChunkPreloader.toChunkCoord(entry.getZ());
-                    int radiusX = resolveRadiusX(entry);
-                    int radiusZ = resolveRadiusZ(entry);
-
-                    if (Math.abs(coord.cx - cx) <= radiusX && Math.abs(coord.cz - cz) <= radiusZ) {
-                        getCacheManager().setZoneTier(entry.getId(), CacheTier.WARM);
-                        LOG.info(() -> "[OptiPortal] Keepalive: chunk " + coord.cx + "," + coord.cz
-                                + " evicted — demoted zone '" + entry.getId() + "' HOT → WARM");
-                        break;
-                    }
-                }
-            }
-
-            // Always call getChunkAsync regardless of current residency. This is the
-            // actual keepalive ping — it re-requests the chunk from the engine, which
-            // resets its eviction timer and reloads it if it was evicted.
-            CompletableFuture<Void> chunkFuture = worldBridge.getChunkAsync(
-                    world, coord.cx, coord.cz, true)
-                    .thenRun(() -> { /* chunk pinged — metrics recorded by WorldThreadBridge */ })
-                    .exceptionally(ex -> {
-                        LOG.fine(() -> "Keepalive chunk ping failed: " + coord.cx + "," + coord.cz
-                                + ": " + ex.getMessage());
-                        return null;
-                    });
-
-            chunkFutures.add(chunkFuture);
-        }
-
-        return CompletableFuture.allOf(chunkFutures.toArray(new CompletableFuture[0]));
-    }
-    
-    /**
-     * Group chunks by world for batched processing.
-     *
-     * @param tier Cache tier
-     * @return Map of world name to chunk coordinates
-     */
-    private Map<String, List<ChunkCoordinate>> groupChunksByWorld(CacheTier tier) {
-        Map<String, java.util.Set<Long>> seen = new HashMap<>();
-        Map<String, List<ChunkCoordinate>> result = new HashMap<>();
-
-        List<PortalEntry> entries = portalCacheSupplier != null
-                ? portalCacheSupplier.get()
-                : getStorage().loadAll();
+    private void collectPassWork(CacheTier tier, List<PortalEntry> entries,
+                                 Map<String, List<ChunkCoordinate>> chunksByWorld,
+                                 Map<String, List<HotZoneCandidate>> hotCandidates) {
+        Map<String, Set<Long>> seen = new HashMap<>();
         for (PortalEntry entry : entries) {
             if (entry.isInstanced()) continue;
             if (getCacheManager().getZoneTier(entry.getId()) != tier) continue;
 
             String worldName = entry.getWorld();
-            java.util.Set<Long> worldSeen = seen.computeIfAbsent(worldName, k -> new java.util.HashSet<>());
-            List<ChunkCoordinate> worldChunks = result.computeIfAbsent(worldName, k -> new ArrayList<>());
-
             int cx = ChunkPreloader.toChunkCoord(entry.getX());
             int cz = ChunkPreloader.toChunkCoord(entry.getZ());
             int radiusX = resolveRadiusX(entry);
             int radiusZ = resolveRadiusZ(entry);
 
+            if (tier == CacheTier.HOT) {
+                hotCandidates.computeIfAbsent(worldName, k -> new ArrayList<>())
+                        .add(new HotZoneCandidate(entry, cx, cz, radiusX, radiusZ,
+                                getCacheManager().getZoneGeneration(entry.getId())));
+            }
+
+            Set<Long> worldSeen = seen.computeIfAbsent(worldName, k -> new HashSet<>());
             for (int dx = -radiusX; dx <= radiusX; dx++) {
                 for (int dz = -radiusZ; dz <= radiusZ; dz++) {
-                    long key = ((long)(cx + dx) << 32) | ((cz + dz) & 0xFFFFFFFFL);
+                    long key = ((long) (cx + dx) << 32) | ((cz + dz) & 0xFFFFFFFFL);
                     if (worldSeen.add(key)) {
-                        worldChunks.add(new ChunkCoordinate(cx + dx, cz + dz));
+                        chunksByWorld.computeIfAbsent(worldName, k -> new ArrayList<>())
+                                .add(new ChunkCoordinate(cx + dx, cz + dz));
                     }
                 }
             }
         }
-
-        return result;
     }
-    
+
+    private CompletableFuture<Void> pingChunkBatch(String worldName, List<ChunkCoordinate> batch,
+                                                   CacheTier tier, List<HotZoneCandidate> candidates,
+                                                   Set<String> demotedThisPass) {
+        ChunkSurface surface = chunkSurface(worldName);
+        if (surface == null) {
+            return CompletableFuture.completedFuture(null); // world not loaded (gone)
+        }
+
+        BatchStats stats = new BatchStats();
+        List<CompletableFuture<Void>> chunkFutures = new ArrayList<>();
+
+        for (ChunkCoordinate coord : batch) {
+            long index = ((long) coord.cx << 32) | (coord.cz & 0xFFFFFFFFL);
+            boolean resident = surface.isResident(index);
+
+            if (!resident) {
+                if (tier == CacheTier.HOT) {
+                    // I2.2: demote all same-world HOT zones covering the evicted coord
+                    // (candidates are pre-grouped per world - cross-world zones are excluded).
+                    demoteOverlappingHotZones(coord, candidates, demotedThisPass);
+
+                    // F3: ownership/pin-aware recovery. A missing chunk owned by a zone is
+                    // re-loaded and its ownership re-registered (idempotent: re-pins only if
+                    // the audit removed the pin). An unowned chunk is COLD/unowned geometry -
+                    // keepalive must never resurrect it (the 3-tier model owns that decision).
+                    Set<String> owners = getCacheManager().getChunkOwners(worldName, coord.cx, coord.cz);
+                    if (owners.isEmpty()) {
+                        stats.skipped.incrementAndGet();
+                        continue;
+                    }
+                    stats.attempted.incrementAndGet();
+                    chunkFutures.add(surface.ping(index).whenComplete((r, ex) -> {
+                        if (ex == null) {
+                            for (String zoneId : owners) {
+                                getCacheManager().registerOwnershipBatch(
+                                        zoneId, worldName, List.of(new int[]{coord.cx, coord.cz}));
+                            }
+                            stats.succeeded.incrementAndGet();
+                        } else {
+                            stats.failed.incrementAndGet();
+                            LOG.fine(() -> "[OptiPortal] Keepalive chunk ping failed: "
+                                    + coord.cx + "," + coord.cz + ": " + ex.getMessage());
+                        }
+                    }));
+                } else {
+                    // WARM/COLD tier: missing chunks are left to the decay/preload path.
+                    stats.skipped.incrementAndGet();
+                }
+            } else {
+                stats.attempted.incrementAndGet();
+                chunkFutures.add(surface.ping(index).whenComplete((r, ex) -> {
+                    if (ex == null) {
+                        stats.succeeded.incrementAndGet();
+                    } else {
+                        stats.failed.incrementAndGet();
+                        LOG.fine(() -> "[OptiPortal] Keepalive chunk ping failed: "
+                                + coord.cx + "," + coord.cz + ": " + ex.getMessage());
+                    }
+                }));
+            }
+        }
+
+        return CompletableFuture.allOf(chunkFutures.toArray(new CompletableFuture[0]))
+                .thenAccept(v -> {
+                    if (stats.attempted.get() > 0) {
+                        LOG.info("[OptiPortal] Keepalive " + tier + ": pinged "
+                                + stats.succeeded.get() + "/" + stats.attempted.get()
+                                + " chunks for world '" + worldName + "'"
+                                + (stats.skipped.get() > 0 ? " (" + stats.skipped.get() + " unowned/absent skipped)" : "")
+                                + (stats.failed.get() > 0 ? " (" + stats.failed.get() + " failed)" : ""));
+                    }
+                })
+                .exceptionally(ex -> {
+                    if (stats.succeeded.get() == 0) {
+                        // F7: a fully-failed (or aborted) tier is a keepalive error, not a success.
+                        metrics.recordKeepaliveError(tier.name());
+                        LOG.warning("[OptiPortal] Keepalive " + tier
+                                + ": batch failed for world '" + worldName + "': " + ex.getMessage());
+                    }
+                    return null;
+                });
+    }
+
     /**
-     * Calculate optimal batch size based on current load.
-     *
-     * @param totalChunks Total number of chunks to process
-     * @return Optimal batch size
+     * I2.2: demote (HOT → WARM) every candidate zone covering the evicted coord. Deduped
+     * across batches via {@code demotedThisPass} and revalidated at dispatch time: a zone
+     * that decayed, was deleted, or was re-promoted between the snapshot and this delayed
+     * batch is left alone.
      */
+    private void demoteOverlappingHotZones(ChunkCoordinate coord, List<HotZoneCandidate> candidates,
+                                           Set<String> demotedThisPass) {
+        for (HotZoneCandidate c : candidates) {
+            if (Math.abs(coord.cx - c.cx) > c.radiusX || Math.abs(coord.cz - c.cz) > c.radiusZ) continue;
+            if (!demotedThisPass.add(c.zoneId)) continue; // already handled by an earlier batch/coord
+            if (getCacheManager().getZoneTier(c.zoneId) != CacheTier.HOT) continue;
+            if (getCacheManager().getZoneGeneration(c.zoneId) != c.capturedGen) continue;
+            getCacheManager().setZoneTier(c.zoneId, CacheTier.WARM);
+            LOG.info("[OptiPortal] Keepalive: chunk " + coord.cx + "," + coord.cz
+                    + " evicted - demoted zone '" + c.zoneId + "' HOT -> WARM");
+        }
+    }
+
+    /**
+     * Per-world chunk ping surface (seam: tests substitute a fake without a booted World).
+     * The production implementation is the ChunkStore reference API - the same direct call
+     * the classic manager uses (D2b: no bridge, no world-thread hop).
+     * Returns null when the world is not loaded.
+     */
+    protected ChunkSurface chunkSurface(String worldName) {
+        World world = getChunkPreloader().getWorldRegistry().getWorld(worldName);
+        if (world == null) return null;
+        ChunkStore store = world.getChunkStore();
+        return new ChunkSurface() {
+            @Override
+            public boolean isResident(long engineIndex) {
+                return store.getChunkReference(engineIndex) != null;
+            }
+
+            @Override
+            public CompletableFuture<Void> ping(long engineIndex) {
+                // Re-requests the chunk from the engine; reloads it if evicted and resets
+                // its eviction timer. A null/invalid ref means the ping did not land.
+                return store.getChunkReferenceAsync(engineIndex).thenApply(ref -> {
+                    if (ref == null || !ref.isValid()) {
+                        throw new CancellationException(
+                                "chunk reference unavailable for " + Long.toHexString(engineIndex));
+                    }
+                    return null;
+                });
+            }
+        };
+    }
+
+    /**
+     * Testable seam: per-world chunk residency + ping request.
+     * Engine index encoding matches {@code ChunkUtil.indexChunk} (cx &lt;&lt; 32 | cz).
+     */
+    public interface ChunkSurface {
+        boolean isResident(long engineIndex);
+
+        CompletableFuture<Void> ping(long engineIndex);
+    }
+
     private int calculateOptimalBatchSize(int totalChunks) {
+        // Batch size is a chunk-COUNT heuristic keyed on balancer load (NOT milliseconds):
+        // high active load -> 25; low load + fast average -> 100; otherwise default 50.
         AsyncLoadBalancer.LoadStats loadStats = loadBalancer.getLoadStats();
-        
-        // Adjust batch size based on current load
-        int batchSize = DEFAULT_BATCH_SIZE;
-        
+        int batchSize;
         if (loadStats.activeOperations > 10) {
-            // High load - reduce batch size
             batchSize = Math.max(10, DEFAULT_BATCH_SIZE / 2);
         } else if (loadStats.activeOperations < 3 && loadStats.averageExecutionTime < 50) {
-            // Low load and good performance - increase batch size
             batchSize = Math.min(MAX_BATCH_SIZE, DEFAULT_BATCH_SIZE * 2);
+        } else {
+            batchSize = DEFAULT_BATCH_SIZE;
         }
-        
-        // Ensure we don't exceed total chunks
-        return Math.min(batchSize, totalChunks);
+        return Math.min(batchSize, Math.max(1, totalChunks));
     }
-    
-    /**
-     * Get current async performance statistics.
-     * 
-     * @return Performance statistics
-     */
-    public AsyncLoadBalancer.LoadStats getAsyncLoadStats() {
-        return loadBalancer.getLoadStats();
-    }
-    
-    /**
-     * Get current performance metrics.
-     * 
-     * @return Performance metrics
-     */
-    public AsyncMetrics.PerformanceSummary getAsyncPerformanceSummary() {
-        return metrics.getPerformanceSummary();
-    }
-    
-    /**
-     * Chunk coordinate data class.
-     */
-    private static class ChunkCoordinate {
-        public final int cx;
-        public final int cz;
-        
-        public ChunkCoordinate(int cx, int cz) {
-            this.cx = cx;
-            this.cz = cz;
+
+    /** Pre-resolved demotion candidate for one HOT zone (I2.2). */
+    private static final class HotZoneCandidate {
+        final String zoneId;
+        final int cx, cz, radiusX, radiusZ;
+        final long capturedGen;
+
+        HotZoneCandidate(PortalEntry entry, int cx, int cz, int radiusX, int radiusZ, long capturedGen) {
+            this.zoneId      = entry.getId();
+            this.cx         = cx;
+            this.cz         = cz;
+            this.radiusX    = radiusX;
+            this.radiusZ    = radiusZ;
+            this.capturedGen = capturedGen;
         }
-        
-        @Override
-        public String toString() {
-            return cx + "," + cz;
-        }
+    }
+
+    private static final class BatchStats {
+        final AtomicInteger attempted = new AtomicInteger();
+        final AtomicInteger succeeded = new AtomicInteger();
+        final AtomicInteger skipped   = new AtomicInteger();
+        final AtomicInteger failed    = new AtomicInteger();
+    }
+
+    /** Simple chunk-coordinate pair for radius enumeration (no engine dependency). */
+    record ChunkCoordinate(int cx, int cz) {
     }
 }

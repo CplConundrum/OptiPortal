@@ -1,180 +1,247 @@
 package com.optiportal.cache;
 
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
 
 import com.hypixel.hytale.math.util.ChunkUtil;
 import com.hypixel.hytale.server.core.universe.world.World;
-import com.optiportal.config.PluginConfig;
 import com.optiportal.preload.WorldRegistry;
-
+import com.optiportal.config.PluginConfig;
 import it.unimi.dsi.fastutil.longs.LongSet;
 
 /**
- * Periodically audits the CacheManager chunk ownership map against what
- * the engine reports as actually loaded, detecting eviction drift.
+ * Periodically audits the {@link CacheManager} chunk-ownership map against what the engine
+ * reports as actually loaded, detecting eviction drift (chunks the engine evicted without
+ * OptiPortal noticing).
  *
- * <p><b>DORMANT: This class is intentionally not wired into startup.</b>
- * It may be activated in a future pass if eviction drift detection proves necessary.
+ * <p>Activation (2026-11-12 wiring): constructed by {@code OptiPortal} and started
+ * alongside the keepalive when {@code chunkPressure.ownershipAuditEnabled} is true
+ * (default). Audits run every N minutes ({@code chunkPressure.ownershipAuditIntervalMinutes},
+ * default 60) on a fixed delay with a 1-minute initial delay.
  *
- * <p><b>Lifecycle safety note:</b> This class schedules recurring tasks via
- * {@code executor.scheduleAtFixedRate()}. If ever activated, callers must ensure
- * explicit cancellation via {@code ScheduledFuture.cancel()} or plugin shutdown
- * hooks to avoid task leaks, as {@link com.hypixel.hytale.server.core.plugin.PluginBase}
- * does not automatically cancel arbitrary executor tasks during cleanup.
+ * <p>Lifecycle: {@link #stop()} cancels the timer (interrupting the idle wait) and fences
+ * the in-flight pass - a stopped pass applies no mutations. The shared executor shutdown at
+ * plugin stop is a backstop, not a substitute for quiescing before registry serialization.
  *
- * Audits run every N minutes (configurable via ownershipAuditIntervalMinutes).
- * On detection, CacheManager.onChunkEvicted() is called to clean up.
- *
- * "Drift" occurs when the engine evicts a chunk (due to memory pressure,
- * world unload, or other causes) without OptiPortal receiving a corresponding
- * event. The ownership map then references chunks that no longer exist,
- * causing RAM estimates and tier decisions to be stale.
- *
- * Audits run every N minutes (configurable via ownershipAuditIntervalMinutes).
- * On detection, CacheManager.onChunkEvicted() is called to clean up.
- *
- * Threading: audit runs on the plugin executor thread pool.
- * All CacheManager calls are safe from any thread.
- * World.getChunkStore().getChunkIndexes() is thread-safe.
+ * <p>Threading: audits run on the plugin's executor pool; all CacheManager calls are safe
+ * from any thread; {@code World.getChunkStore().getChunkIndexes()} is a live (non-atomic)
+ * view, so evictions are revalidated just before they are applied (F4).
  */
 public class ChunkOwnershipAuditor {
 
     private static final Logger LOG = Logger.getLogger("OptiPortal");
 
     private final CacheManager cacheManager;
-    private final WorldRegistry worldRegistry;
     private final ScheduledExecutorService executor;
     private final PluginConfig config;
+    private final WorldSnapshotSource snapshots;
+
+    /** Lifecycle fence: a pass in flight at stop() time applies no mutations. */
+    private final AtomicBoolean active = new AtomicBoolean(false);
+    /** Arm guard: a double start() is a no-op. */
+    private final AtomicBoolean armed  = new AtomicBoolean(false);
+
+    private volatile ScheduledFuture<?> task;
+
+    /**
+     * Per-world loaded-chunk snapshot source (seam: production wraps
+     * {@link WorldRegistry}; tests substitute fakes to simulate the observation-to-apply gap).
+     */
+    public interface WorldSnapshotSource {
+        List<String> worldNames();
+
+        /** Live view of the world's loaded chunk indexes (engine index = cx &lt;&lt; 32 | cz). */
+        LongSet loadedIndexes(String worldName);
+    }
 
     public ChunkOwnershipAuditor(CacheManager cacheManager,
                                  WorldRegistry worldRegistry,
                                  ScheduledExecutorService executor,
                                  PluginConfig config) {
+        this(cacheManager, executor, config, new RegistrySnapshotSource(worldRegistry));
+    }
+
+    ChunkOwnershipAuditor(CacheManager cacheManager,
+                          ScheduledExecutorService executor,
+                          PluginConfig config,
+                          WorldSnapshotSource snapshots) {
         this.cacheManager = cacheManager;
-        this.worldRegistry = worldRegistry;
-        this.executor = executor;
-        this.config = config;
+        this.executor     = executor;
+        this.config       = config;
+        this.snapshots    = snapshots;
     }
 
-    /**
-     * Start the periodic audit scheduler.
-     * Audit runs immediately 1 minute after start, then every N minutes.
-     */
+    /** Production snapshot source: the engine's live ChunkStore views via WorldRegistry. */
+    private static final class RegistrySnapshotSource implements WorldSnapshotSource {
+        private final WorldRegistry worldRegistry;
+
+        RegistrySnapshotSource(WorldRegistry worldRegistry) {
+            this.worldRegistry = worldRegistry;
+        }
+
+        @Override
+        public List<String> worldNames() {
+            List<String> names = new ArrayList<>();
+            for (World w : worldRegistry.getWorlds()) {
+                names.add(w.getName());
+            }
+            return names;
+        }
+
+        @Override
+        public LongSet loadedIndexes(String worldName) {
+            World w = worldRegistry.getWorld(worldName);
+            return w.getChunkStore().getChunkIndexes();
+        }
+    }
+
     public void start() {
+        if (!armed.compareAndSet(false, true)) {
+            LOG.fine("[OptiPortal] Ownership auditor: already armed - start() ignored");
+            return;
+        }
         int intervalMinutes = config.getOwnershipAuditIntervalMinutes();
-        // Ensure minimum interval of 1 minute to avoid issues with scheduleAtFixedRate
         if (intervalMinutes < 1) {
+            LOG.warning("[OptiPortal] Ownership auditor: interval below 1 minute - clamped to 1");
             intervalMinutes = 1;
-            LOG.warning("[OptiPortal] ChunkOwnershipAuditor: intervalMinutes must be >= 1, using 1");
         }
-        // Initial delay of 1 minute to let the server finish startup
-        executor.scheduleAtFixedRate(() -> {
-            try {
-                runAudit();
-            } catch (Exception e) {
-                LOG.warning("[OptiPortal] ChunkOwnershipAuditor: audit error: " + e.getMessage());
-            }
-        }, 1, intervalMinutes, TimeUnit.MINUTES);
-        LOG.info("[OptiPortal] ChunkOwnershipAuditor scheduled every "
-                + intervalMinutes + " minutes.");
+        // I1.2: fixed delay - a slow audit can never overlap the next one.
+        task = executor.scheduleWithFixedDelay(this::runAuditSafely, 1, intervalMinutes, TimeUnit.MINUTES);
+        active.set(true);
+        LOG.info("[OptiPortal] Chunk ownership auditor started (every " + intervalMinutes + "m, fixed delay)");
     }
 
-    /**
-     * Run one full audit pass across all loaded worlds.
-     * For each world, cross-references the ownership map against actual
-     * loaded chunk indexes reported by ChunkStore.
-     */
-    public void runAudit() {
-        for (World world : worldRegistry.getWorlds()) {
-            try {
-                auditWorld(world);
-            } catch (Exception e) {
-                LOG.warning("[OptiPortal] ChunkOwnershipAuditor: error auditing world '"
-                        + world.getName() + "': " + e.getMessage());
-            }
+    public void stop() {
+        active.set(false);
+        ScheduledFuture<?> t = task;
+        task = null;
+        if (t != null) {
+            // I1.1: cancel(true) interrupts the idle wait; an in-flight pass is fenced
+            // by the `active` flag (it applies no mutations once stopped).
+            t.cancel(true);
         }
+        armed.set(false);
     }
 
-    // Safety threshold: if this fraction of checked chunks appear evicted, it
-    // almost certainly indicates a lookup error (wrong pack formula, non-ticking
-    // chunks excluded from getChunkIndexes(), etc.) rather than genuine eviction.
-    // In that case we log a warning and skip all onChunkEvicted callbacks to
-    // avoid corrupting the ownership map.
-    private static final double EVICTION_SANITY_THRESHOLD = 0.5;
+    public void reschedule() {
+        stop();
+        start();
+    }
 
-    private void auditWorld(World world) {
-        String worldName = world.getName();
-
-        // Fetch all loaded chunk indexes from the ChunkStore in one call.
-        // getChunkIndexes() covers both ticking and non-ticking chunks, unlike
-        // getChunkIfLoaded() which silently returns null for non-ticking chunks.
-        LongSet loadedIndexes;
+    private void runAuditSafely() {
+        if (!active.get()) return;
         try {
-            loadedIndexes = world.getChunkStore().getChunkIndexes();
+            runAudit();
         } catch (Exception e) {
-            LOG.warning("[OptiPortal] ChunkOwnershipAuditor: getChunkIndexes() failed for '"
+            LOG.warning("[OptiPortal] Ownership audit failed: " + e.getMessage());
+        }
+    }
+
+    public void runAudit() {
+        for (String worldName : snapshots.worldNames()) {
+            if (!active.get()) return;
+            try {
+                auditWorld(worldName);
+            } catch (Exception e) {
+                LOG.warning("[OptiPortal] Ownership audit for world '" + worldName + "' failed: " + e.getMessage());
+            }
+        }
+    }
+
+    private void auditWorld(String worldName) {
+        // ---- observation phase ----------------------------------------------------
+        LongSet loaded;
+        try {
+            loaded = snapshots.loadedIndexes(worldName);
+        } catch (Exception e) {
+            LOG.warning("[OptiPortal] Ownership audit: could not read chunk indexes for '"
                     + worldName + "': " + e.getMessage());
             return;
         }
 
-        // Get only the packed chunk keys owned in this world — no prefix filtering needed.
-        // Key encoding: cx = (int) key,  cz = (int)(key >>> 32)
-        java.util.Set<Long> ownedKeys = cacheManager.getOwnedChunkKeys(worldName);
-        if (ownedKeys.isEmpty()) return;
+        Set<Long> ownedKeys = cacheManager.getOwnedChunkKeys(worldName);
+        if (ownedKeys.isEmpty()) {
+            return;
+        }
 
         int checkedCount = 0;
         int evictedCount = 0;
+        List<int[]> evictions = new ArrayList<>();
+        List<Set<String>> observedOwners = new ArrayList<>();
 
-        // Collect evictions before applying them so we can run the sanity check first.
-        java.util.List<int[]> evictions = new java.util.ArrayList<>();
-
-        for (Long packedKey : ownedKeys) {
+        for (Long key : ownedKeys) {
+            int cx = (int) (long) key;
+            int cz = (int) (key >>> 32);
             checkedCount++;
-            int cx = (int)(long) packedKey;
-            int cz = (int)(packedKey >>> 32);
-            // Convert to engine index format before lookup.
-            // CacheManager stores cx-low/cz-high; ChunkStore.getChunkIndexes() uses ChunkUtil.indexChunk.
             long engineIndex = ChunkUtil.indexChunk(cx, cz);
-            if (!loadedIndexes.contains(engineIndex)) {
+            if (!loaded.contains(engineIndex)) {
                 evictedCount++;
                 evictions.add(new int[]{cx, cz});
+                // F4: capture the observed owner set at observation time; the application
+                // phase skips the coord if ownership moved in the gap.
+                observedOwners.add(new HashSet<>(cacheManager.getChunkOwners(worldName, cx, cz)));
             }
         }
 
-        if (checkedCount == 0) return;
-
-        double absentFraction = evictedCount / (double) checkedCount;
-
-        // 100% eviction rate: world may be in the process of unloading.
-        // Skip callbacks to avoid corrupting ownership for zones that will reload.
+        if (evictedCount == 0) {
+            LOG.fine("[OptiPortal] Ownership audit: world '" + worldName + "' clean (checked=" + checkedCount + ")");
+            return;
+        }
         if (evictedCount == checkedCount) {
-            final int fc = checkedCount;
-            LOG.fine(() -> "[OptiPortal] ChunkOwnershipAuditor: all " + fc
-                    + " owned chunks absent for '" + worldName
-                    + "' — possible world unload in progress, skipping.");
+            LOG.info("[OptiPortal] Ownership audit: world '" + worldName
+                    + "' appears to be unloading (all " + checkedCount + " owned chunks missing) - skipping eviction application");
+            return;
+        }
+        if (checkedCount > 0 && (double) evictedCount / checkedCount > 0.5) {
+            LOG.info("[OptiPortal] Ownership audit: world '" + worldName + "' missing "
+                    + evictedCount + "/" + checkedCount + " owned chunks (>50%) - looks like a world unload, skipping");
             return;
         }
 
-        // Sanity check: if more than EVICTION_SANITY_THRESHOLD of checked chunks appear
-        // evicted at once, something is likely wrong — skip callbacks to prevent ownership
-        // corruption and log so the root cause can be investigated.
-        if (absentFraction > EVICTION_SANITY_THRESHOLD) {
-            final int fc = checkedCount, fe = evictedCount;
-            LOG.warning(() -> "[OptiPortal] ChunkOwnershipAuditor: audit for '" + worldName
-                    + "' found " + fe + "/" + fc
-                    + " chunks absent — sanity threshold exceeded, skipping eviction callbacks.");
+        // ---- F4: conditional application -------------------------------------------
+        // Revalidate before applying: (a) a chunk reloaded in the observation-to-apply gap
+        // must not be re-evicted, and (b) a coord whose ownership changed in the gap
+        // (re-registration/transfer) must not be erased by the stale observation.
+        // A re-registration between the check and the apply is still not atomic; a rare
+        // double-apply is bounded to a single coord and self-heals on the next audit.
+        if (!active.get()) return; // I1.1: stop fence
+        LongSet loadedNow = loaded;
+        try {
+            loadedNow = snapshots.loadedIndexes(worldName);
+        } catch (Exception e) {
+            LOG.fine("[OptiPortal] Ownership audit: second index read failed - using the observation snapshot");
+        }
+
+        List<int[]> toApply = new ArrayList<>();
+        for (int i = 0; i < evictions.size(); i++) {
+            if (!active.get()) return; // I1.1: stop fence (per-coord)
+            int[] c = evictions.get(i);
+            long engineIndex = ChunkUtil.indexChunk(c[0], c[1]);
+            if (loadedNow != null && loadedNow.contains(engineIndex)) {
+                continue; // (a) reloaded in the gap
+            }
+            Set<String> nowOwners = cacheManager.getChunkOwners(worldName, c[0], c[1]);
+            if (!nowOwners.equals(observedOwners.get(i))) {
+                continue; // (b) ownership moved in the gap
+            }
+            toApply.add(c);
+        }
+
+        if (toApply.isEmpty()) {
+            LOG.info("[OptiPortal] Ownership audit: world '" + worldName + "': "
+                    + evictedCount + " observed evictions no longer current - nothing applied");
             return;
         }
 
-        // Apply confirmed evictions in one batch call
-        cacheManager.onChunksEvicted(worldName, evictions);
-
-        if (evictedCount > 0 || LOG.isLoggable(java.util.logging.Level.FINE)) {
-            LOG.info("[OptiPortal] Ownership audit for '" + worldName
-                    + "': checked=" + checkedCount
-                    + " evicted=" + evictedCount);
-        }
+        cacheManager.onChunksEvicted(worldName, toApply);
+        LOG.info("[OptiPortal] Ownership audit: world '" + worldName + "': checked="
+                + checkedCount + " evictedApplied=" + toApply.size() + " (observed=" + evictedCount + ")");
     }
 }
