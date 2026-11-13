@@ -8,8 +8,10 @@ import com.hypixel.hytale.server.core.Message;
 import com.hypixel.hytale.server.core.command.system.AbstractCommand;
 import com.hypixel.hytale.server.core.command.system.CommandContext;
 import com.optiportal.OptiPortal;
+import com.optiportal.config.PluginConfig;
 import com.optiportal.model.PortalEntry;
 import com.optiportal.model.WarmStrategy;
+import com.optiportal.model.PortalRadii;
 import com.optiportal.preload.ChunkPreloader;
 
 /**
@@ -724,24 +726,10 @@ public class PreloadCommand extends AbstractCommand {
     }
 
     private int expectedChunkCount(PortalEntry entry) {
-        int radiusX = resolveRadiusX(entry);
-        int radiusZ = resolveRadiusZ(entry);
+        PluginConfig cfg = plugin.getPluginConfig();
+        int radiusX = PortalRadii.resolveRadiusXStrategy(entry, cfg.getDefaultWarmRadius(), cfg.getPredictiveRadius());
+        int radiusZ = PortalRadii.resolveRadiusZStrategy(entry, cfg.getDefaultWarmRadius(), cfg.getPredictiveRadius());
         return (2 * radiusX + 1) * (2 * radiusZ + 1);
     }
 
-    private int resolveRadiusX(PortalEntry entry) {
-        if (entry.getWarmRadiusX() != null) return entry.getWarmRadiusX();
-        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
-        return entry.getStrategy() == WarmStrategy.WARM
-                ? plugin.getPluginConfig().getDefaultWarmRadius()
-                : plugin.getPluginConfig().getPredictiveRadius();
-    }
-
-    private int resolveRadiusZ(PortalEntry entry) {
-        if (entry.getWarmRadiusZ() != null) return entry.getWarmRadiusZ();
-        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
-        return entry.getStrategy() == WarmStrategy.WARM
-                ? plugin.getPluginConfig().getDefaultWarmRadius()
-                : plugin.getPluginConfig().getPredictiveRadius();
-    }
 }

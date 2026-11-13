@@ -13,9 +13,9 @@ package com.optiportal.model;
  * intentionally differ: the preload layer falls back to the default warm
  * radius, the teleport layer to the predictive radius.
  *
- * <p>The strategy-aware variants in PreloadCommand / OptiPortalUIPage are a
- * separate family (WARM -&gt; default warm radius, otherwise predictive radius)
- * and are deliberately not consolidated here.
+ * <p>The strategy-aware family (WARM -&gt; default warm radius, otherwise
+ * predictive radius, used by the PreloadCommand / OptiPortalUIPage surfaces)
+ * is served by the resolveRadiusXStrategy / resolveRadiusZStrategy variants.
  */
 public final class PortalRadii {
 
@@ -45,5 +45,27 @@ public final class PortalRadii {
     public static int resolveRadius(PortalEntry entry, int fallbackRadius) {
         if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
         return fallbackRadius;
+    }
+
+    /**
+     * Strategy-aware X-axis radius (command/UI surfaces): entry explicit axis
+     * radius &gt; uniform warm radius &gt; (WARM strategy ? default warm radius :
+     * predictive radius).
+     */
+    public static int resolveRadiusXStrategy(PortalEntry entry, int defaultWarmRadius, int predictiveRadius) {
+        if (entry.getWarmRadiusX() != null) return entry.getWarmRadiusX();
+        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
+        return entry.getStrategy() == WarmStrategy.WARM ? defaultWarmRadius : predictiveRadius;
+    }
+
+    /**
+     * Strategy-aware Z-axis radius (command/UI surfaces): entry explicit axis
+     * radius &gt; uniform warm radius &gt; (WARM strategy ? default warm radius :
+     * predictive radius).
+     */
+    public static int resolveRadiusZStrategy(PortalEntry entry, int defaultWarmRadius, int predictiveRadius) {
+        if (entry.getWarmRadiusZ() != null) return entry.getWarmRadiusZ();
+        if (entry.getWarmRadius() > 0) return entry.getWarmRadius();
+        return entry.getStrategy() == WarmStrategy.WARM ? defaultWarmRadius : predictiveRadius;
     }
 }
