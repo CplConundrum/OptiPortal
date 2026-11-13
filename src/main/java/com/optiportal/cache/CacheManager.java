@@ -672,12 +672,12 @@ public class CacheManager {
 
 
     /**
-     * Batch variant of addKeepLoadedAsync — submits a single executor task
-     * (off-world-thread; null-zone legacy path — no stamps, no locks) that calls
-     * addKeepLoaded() on multiple chunks. Reduces task submission overhead during
-     * zone registration when many chunks are already loaded. The engine counter
-     * (WorldChunk.addKeepLoaded, an AtomicInteger) is thread-safe, so the task
-     * needs neither the world thread nor a chunk lock.
+     * Submits a single executor task (off-world-thread; null-zone legacy path —
+     * no stamps, no locks) that calls addKeepLoaded() on multiple chunks.
+     * Reduces task submission overhead during zone registration when many chunks
+     * are already loaded. The engine counter (WorldChunk.addKeepLoaded, an
+     * AtomicInteger) is thread-safe, so the task needs neither the world thread
+     * nor a chunk lock.
      */
     private void addKeepLoadedBatchAsync(String worldName, java.util.List<Long> engineIndexes) {
         com.hypixel.hytale.server.core.universe.world.World world = worldRegistry.getWorld(worldName);
@@ -803,17 +803,6 @@ public class CacheManager {
             }
         });
     }
-
-    /**
-     * F3: re-request ONE keep-loaded pin for a chunk the engine evicted. The pin
-     * request lapsed together with the eviction, and the reloaded chunk's
-     * per-instance counter (engine WorldChunk.keepLoaded) starts at zero, so the
-     * chunk must be re-pinned ONCE PER CURRENT OWNER to stay balanced with the
-     * per-zone release path (deregistration decrements once per zone). Call AFTER
-     * the chunk has been re-loaded: the pre-store filter in
-     * addKeepLoadedBatchAsync skips absent chunks, so this is a no-op before the
-     * reload lands.
-     */
 
     /**
      * Zone-aware recovery re-pin: re-acquires this zone's keep-loaded pin on a
@@ -1273,7 +1262,11 @@ public class CacheManager {
      * Unpack: cx = (int) key,  cz = (int)(key >>> 32)
      */
     private static long packChunkIndex(int cx, int cz) {
-        return ((long)(cx & 0xFFFFFFFF)) | ((long)(cz & 0xFFFFFFFF) << 32);
+        // Mask AFTER the long cast: masking in int first and casting after
+        // sign-extends for negative coordinates (int -1 -> long 0xFFFFFFFFFFFFFFFF),
+        // which collapsed every cx<0 chunk onto one shared key and merged their
+        // ownership/stamp entries. The masked long form is injective for all int pairs.
+        return (((long) cx) & 0xFFFFFFFFL) | ((((long) cz) & 0xFFFFFFFFL) << 32);
     }
 
     /**

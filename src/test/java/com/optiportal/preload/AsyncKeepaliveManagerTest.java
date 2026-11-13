@@ -642,6 +642,37 @@ class AsyncKeepaliveManagerTest {
     }
 
     @Test
+    void negativeXChunksDoNotShareOwnershipEntries() throws Exception {
+        // Goldfish battery (negative-X packing): before the packChunkIndex mask
+        // fix, every cx<0 chunk collapsed onto a single pack key, merging the
+        // ownership/stamp entries of distinct negative-x chunks.
+        Set<Long> resident = new java.util.LinkedHashSet<>(
+                java.util.Set.of(idx(-1, 0), idx(-1, 3)));
+        Fixture fx = new Fixture(resident);
+        ((RecordingCacheManager) fx.cm).presentChunks = resident;
+        fx.storage.save(zone("z1", -1, 0, 1));
+        fx.storage.save(zone("z2", -1, 3, 1));
+        fx.cm.setZoneTier("z1", CacheTier.HOT);
+        fx.cm.setZoneTier("z2", CacheTier.HOT);
+        RecordingCacheManager rec = (RecordingCacheManager) fx.cm;
+        rec.registerOwnershipBatch("z1", "w1", List.of(new int[]{-1, 0}));
+        rec.registerOwnershipBatch("z2", "w1", List.of(new int[]{-1, 3}));
+        assertEquals(1, pins(rec, idx(-1, 0)), "precondition: z1 pinned (-1, 0)");
+        assertEquals(1, pins(rec, idx(-1, 3)), "precondition: z2 pinned (-1, 3)");
+        java.util.Set<String> ownersA = rec.getChunkOwners("w1", -1, 0);
+        java.util.Set<String> ownersB = rec.getChunkOwners("w1", -1, 3);
+        assertTrue(ownersA.contains("z1") && !ownersA.contains("z2"),
+                "(-1,0) owner set must contain only z1 (pre-fix: the shared pack key merged both entries)");
+        assertTrue(ownersB.contains("z2") && !ownersB.contains("z1"),
+                "(-1,3) owner set must contain only z2");
+        // Per-chunk release still balances each chunk independently.
+        fx.cm.releaseZoneChunks("z1");
+        assertEquals(0, pins(rec, idx(-1, 0)), "z1's release decremented (-1, 0)");
+        assertEquals(1, pins(rec, idx(-1, 3)), "z2's pin on (-1, 3) is untouched by z1's release");
+        assertTrue(rec.hasLivePin("z2", "w1", -1, 3), "z2's stamp is still live");
+    }
+
+    @Test
     void auditorEvictionInvalidatesStaleStamps() throws Exception {
         Set<Long> resident = new java.util.LinkedHashSet<>(java.util.Set.of(idx(0, 0))); // chunk IS resident
         Fixture fx = new Fixture(resident);
