@@ -11,15 +11,18 @@ import org.junit.jupiter.api.Test;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Off-thread pass (B): registerPortalDeviceZoneBookkeeping runs the PortalDevice
- * zone bookkeeping (entryCache / reverseIndex / storage / markNoDecay) off the
- * world thread — pure cache/storage work, no engine calls.
+ * Off-thread pass (B): autoRegisterPortalDeviceZone publishes the zone index
+ * (entryCache / reverseIndex) SYNCHRONOUSLY on the world thread -- the same
+ * chunk event's promoteColdZones and H4 ownership registration run right after
+ * autoRegisterPortalDevice returns and must see the new index. Only storage
+ * persistence is off-thread (executor).
  */
 class PortalChunkListenerOffThreadTest {
 
@@ -44,7 +47,8 @@ class PortalChunkListenerOffThreadTest {
         FakeStorageBackend storage = new FakeStorageBackend();
         PortalChunkListener listener = newListener(storage, new ArrayList<>());
         UUID dest = UUID.randomUUID();
-        listener.registerPortalDeviceZoneBookkeeping("world-a", 3, 4, dest, true);
+        assertTrue(listener.autoRegisterPortalDeviceZone("world-a", 3, 4, dest, true),
+                "new zone -> created=true");
 
         PortalEntry entry = listener.entryCacheLookup("portaldevice:world-a:3:4");
         assertNotNull(entry, "entryCache entry created");
@@ -60,8 +64,12 @@ class PortalChunkListenerOffThreadTest {
                 listener.reverseIndexLookup("world-a", packChunk(3, 4)),
                 "reverse index covers the centre chunk");
 
-        assertEquals(1, storage.loadById("portaldevice:world-a:3:4") == null ? 0 : 1,
-                "storage.save called for the new entry");
+        executor.runAllExecuted(); // persistence is the off-thread part
+        Optional<PortalEntry> stored = storage.loadById("portaldevice:world-a:3:4");
+        assertTrue(stored != null && stored.isPresent(),
+                "storage.save ran off-thread for the new entry");
+        assertEquals(dest, stored.get().getDestinationWorldUuid(),
+                "persisted entry carries the destination UUID");
     }
 
     /** B2: existing entry with a missing destination UUID -> backfilled and
@@ -71,12 +79,14 @@ class PortalChunkListenerOffThreadTest {
         FakeStorageBackend storage = new FakeStorageBackend();
         PortalChunkListener listener = newListener(storage, new ArrayList<>());
         // First pass: destination UUID not known yet (entry created with null dest)
-        listener.registerPortalDeviceZoneBookkeeping("world-b", 1, 2, null, true);
+        assertTrue(listener.autoRegisterPortalDeviceZone("world-b", 1, 2, null, true),
+                "first pass creates the entry");
         assertNull(listener.entryCacheLookup("portaldevice:world-b:1:2").getDestinationWorldUuid());
 
-        // Second pass: UUID now known -> backfill + re-persist
+        // Second pass: UUID now known -> existing-entry backfill (created=false)
         UUID dest = UUID.randomUUID();
-        listener.registerPortalDeviceZoneBookkeeping("world-b", 1, 2, dest, true);
+        assertFalse(listener.autoRegisterPortalDeviceZone("world-b", 1, 2, dest, true),
+                "second pass hits the existing-entry backfill path");
         assertEquals(dest,
                 listener.entryCacheLookup("portaldevice:world-b:1:2").getDestinationWorldUuid(),
                 "existing entry backfilled with the destination UUID");
@@ -89,10 +99,10 @@ class PortalChunkListenerOffThreadTest {
         FakeStorageBackend storage = new FakeStorageBackend();
         ArrayList<String> noDecayCalls = new ArrayList<>();
         PortalChunkListener listener = newListener(storage, noDecayCalls);
-        listener.registerPortalDeviceZoneBookkeeping("eternal", 5, 6, null, false);
+        listener.autoRegisterPortalDeviceZone("eternal", 5, 6, null, false);
         assertEquals(List.of("portaldevice:eternal:5:6"), noDecayCalls,
                 "non-unloadable world -> markNoDecay");
-        listener.registerPortalDeviceZoneBookkeeping("normal", 7, 8, null, true);
+        listener.autoRegisterPortalDeviceZone("normal", 7, 8, null, true);
         assertEquals(List.of("portaldevice:eternal:5:6"), noDecayCalls,
                 "unloadable world -> no markNoDecay");
     }

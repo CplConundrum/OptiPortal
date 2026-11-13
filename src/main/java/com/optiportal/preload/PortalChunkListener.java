@@ -175,28 +175,34 @@ public class PortalChunkListener {
         }
         if (device == null) return;
 
-        // Engine-bound work stays on the world thread: capture plain values and
-        // run the rare, one-shot destination-world scan (BlockModule reads).
-        final UUID destUuid = device.getDestinationWorldUuid();
-        final String worldName = world.getName();
-        final boolean canUnload = world.getWorldConfig().canUnloadChunks();
-        if (device.getDestinationWorld() != null) {
+        // Zone bookkeeping is deliberately SYNCHRONOUS (world thread):
+        // onChunkPreLoad runs promoteColdZones and the H4 event-driven
+        // ownership registration right after this method returns, in the
+        // same event -- deferring the index publication off-thread would
+        // leave them seeing a missing index. The only off-thread part is
+        // storage persistence (inside the bookkeeping).
+        boolean created = autoRegisterPortalDeviceZone(
+                world.getName(), chunkX, chunkZ,
+                device.getDestinationWorldUuid(),
+                world.getWorldConfig().canUnloadChunks());
+        if (created && device.getDestinationWorld() != null) {
+            // One-shot per zone: existing zones return created=false above, so
+            // reloads of an already-registered chunk never re-scan the
+            // destination world (original semantics, preserved).
             warmZoneManager.scanWorldForPortalDestination(device.getDestinationWorld());
         }
-
-        // Off-thread bookkeeping: entryCache/reverseIndex/storage/markNoDecay.
-        executor.execute(() ->
-                registerPortalDeviceZoneBookkeeping(worldName, chunkX, chunkZ, destUuid, canUnload));
     }
 
     /**
-     * Off-thread bookkeeping for auto-registered PortalDevice zones (dispatched
-     * from autoRegisterPortalDevice on the plugin executor). Pure
-     * entryCache/reverseIndex/storage/cacheManager work — no engine calls.
-     * Package-private for tests.
+     * Synchronous (world-thread) zone bookkeeping for an auto-registered
+     * PortalDevice zone. entryCache + the full-footprint reverse index are
+     * published before this method returns, so the same event's promote and
+     * H4 ownership steps see the new zone. Only storage persistence is
+     * off-thread (executor). Returns true if a NEW entry was created, false
+     * for the existing-entry (backfill) path. Package-private for tests.
      */
-    void registerPortalDeviceZoneBookkeeping(String worldName, int chunkX, int chunkZ,
-                                              UUID destUuid, boolean canUnload) {
+    boolean autoRegisterPortalDeviceZone(String worldName, int chunkX, int chunkZ,
+                                          UUID destUuid, boolean canUnload) {
         // Chunk center in world coordinates (Hytale chunks are 32x32 blocks)
         double worldX = chunkX * 32.0 + 16.0;
         double worldZ = chunkZ * 32.0 + 16.0;
@@ -209,10 +215,10 @@ public class PortalChunkListener {
             if (existingEntry.getDestinationWorldUuid() == null && destUuid != null) {
                 existingEntry.setDestinationWorldUuid(destUuid);
                 entryCache.put(zoneId, existingEntry);
-                storage.save(existingEntry);
+                executor.execute(() -> storage.save(existingEntry));
                 LOG.fine(() -> "[OptiPortal] Backfilled destination UUID for existing zone: " + zoneId);
             }
-            return;
+            return false;
         }
 
         PortalEntry entry = new PortalEntry(zoneId, worldName, worldX, 64.0, worldZ, 0);
@@ -222,7 +228,7 @@ public class PortalChunkListener {
             entry.setDestinationWorldUuid(destUuid);
         }
         entryCache.put(zoneId, entry);
-        storage.save(entry);
+        executor.execute(() -> storage.save(entry));
 
         // Keep reverse index in sync with new auto-registered zone (full footprint, not just centre)
         int defaultRadius = config.getDefaultWarmRadius();
@@ -243,6 +249,7 @@ public class PortalChunkListener {
 
         LOG.info(() -> "[OptiPortal] Auto-registered PortalDevice zone: " + zoneId
                 + " at chunk (" + chunkX + ", " + chunkZ + ")");
+        return true;
     }
 
     // Test accessors (package-private)

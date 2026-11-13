@@ -595,15 +595,23 @@ public class TeleportInterceptor {
 
     /** Stale-ref cleanup for players with no live world. */
     protected void cleanupStalePlayer(UUID uuid) {
-        playerRefs.remove(uuid);
-        lastSeenTeleportNanos.remove(uuid);
-        lastKnownPosition.remove(uuid);
-        cooldowns.remove(uuid);
+        // Full removal (superset of the stale-ref cleanup): also drops the
+        // proximity, respawn-capture and transform-snapshot state.
+        removePlayerRef(uuid);
     }
 
     /** Concurrent-safe TeleportRecord read (engine getComponentConcurrent). */
     protected TeleportRecord readTeleportRecordConcurrent(PlayerRef pRef) {
         return pRef.getComponentConcurrent(TeleportRecord.getComponentType());
+    }
+
+    /**
+     * Submit a capture task to a world (production: World.execute).
+     * Test seam: simulates the E1 rejection -- a shutting-down world throws
+     * (SkipSentryException) before the task runs.
+     */
+    protected void runWorldTask(World world, Runnable task) {
+        world.execute(task);
     }
 
     /** Snapshot-dispatch set for this poll (drained exactly once). */
@@ -620,31 +628,60 @@ public class TeleportInterceptor {
      */
     protected void dispatchTransformSnapshot(World world, long cycle) {
         java.util.concurrent.CompletableFuture<Void> done = new java.util.concurrent.CompletableFuture<>();
-        world.execute(() -> {
-            try {
-                for (PlayerRef ref : world.getPlayerRefs()) {
-                    if (ref == null || ref.getUuid() == null) continue;
-                    com.hypixel.hytale.math.vector.Transform t = ref.getTransform();
-                    if (t == null || t.getPosition() == null) continue;
-                    org.joml.Vector3d p = t.getPosition();
-                    transformSnaps.put(ref.getUuid(), new TransformSnap(p.x, p.y, p.z, world.getName(), cycle));
+        try {
+            runWorldTask(world, () -> {
+                try {
+                    for (PlayerRef ref : world.getPlayerRefs()) {
+                        if (ref == null || ref.getUuid() == null) continue;
+                        com.hypixel.hytale.math.vector.Transform t = ref.getTransform();
+                        if (t == null || t.getPosition() == null) continue;
+                        org.joml.Vector3d p = t.getPosition();
+                        transformSnaps.put(ref.getUuid(), new TransformSnap(p.x, p.y, p.z, world.getName(), cycle));
+                    }
+                } finally {
+                    done.complete(null);
                 }
-            } finally {
-                done.complete(null);
+            });
+        } catch (RuntimeException e) {
+            // E1 (WorldThreadBridge): World.execute() rejects a shutting-down
+            // world with SkipSentryException (a RuntimeException) *before* the
+            // lambda runs, so the inner catch cannot see it. Unguarded, the
+            // exception escapes pollTeleportRecords and silently kills the
+            // scheduleWithFixedDelay polling task forever. Drop this world's
+            // capture for this cycle; the next poll retries.
+            done.completeExceptionally(e);
+            LOG.fine(() -> "[OptiPortal] Transform capture rejected by world "
+                    + world.getName() + " (shutting down?): " + e);
+            return;
+        }
+        done.whenComplete((v, e) -> {
+            if (e == null) {
+                executor.execute(() -> processPositionSnapshots(world, cycle));
             }
         });
-        done.whenComplete((v, e) -> executor.execute(() -> processPositionSnapshots(cycle)));
     }
 
     /**
-     * Off-thread position-jump detection + position bookkeeping for the current
-     * poll cycle. Skips players with no fresh snapshot (stale cycle = no capture
-     * this poll, e.g. the world task was dropped during world shutdown).
+     * Off-thread position-jump detection + position bookkeeping for one world's
+     * capture task in the current poll cycle.
      */
-    void processPositionSnapshots(long cycle) {
+    void processPositionSnapshots(World world, long cycle) {
+        processPositionSnapshots(world.getName(), cycle);
+    }
+
+    /**
+     * World-local snapshot processing: runs once per world completion and
+     * handles only the snapshots that world's capture task wrote this cycle.
+     * A global pass would re-process every player once per concurrently
+     * completing world, learning a single jump N times (falsely satisfying
+     * the hotspot threshold). Skips players with no fresh snapshot (stale
+     * cycle = no capture this poll, e.g. the world task was dropped during
+     * world shutdown).
+     */
+    void processPositionSnapshots(String worldName, long cycle) {
         for (UUID uuid : playerRefs.keySet()) {
             TransformSnap snap = transformSnaps.get(uuid);
-            if (snap == null || snap.cycle != cycle) continue;
+            if (snap == null || snap.cycle != cycle || !snap.worldName.equals(worldName)) continue;
             double cx = snap.x, cy = snap.y, cz = snap.z;
             double[] prevPos = lastKnownPosition.get(uuid);
             if (prevPos != null) {
@@ -1223,6 +1260,7 @@ public class TeleportInterceptor {
         reversePreloadCooldowns.clear();
         cooldowns.clear();
         playerRefs.clear();
+        transformSnaps.clear();
         lastSeenTeleportNanos.clear();
         lastKnownPosition.clear();
         lastProximityCheckPosition.clear();
@@ -1325,6 +1363,7 @@ public class TeleportInterceptor {
 
     public void removePlayerRef(UUID uuid) {
         playerRefs.remove(uuid);
+        transformSnaps.remove(uuid);
         cooldowns.remove(uuid);
         lastKnownPosition.remove(uuid);
         lastProximityCheckPosition.remove(uuid);
