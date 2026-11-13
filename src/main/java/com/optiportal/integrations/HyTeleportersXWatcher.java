@@ -1,8 +1,5 @@
 package com.optiportal.integrations;
 
-import com.hypixel.hytale.common.plugin.PluginIdentifier;
-import com.hypixel.hytale.server.core.HytaleServer;
-import com.hypixel.hytale.server.core.plugin.PluginBase;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
@@ -231,16 +228,8 @@ public class HyTeleportersXWatcher {
 
         // Remove teleporters that are in storage but no longer exist in file.
         // Only delete entries owned by this watcher (by prefix match)
-        for (String existingId : existing.keySet()) {
-            if (!incomingIds.contains(existingId)) {
-                PortalEntry ex = existing.get(existingId);
-                if (ex != null) {
-                    onPortalDeleted.accept(existingId);
-                    storage.delete(existingId);
-                    LOG.info("[OptiPortal] HyTeleportersX teleporter removed: " + existingId);
-                }
-            }
-        }
+        PortalSyncSupport.deleteMissing(existing, incomingIds, onPortalDeleted, storage,
+                "HyTeleportersX teleporter");
 
         onSyncComplete.run();
     }
@@ -250,26 +239,7 @@ public class HyTeleportersXWatcher {
     }
 
     private boolean isPluginAvailable() {
-        String configuredId = config.getHyTeleportersXPluginId();
-        if (configuredId == null || configuredId.isBlank()) {
-            return false;
-        }
-
-        try {
-            if (configuredId.contains(":")) {
-                return HytaleServer.get().getPluginManager().getPlugin(PluginIdentifier.fromString(configuredId)) != null;
-            }
-        } catch (IllegalArgumentException ignored) {
-            return false;
-        }
-
-        for (PluginBase plugin : HytaleServer.get().getPluginManager().getPlugins()) {
-            if (plugin != null && configuredId.equals(plugin.getIdentifier().getName())) {
-                return true;
-            }
-        }
-
-        return false;
+        return PortalSyncSupport.isPluginLoaded(config.getHyTeleportersXPluginId());
     }
 
     private static String getString(JsonObject json, String key) {

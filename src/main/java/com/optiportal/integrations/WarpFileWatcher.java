@@ -280,16 +280,7 @@ public class WarpFileWatcher {
         // Remove warps that are in storage but no longer exist in file.
         // Only delete PORTAL-type entries — MANUAL zones, death records, and respawn records
         // share the same storage backend and must not be touched by warp sync.
-        for (String existingId : existing.keySet()) {
-            if (!incomingIds.contains(existingId)) {
-                PortalEntry ex = existing.get(existingId);
-                if (ex != null) {
-                    onPortalDeleted.accept(existingId);
-                    storage.delete(existingId);
-                    LOG.info("[OptiPortal] Warp removed: " + existingId);
-                }
-            }
-        }
+        PortalSyncSupport.deleteMissing(existing, incomingIds, onPortalDeleted, storage, "Warp");
 
         // Notify portal cache that storage has changed
         onSyncComplete.run();

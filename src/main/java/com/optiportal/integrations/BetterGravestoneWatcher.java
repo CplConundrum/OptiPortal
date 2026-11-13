@@ -1,6 +1,5 @@
 package com.optiportal.integrations;
 
-import com.hypixel.hytale.common.plugin.PluginIdentifier;
 import com.hypixel.hytale.component.CommandBuffer;
 import com.hypixel.hytale.component.ComponentType;
 import com.hypixel.hytale.component.Ref;
@@ -8,7 +7,6 @@ import com.hypixel.hytale.component.Store;
 import com.hypixel.hytale.component.query.Query;
 import com.hypixel.hytale.math.util.ChunkUtil;
 import org.joml.Vector3d;
-import com.hypixel.hytale.server.core.HytaleServer;
 import com.hypixel.hytale.server.core.asset.type.blocktype.config.BlockType;
 import com.hypixel.hytale.server.core.entity.entities.Player;
 import com.hypixel.hytale.server.core.modules.block.BlockModule;
@@ -16,7 +14,6 @@ import com.hypixel.hytale.server.core.universe.world.chunk.section.BlockSection;
 import com.hypixel.hytale.server.core.modules.entity.component.TransformComponent;
 import com.hypixel.hytale.server.core.modules.entity.damage.DeathComponent;
 import com.hypixel.hytale.server.core.modules.entity.damage.DeathSystems;
-import com.hypixel.hytale.server.core.plugin.PluginBase;
 import com.hypixel.hytale.server.core.universe.PlayerRef;
 import com.hypixel.hytale.server.core.universe.world.World;
 import com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk;
@@ -263,26 +260,7 @@ public class BetterGravestoneWatcher {
     }
 
     private boolean isPluginAvailable() {
-        String configuredId = config.getBetterGravestonePluginId();
-        if (configuredId == null || configuredId.isBlank()) {
-            return false;
-        }
-
-        try {
-            if (configuredId.contains(":")) {
-                return HytaleServer.get().getPluginManager().getPlugin(PluginIdentifier.fromString(configuredId)) != null;
-            }
-        } catch (IllegalArgumentException ignored) {
-            return false;
-        }
-
-        for (PluginBase plugin : HytaleServer.get().getPluginManager().getPlugins()) {
-            if (plugin != null && configuredId.equals(plugin.getIdentifier().getName())) {
-                return true;
-            }
-        }
-
-        return false;
+        return PortalSyncSupport.isPluginLoaded(config.getBetterGravestonePluginId());
     }
 
     private static int floorToBlock(double value) {
