@@ -53,6 +53,15 @@ public class CacheManager {
     // observation belong to the evicted chunk instance and lapsed with it.
     private final ConcurrentHashMap<String, ConcurrentHashMap<Long, Long>> chunkPinGeneration =
             new ConcurrentHashMap<>();
+    // Commit-2 (off-world-thread): per-chunk locks for off-thread pin tasks. Keyed per
+    // world by packed chunk index — the same key space as chunkPinGeneration, so the
+    // map is bounded by the pin-stamp key space. A pin/reconcile/release task locks
+    // its chunk around the check-owner -> check-stamp -> apply -> write-stamp
+    // critical section; this per-chunk mutual exclusion replaces the world-thread
+    // FIFO serialization the r4 design relied on. Batch tasks lock chunks in
+    // ascending engine-index order (the lock-ordering protocol).
+    private final ConcurrentHashMap<String, ConcurrentHashMap<Long, java.util.concurrent.locks.ReentrantLock>> chunkTaskLocks =
+            new ConcurrentHashMap<>();
     // world name → packed chunk index → zone ID → the chunk pin generation at the time
     // this zone's keep-loaded pin was acquired (or re-acquired) on the live instance.
     // A zone whose stamp is missing or older than the chunk's current generation has no
@@ -599,27 +608,36 @@ public class CacheManager {
     }
 
     /**
-     * r4 test seam: submits a world-thread task for the named world. Production
-     * resolves the world from the registry and queues via world.execute()
-     * (fire-and-forget; a world that is shutting down drops the task). Tests
-     * override this to run tasks synchronously (simulating world-thread
-     * serialization) or hold them (queued-task interleavings).
+     * Commit-2 test seam: submits a pin task for the named world. Production
+     * runs pin tasks on the plugin's shared {@link ScheduledExecutorService} —
+     * the pin path performs ZERO world.execute() calls. The atomicity the r4
+     * design obtained from world-thread FIFO is instead provided by the
+     * per-chunk {@link java.util.concurrent.locks.ReentrantLock} held around
+     * each task's critical section ({@link #chunkTaskLock}). Tests override
+     * this to run tasks synchronously (immediate execution — the task still
+     * takes its own chunk lock) or hold them (queued-task interleavings).
      *
      * @return true when the task was accepted (queued or run); false when the
-     *         world is gone or shutting down and the task was dropped. P3 callers
-     *         that own state the task would have cleared (e.g. a pin stamp) use
-     *         this to fall back to clearing it on the calling thread.
+     *         executor is shut down (or absent) and the task was dropped. P3
+     *         callers that own state the task would have cleared (e.g. a pin
+     *         stamp) use this to fall back to clearing it on the calling thread.
      */
-    protected boolean submitWorldTask(String worldName, Runnable task) {
-        com.hypixel.hytale.server.core.universe.world.World world = worldRegistry.getWorld(worldName);
-        if (world == null) return false;
+    protected boolean submitPinTask(String worldName, Runnable task) {
+        if (executor == null) return false;
         try {
-            world.execute(task);
+            executor.execute(task);
             return true;
-        } catch (Exception e) {
-            // world shutting down - the engine is cleaning up chunks; the task is a no-op
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            // executor shut down (plugin stopping) — the task is a no-op
             return false;
         }
+    }
+
+    /** Per-chunk lock for the off-thread pin tasks (see {@link #chunkTaskLocks}). */
+    private java.util.concurrent.locks.ReentrantLock chunkTaskLock(String worldName, long engineIndex) {
+        return chunkTaskLocks
+                .computeIfAbsent(worldName, w -> new ConcurrentHashMap<>())
+                .computeIfAbsent(engineIndex, k -> new java.util.concurrent.locks.ReentrantLock());
     }
 
     /**
@@ -652,14 +670,17 @@ public class CacheManager {
 
 
     /**
-     * Batch variant of addKeepLoadedAsync — submits a single world.execute() task
-     * that calls addKeepLoaded() on multiple chunks. Reduces task submission overhead
-     * during zone registration when many chunks are already loaded.
+     * Batch variant of addKeepLoadedAsync — submits a single executor task
+     * (off-world-thread; null-zone legacy path — no stamps, no locks) that calls
+     * addKeepLoaded() on multiple chunks. Reduces task submission overhead during
+     * zone registration when many chunks are already loaded. The engine counter
+     * (WorldChunk.addKeepLoaded, an AtomicInteger) is thread-safe, so the task
+     * needs neither the world thread nor a chunk lock.
      */
     private void addKeepLoadedBatchAsync(String worldName, java.util.List<Long> engineIndexes) {
         com.hypixel.hytale.server.core.universe.world.World world = worldRegistry.getWorld(worldName);
         if (world == null) return;
-        // Pre-filter to chunks that are actually in the store, before hitting the world thread
+        // Pre-filter to chunks that are actually in the store, before hitting the executor
         java.util.List<Long> present = new java.util.ArrayList<>(engineIndexes.size());
         for (long idx : engineIndexes) {
             if (world.getChunkStore().getChunkReference(idx) != null) {
@@ -668,7 +689,7 @@ public class CacheManager {
         }
         if (present.isEmpty()) return;
         try {
-            world.execute(() -> {
+            executor.execute(() -> {
                 for (long idx : present) {
                     com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk chunk =
                             chunkIfInMemory(world, idx);
@@ -676,20 +697,23 @@ public class CacheManager {
                 }
             });
         } catch (Exception e) {
-            // world shutting down
+            // executor shut down (plugin stopping) — or world-level failure
         }
     }
 
     /**
-     * r4 zone-aware pin dispatch. Queues a single world-thread task that applies
-     * this zone's keep-loaded pin to every chunk in the batch that is present at
-     * execution time. The live-pin stamp is recorded at execution time, against
-     * the chunk instance that actually received the pin (instance-anchored): a
-     * chunk evicted and re-published between the caller's presence check and this
-     * task's execution cannot be left with a missing or stale stamp. Tasks are
-     * idempotent: chunks that already carry a live stamp for this zone are
-     * skipped, so duplicate queued tasks for the same zone+chunk apply exactly
-     * one pin.
+     * r4 zone-aware pin dispatch (commit-2: off-world-thread, per-chunk-locked).
+     * Queues a single executor task that applies this zone's keep-loaded pin to
+     * every chunk in the batch that is present at execution time. The live-pin
+     * stamp is recorded at execution time, against the chunk instance that
+     * actually received the pin (instance-anchored): a chunk evicted and
+     * re-published between the caller's presence check and this task's execution
+     * cannot be left with a missing or stale stamp. Tasks are idempotent: chunks
+     * that already carry a live stamp for this zone are skipped, so duplicate
+     * queued tasks for the same zone+chunk apply exactly one pin. An
+     * execution-time owner-liveness check skips chunks whose owner set no longer
+     * contains this zone (the zone deregistered between submission and execution
+     * — no orphan pins).
      */
     public void addKeepLoadedBatchForZone(String zoneId, String worldName, java.util.List<Long> engineIndexes) {
         if (zoneId == null || engineIndexes == null || engineIndexes.isEmpty()) {
@@ -697,34 +721,49 @@ public class CacheManager {
             return;
         }
         final String zone = zoneId;
-        final java.util.List<Long> indexes = engineIndexes;
-        submitWorldTask(worldName, () -> {
-            for (long packed : indexes) {
+        // Commit-2: lock chunks in ascending engine-index order (the per-chunk
+        // lock-ordering protocol for multi-chunk batch tasks).
+        final java.util.List<Long> sorted = new java.util.ArrayList<>(engineIndexes);
+        java.util.Collections.sort(sorted);
+        submitPinTask(worldName, () -> {
+            for (long packed : sorted) {
                 int cx = (int) (long) packed;
                 int cz = (int) (packed >>> 32);
-                if (hasLivePin(zone, worldName, cx, cz)) continue;
-                if (applyKeepLoadedPin(worldName, packed)) {
-                    recordPinAcquisition(zone, worldName, cx, cz);
+                java.util.concurrent.locks.ReentrantLock lock = chunkTaskLock(worldName, packed);
+                lock.lock();
+                try {
+                    // Commit-2 owner-liveness check: skip an orphan pin when the zone
+                    // deregistered between task submission and execution.
+                    if (!getChunkOwners(worldName, cx, cz).contains(zone)) continue;
+                    if (hasLivePin(zone, worldName, cx, cz)) continue;
+                    if (applyKeepLoadedPin(worldName, packed)) {
+                        recordPinAcquisition(zone, worldName, cx, cz);
+                    }
+                } finally {
+                    lock.unlock();
                 }
             }
         });
     }
 
     /**
-     * r4 recovery reconciliation (world-thread-serialized). Re-fetches the LIVE
-     * owner set for this chunk, re-registers each owner (idempotent claim: an
-     * existing owner is not re-claimed), and queues a single world-thread task
-     * that re-acquires exactly one pin for every owner whose pin is not live on
-     * the reloaded instance (missing stamp, or a stamp older than the current
-     * pin generation). The task re-checks the live-pin stamp at execution time
-     * and skips zones whose pin was acquired in the meantime, so queued
-     * duplicates (a registration task and this reconciliation task racing on the
-     * same zone+chunk) apply exactly one pin.
+     * r4 recovery reconciliation (commit-2: off-thread, per-chunk-locked).
+     * Re-fetches the LIVE owner set for this chunk, re-registers each owner
+     * (idempotent claim: an existing owner is not re-claimed), and queues a
+     * single executor task that re-acquires exactly one pin for every owner
+     * whose pin is not live on the reloaded instance (missing stamp, or a stamp
+     * older than the current pin generation). The task re-checks the live-pin
+     * stamp at execution time and skips zones whose pin was acquired in the
+     * meantime, so queued duplicates (a registration task and this
+     * reconciliation task racing on the same zone+chunk) apply exactly one pin.
+     * An execution-time owner-liveness check skips owners that deregistered
+     * between submission and execution (no orphan pins).
      *
      * <p>Called from the keepalive recovery callback on the ping-completing
-     * thread; every pin mutation and stamp write happens on the world thread
-     * (via the queued task), total-ordered with registration pin tasks and the
-     * per-zone release path.
+     * thread; pin mutations and stamp writes happen on the executor thread under
+     * the chunk's per-chunk lock, mutually exclusive with registration pin tasks
+     * and the per-zone release path — the per-chunk lock replaces the r4
+     * world-thread FIFO total ordering for same-chunk operations.
      */
     public void reconcileKeepLoadedPins(String worldName, int cx, int cz) {
         java.util.Set<String> liveOwners = getChunkOwners(worldName, cx, cz);
@@ -740,12 +779,21 @@ public class CacheManager {
         if (toRepin.isEmpty()) return;
         final java.util.List<String> zones = toRepin;
         final long finalIdx = idx;
-        submitWorldTask(worldName, () -> {
-            for (String zoneId : zones) {
-                if (hasLivePin(zoneId, worldName, cx, cz)) continue;
-                if (applyKeepLoadedPin(worldName, finalIdx)) {
-                    recordPinAcquisition(zoneId, worldName, cx, cz);
+        submitPinTask(worldName, () -> {
+            java.util.concurrent.locks.ReentrantLock lock = chunkTaskLock(worldName, finalIdx);
+            lock.lock();
+            try {
+                for (String zoneId : zones) {
+                    // Commit-2 owner-liveness check: skip a zone that deregistered
+                    // between reconciliation submission and task execution.
+                    if (!getChunkOwners(worldName, cx, cz).contains(zoneId)) continue;
+                    if (hasLivePin(zoneId, worldName, cx, cz)) continue;
+                    if (applyKeepLoadedPin(worldName, finalIdx)) {
+                        recordPinAcquisition(zoneId, worldName, cx, cz);
+                    }
                 }
+            } finally {
+                lock.unlock();
             }
         });
     }
@@ -1225,18 +1273,20 @@ public class CacheManager {
     /**
      * Release a single chunk's keep-loaded pin, conditionally and zone-scoped (P3).
      *
-     * Threading: safe to call from any thread. The decrement is applied on the
-     * world thread via a queued task (total-ordered with the pin-acquisition
-     * tasks), and the task runs stamp-conditionally: it decrements the live
-     * instance's counter only when this zone's pin is live on that instance
-     * ({@link #hasLivePin} — the stamp was written at or after the chunk's last
-     * observed eviction). A pin that lapsed with an evicted instance must not
-     * touch the new instance's counter (the pin died with the old instance):
-     * the stale stamp is cleared instead, so a later re-registration is not
-     * skipped by the live-pin guard. The task owns the stamp clear so the
-     * decrement and the clear stay total-ordered with all other world-thread
-     * pin tasks; if the world is already gone (shutdown/reload, task would be
-     * dropped) the stamp is cleared on the calling thread instead.
+     * Threading: safe to call from any thread (commit-2: off-world-thread). The
+     * decrement is applied on the executor thread under the chunk's per-chunk
+     * lock (the per-chunk lock replaces the r4 world-thread FIFO total ordering
+     * for same-chunk operations), and the task runs stamp-conditionally: it
+     * decrements the live instance's counter only when this zone's pin is live
+     * on that instance ({@link #hasLivePin} — the stamp was written at or after
+     * the chunk's last observed eviction). A pin that lapsed with an evicted
+     * instance must not touch the new instance's counter (the pin died with the
+     * old instance): the stale stamp is cleared instead, so a later
+     * re-registration is not skipped by the live-pin guard. The task owns the
+     * stamp clear so the decrement and the clear stay mutually exclusive with
+     * all other pin tasks on the chunk; if the executor task is dropped
+     * (shutdown, task rejected) the stamp is cleared on the calling thread
+     * instead.
      *
      * @param worldName the world name
      * @param cx        chunk X
@@ -1245,18 +1295,26 @@ public class CacheManager {
      */
     private void tryReleaseKeepLoaded(String worldName, int cx, int cz, String zoneId) {
         long engineIndex = ChunkUtil.indexChunk(cx, cz);
-        // P3: stamp-conditional decrement — the queued world task touches the live
-        // instance's counter only when this zone's pin is live on it, and owns the
-        // stamp clear so the two stay total-ordered with all pin tasks. If the task
-        // is dropped (world shutting down), the stamp is cleared on the calling
-        // thread instead so a re-registered zone is not skipped by the live-pin guard.
-        if (!submitWorldTask(worldName, () -> {
-                if (hasLivePin(zoneId, worldName, cx, cz)) {
-                    if (applyKeepLoadedRelease(worldName, engineIndex)) {
-                        LOG.fine(() -> "[OptiPortal] removeKeepLoaded: " + worldName + ":" + cx + ":" + cz);
+        // P3: stamp-conditional decrement — the queued executor task (commit-2:
+        // off-world-thread, under the chunk's per-chunk lock) touches the live
+        // instance's counter only when this zone's pin is live on it, and owns
+        // the stamp clear so the two stay mutually exclusive with all pin tasks
+        // on the chunk. If the task is dropped (executor shut down), the stamp
+        // is cleared on the calling thread instead so a re-registered zone is
+        // not skipped by the live-pin guard.
+        if (!submitPinTask(worldName, () -> {
+                java.util.concurrent.locks.ReentrantLock lock = chunkTaskLock(worldName, engineIndex);
+                lock.lock();
+                try {
+                    if (hasLivePin(zoneId, worldName, cx, cz)) {
+                        if (applyKeepLoadedRelease(worldName, engineIndex)) {
+                            LOG.fine(() -> "[OptiPortal] removeKeepLoaded: " + worldName + ":" + cx + ":" + cz);
+                        }
                     }
+                    removePinStamp(worldName, engineIndex, zoneId);
+                } finally {
+                    lock.unlock();
                 }
-                removePinStamp(worldName, engineIndex, zoneId);
             })) {
             removePinStamp(worldName, engineIndex, zoneId);
         }

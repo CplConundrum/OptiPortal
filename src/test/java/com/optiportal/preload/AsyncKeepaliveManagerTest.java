@@ -132,9 +132,9 @@ class AsyncKeepaliveManagerTest {
                 new java.util.concurrent.ConcurrentHashMap<>();
         /** r4 test seam: records execution-time stamp writes (zone|world:cx,cz). */
         final List<String> stampCalls = new ArrayList<>();
-        /** r4 test seam: world tasks held for explicit interleaving (holdWorldTasks). */
+        /** r4 test seam: pin tasks held for explicit interleaving (holdWorldTasks). */
         final List<Runnable> queuedWorldTasks = new ArrayList<>();
-        /** r4 test seam: hold world tasks until runQueuedWorldTasks() (queued interleavings). */
+        /** r4 test seam: hold pin tasks until runQueuedWorldTasks() (queued interleavings). */
         volatile boolean holdWorldTasks;
 
         RecordingCacheManager(FakePluginConfig cfg, ScheduledExecutorService exec) throws Exception {
@@ -163,7 +163,7 @@ class AsyncKeepaliveManagerTest {
         }
 
         @Override
-        protected boolean submitWorldTask(String worldName, Runnable task) {
+        protected boolean submitPinTask(String worldName, Runnable task) {
             if (holdWorldTasks) {
                 queuedWorldTasks.add(task);
                 return true;
@@ -206,7 +206,7 @@ class AsyncKeepaliveManagerTest {
             super.reconcileKeepLoadedPins(worldName, cx, cz);
         }
 
-        /** Runs (and clears) the world tasks held while holdWorldTasks was on. */
+        /** Runs (and clears) the pin tasks held while holdWorldTasks was on. */
         void runQueuedWorldTasks() {
             holdWorldTasks = false;
             for (Runnable t : queuedWorldTasks) t.run();
@@ -459,6 +459,86 @@ class AsyncKeepaliveManagerTest {
         rec.holdWorldTasks = false;
         fx.cm.releaseZoneChunks("z1");
         assertEquals(0, pins(rec, idx(0, 0)), "the release balances the single pin");
+    }
+
+    @Test
+    void concurrentPinTasksApplyExactlyOnePinPerZone() throws Exception {
+        // Commit-2 off-world-thread: the per-chunk lock must serialize
+        // check-stamp-apply-stamp for concurrently double-dispatched registration
+        // tasks (the r4 world-thread FIFO property, now off-thread).
+        Set<Long> resident = new java.util.LinkedHashSet<>(java.util.Set.of(idx(0, 0)));
+        Fixture fx = new Fixture(resident);
+        ((RecordingCacheManager) fx.cm).presentChunks = resident;
+        for (String z : List.of("z1", "z2", "z3", "z4")) {
+            fx.storage.save(zone(z, 0, 0, 1));
+            fx.cm.setZoneTier(z, CacheTier.HOT);
+            ((RecordingCacheManager) fx.cm).registerOwnershipBatch(z, "w1", List.of(new int[]{0, 0}));
+        }
+        RecordingCacheManager rec = (RecordingCacheManager) fx.cm;
+        assertEquals(4, pins(rec, idx(0, 0)), "precondition: one pin per registered zone");
+        // Stress: 8 threads (2 per zone) concurrently re-dispatch registration
+        // tasks on a FRESH chunk instance (the r4 P1 shape: the check-apply window
+        // is only open when the stamp is absent — a live stamp makes tasks skip
+        // idempotently regardless of locking). Each round evicts + clears the
+        // counter, so the concurrent duplicate tasks race in the check-apply
+        // window; without the per-chunk lock, a same-zone pair double-pins.
+        final int THREADS = 8, ROUNDS = 200;
+        for (int r = 0; r < ROUNDS; r++) {
+            rec.noteChunkEvicted("w1", 0, 0); // gen bump: the current stamps lapse
+            rec.pinCounters.remove(idx(0, 0)); // the re-published (new) instance
+            java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(THREADS);
+            for (int tt = 0; tt < THREADS; tt++) {
+                final String z = "z" + (1 + tt % 4);
+                new Thread(() -> {
+                    try { start.await(); } catch (java.lang.InterruptedException ignored) { }
+                    rec.addKeepLoadedBatchForZone(z, "w1", List.of(idx(0, 0)));
+                    done.countDown();
+                }).start();
+            }
+            start.countDown();
+            done.await();
+            assertEquals(4, pins(rec, idx(0, 0)),
+                    "round " + r + ": concurrent duplicate registration tasks keep exactly one pin per zone on the fresh instance (per-chunk lock)");
+        }
+        // Zero residue: release every zone (inline under the test seam).
+        for (String z : List.of("z1", "z2", "z3", "z4")) fx.cm.releaseZoneChunks(z);
+        assertEquals(0, pins(rec, idx(0, 0)), "releases balance all pins - zero residue");
+    }
+
+    @Test
+    void orphanPinTaskSkipsWhenOwnerDeregistered() throws Exception {
+        // Commit-2: the execution-time owner-liveness check skips a queued pin
+        // task when the zone deregistered between submission and execution (no
+        // orphan pins on a re-published chunk nobody owns).
+        Set<Long> resident = new java.util.LinkedHashSet<>(java.util.Set.of(idx(0, 0)));
+        Fixture fx = new Fixture(resident);
+        ((RecordingCacheManager) fx.cm).presentChunks = resident;
+        fx.storage.save(zone("z1", 0, 0, 1));
+        fx.cm.setZoneTier("z1", CacheTier.HOT);
+        RecordingCacheManager rec = (RecordingCacheManager) fx.cm;
+        rec.registerOwnershipBatch("z1", "w1", List.of(new int[]{0, 0}));
+        assertEquals(1, pins(rec, idx(0, 0)), "precondition: the registration applied one pin");
+        // Eviction: the instance's pin lapsed (gen bump) and its counter is gone
+        // (re-published instance). The zone's stamp is now stale.
+        rec.noteChunkEvicted("w1", 0, 0);
+        rec.pinCounters.remove(idx(0, 0));
+        assertFalse(rec.hasLivePin("z1", "w1", 0, 0), "precondition: the pin lapsed with the eviction");
+        rec.holdWorldTasks = true;
+        rec.addKeepLoadedBatchForZone("z1", "w1", List.of(idx(0, 0))); // queued (held)
+        fx.cm.deregisterAllChunks("z1"); // ownership gone NOW; release task queued (held)
+        // Execute ONLY the held registration task (the orphan one) - the release
+        // task has not run yet, so an orphan pin would be visible. (Running the
+        // full queue would let the release task balance the orphan pin and mask
+        // the defect.)
+        assertEquals(2, rec.queuedWorldTasks.size(), "registration task + release task are both held");
+        rec.queuedWorldTasks.get(0).run();
+        assertEquals(0, pins(rec, idx(0, 0)),
+                "the orphan registration task was skipped (owner deregistered, stale stamp) - no orphan pin on the re-published instance");
+        assertFalse(rec.hasLivePin("z1", "w1", 0, 0), "no live stamp for the deregistered zone");
+        // Now run the rest (the release task): it balances nothing and leaves zero residue.
+        rec.runQueuedWorldTasks();
+        assertEquals(0, pins(rec, idx(0, 0)), "the release is a no-op balance - zero residue");
     }
 
     @Test
