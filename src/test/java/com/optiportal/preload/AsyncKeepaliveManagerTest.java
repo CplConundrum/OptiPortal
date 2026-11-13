@@ -72,8 +72,25 @@ class AsyncKeepaliveManagerTest {
             return resident.contains(engineIndex);
         }
 
+        // Latch mode: ping() returns a future held until releaseLatch() - lets a test
+        // interleave work (a late registration, an audit strip) in the gap between
+        // "chunk observed missing" and "reload landed".
+        volatile CompletableFuture<Void> latch;
+
+        void holdNextPing() {
+            latch = new CompletableFuture<>();
+        }
+
+        void releaseLatch() {
+            CompletableFuture<Void> l = latch;
+            latch = null;
+            if (l != null) l.complete(null);
+        }
+
         @Override public CompletableFuture<Void> ping(long engineIndex) {
             pinged.add(engineIndex);
+            CompletableFuture<Void> l = latch;
+            if (l != null) return l;
             return failPings
                     ? CompletableFuture.failedFuture(new IllegalStateException("simulated chunk failure"))
                     : CompletableFuture.completedFuture(null);
@@ -104,15 +121,35 @@ class AsyncKeepaliveManagerTest {
      */
     static final class RecordingCacheManager extends CacheManager {
         final List<String> pinCalls = new ArrayList<>();
+        final List<String> regCalls = new ArrayList<>();
+        /** Test seam for {@link #isChunkStorePresent}: a null set = production
+         *  behavior (a fake WorldRegistry has no worlds, so every check is false);
+         *  a set = explicit control of which chunks the store reports present. */
+        volatile Set<Long> presentChunks;
 
         RecordingCacheManager(FakePluginConfig cfg, ScheduledExecutorService exec) throws Exception {
             super(cfg, new WalManager(cfg), exec, new WorldRegistry(), null, new MetricsCollector());
         }
 
         @Override
-        public void reacquireKeepLoadedPin(String worldName, int cx, int cz) {
-            pinCalls.add(worldName + ":" + cx + ":" + cz);
-            super.reacquireKeepLoadedPin(worldName, cx, cz);
+        public int registerOwnershipBatch(String zoneId, String world, List<int[]> chunkCoords) {
+            int r = super.registerOwnershipBatch(zoneId, world, chunkCoords);
+            for (int[] c : chunkCoords) {
+                regCalls.add(zoneId + "|" + world + ":" + c[0] + "," + c[1] + "|" + r);
+            }
+            return r;
+        }
+
+        @Override
+        protected boolean isChunkStorePresent(String worldName, long engineIndex) {
+            Set<Long> p = presentChunks;
+            return p != null && p.contains(engineIndex);
+        }
+
+        @Override
+        public void reacquireKeepLoadedPin(String worldName, int cx, int cz, String zoneId) {
+            pinCalls.add(worldName + ":" + cx + ":" + cz + ":" + zoneId);
+            super.reacquireKeepLoadedPin(worldName, cx, cz, zoneId);
         }
     }
 
@@ -205,9 +242,86 @@ class AsyncKeepaliveManagerTest {
 
         fx.ak.pingTier(CacheTier.HOT, "test");
 
-        assertEquals(List.of("w1:0:0", "w1:0:0"), ((RecordingCacheManager) fx.cm).pinCalls,
+        assertEquals(Set.of("w1:0:0:z1", "w1:0:0:z2"),
+                new java.util.HashSet<>(((RecordingCacheManager) fx.cm).pinCalls),
                 "one re-acquired pin per current owner of the recovered chunk (balanced with the per-zone release path)");
         assertEquals(Set.of("z1", "z2"), fx.cm.getChunkOwners("w1", 0, 0), "F3: both owners' ownership is re-registered");
+    }
+    /**
+     * F3 interleaving regression (QC r3 P1): an owner that registers on the reloaded
+     * chunk DURING the ping gap already holds its own live pin (applied to the new
+     * instance, stamped at registration). The recovery callback must re-pin ONLY the
+     * owners whose pins lapsed with the evicted instance - re-pinning the late owner
+     * would leave one extra keep-loaded count with no owner after all releases
+     * (permanent residency leak). Pre-registered owners z1/z2 (no stamp on the fake
+     * store) have lapsed pins and are re-pinned exactly once each.
+     */
+    @Test
+    void lateOwnerRegisteringInPingGapIsNotDoublePinned() throws Exception {
+        Set<Long> resident = new java.util.LinkedHashSet<>();
+        Fixture fx = new Fixture(resident); // chunk (0,0) not resident: evicted
+        ((RecordingCacheManager) fx.cm).presentChunks = resident;
+        fx.storage.save(zone("z1", 0, 0, 1));
+        fx.storage.save(zone("z2", 0, 0, 1));
+        fx.storage.save(zone("z3", 0, 0, 1)); // late owner: registers in the ping gap
+        fx.cm.setZoneTier("z1", CacheTier.HOT);
+        fx.cm.setZoneTier("z2", CacheTier.HOT);
+        fx.cm.setZoneTier("z3", CacheTier.HOT);
+        fx.cm.registerOwnershipBatch("z1", "w1", List.of(new int[]{0, 0}));
+        fx.cm.registerOwnershipBatch("z2", "w1", List.of(new int[]{0, 0}));
+
+        fx.surface.holdNextPing();
+        fx.ak.pingTier(CacheTier.HOT, "test"); // the reload is in flight (latch held)
+        // The gap: the reload lands (chunk now present in the store) and the late owner
+        // registers on it - its registration issues and applies its own pin.
+        resident.add(idx(0, 0));
+        fx.cm.registerOwnershipBatch("z3", "w1", List.of(new int[]{0, 0}));
+        fx.surface.releaseLatch(); // the recovery callback runs now
+
+        RecordingCacheManager rec = (RecordingCacheManager) fx.cm;
+        assertEquals(Set.of("w1:0:0:z1", "w1:0:0:z2"), new java.util.HashSet<>(rec.pinCalls),
+                "lapsed owners z1/z2 re-pinned once each; the late owner z3 already holds a live pin and must NOT be re-pinned");
+        assertTrue(rec.regCalls.stream().anyMatch(c -> c.equals("z3|w1:0,0|1")),
+                "the late owner's own registration acquired its pin (pinned == 1)");
+        assertEquals(3, rec.pinCalls.size() + rec.regCalls.stream()
+                        .filter(c -> c.equals("z3|w1:0,0|1")).count(),
+                "3 owners hold 3 pin acquisitions on the live instance: z1+z2 re-acquires + z3's registration (z1/z2's pre-ping claims belonged to the evicted instance and lapsed with it)");
+        // Release every owner: each release balances exactly one acquisition, so no
+        // keep-loaded count survives with zero owners (the reviewer's residue probe).
+        fx.cm.releaseZoneChunks("z1");
+        fx.cm.releaseZoneChunks("z2");
+        fx.cm.releaseZoneChunks("z3");
+        assertEquals(Set.of(), fx.cm.getChunkOwners("w1", 0, 0),
+                "all owners released - no ownership (and therefore no orphaned pin) remains");
+    }
+
+    /**
+     * F3 interleaving regression (goldfish major): the auditor strips the chunk's
+     * ownership mapping during the ping gap. The recovery callback must operate on
+     * the LIVE owner set (empty after a strip) and must not re-register the retained
+     * set reference - that would resurrect the stripped ownership with pins and
+     * re-trigger the audit loop.
+     */
+    @Test
+    void stripDuringPingGapDoesNotResurrectOwnership() throws Exception {
+        Fixture fx = new Fixture(Set.of()); // chunk (0,0) evicted
+        fx.storage.save(zone("z1", 0, 0, 1));
+        fx.storage.save(zone("z2", 0, 0, 1));
+        fx.cm.setZoneTier("z1", CacheTier.HOT);
+        fx.cm.setZoneTier("z2", CacheTier.HOT);
+        fx.cm.registerOwnershipBatch("z1", "w1", List.of(new int[]{0, 0}));
+        fx.cm.registerOwnershipBatch("z2", "w1", List.of(new int[]{0, 0}));
+
+        fx.surface.holdNextPing();
+        fx.ak.pingTier(CacheTier.HOT, "test"); // the reload is in flight (latch held)
+        // The gap: the auditor strips the chunk (e.g. a demotion sweep ran concurrently).
+        fx.cm.onChunksEvicted("w1", List.of(new int[]{0, 0}));
+        fx.surface.releaseLatch(); // the recovery callback runs now
+
+        assertEquals(List.of(), ((RecordingCacheManager) fx.cm).pinCalls,
+                "no re-pins for a stripped chunk (the live owner set is empty)");
+        assertEquals(Set.of(), fx.cm.getChunkOwners("w1", 0, 0),
+                "stripped ownership is not resurrected by the recovery callback");
     }
 
     @Test

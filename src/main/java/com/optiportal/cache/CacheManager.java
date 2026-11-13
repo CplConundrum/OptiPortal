@@ -48,6 +48,20 @@ public class CacheManager {
     private final ConcurrentHashMap<String, ConcurrentHashMap<String, Set<Long>>> zoneToChunks =
             new ConcurrentHashMap<>();
 
+    // world name → packed chunk index → pin generation counter. Bumped every time the
+    // keepalive recovery observes an evicted-but-owned chunk: pins acquired before that
+    // observation belong to the evicted chunk instance and lapsed with it.
+    private final ConcurrentHashMap<String, ConcurrentHashMap<Long, Long>> chunkPinGeneration =
+            new ConcurrentHashMap<>();
+    // world name → packed chunk index → zone ID → the chunk pin generation at the time
+    // this zone's keep-loaded pin was acquired (or re-acquired) on the live instance.
+    // A zone whose stamp is missing or older than the chunk's current generation has no
+    // live pin on the current instance and must be re-pinned by recovery; re-pinning a
+    // zone whose stamp is current would double-count (its own registration already
+    // pinned the reloaded instance).
+    private final ConcurrentHashMap<String, ConcurrentHashMap<Long, ConcurrentHashMap<String, Long>>> ownerPinGeneration =
+            new ConcurrentHashMap<>();
+
     // zone ID → current tier
     private final Map<String, CacheTier> zoneTiers = new ConcurrentHashMap<>();
 
@@ -273,6 +287,7 @@ public class CacheManager {
                     boolean removed = owners.remove(zoneId);
                     if (removed) {
                         tryReleaseKeepLoaded(worldName, (int)(long) k, (int)(k >>> 32));
+                        removePinStamp(worldName, k, zoneId);
                     }
                     return owners.isEmpty() ? null : owners;
                 });
@@ -553,6 +568,9 @@ public class CacheManager {
         recordReverseOwnership(zoneId, world, key);
         if (added) {
             addKeepLoadedAsync(world, cx, cz);
+            if (isChunkStorePresent(world, ChunkUtil.indexChunk(cx, cz))) {
+                recordPinAcquisition(zoneId, world, cx, cz);
+            }
         }
     }
 
@@ -641,8 +659,100 @@ public class CacheManager {
      * addKeepLoadedBatchAsync skips absent chunks, so this is a no-op before the
      * reload lands.
      */
+    /**
+     * Legacy recovery re-pin: re-acquires the keep-loaded pin without recording which
+     * zone's pin it is (no stamp). Use the zone-aware overload from keepalive recovery.
+     */
     public void reacquireKeepLoadedPin(String worldName, int cx, int cz) {
+        reacquireKeepLoadedPin(worldName, cx, cz, null);
+    }
+
+    /**
+     * Zone-aware recovery re-pin: re-acquires this zone's keep-loaded pin on a reloaded
+     * chunk instance and stamps the acquisition on the current chunk pin generation, so
+     * a later recovery cycle on the same instance does not re-pin the same zone.
+     */
+    public void reacquireKeepLoadedPin(String worldName, int cx, int cz, String zoneId) {
         addKeepLoadedBatchAsync(worldName, java.util.List.of(ChunkUtil.indexChunk(cx, cz)));
+        recordPinAcquisition(zoneId, worldName, cx, cz);
+    }
+
+    // ---- F3 pin-generation reconciliation -------------------------------------
+    // Engine evictions reset a chunk's per-instance keep-loaded counter; the mod-side
+    // ownership map survives. Recovery must re-pin exactly the owners whose pins lapsed
+    // with the evicted instance, and must NOT re-pin owners that registered on the
+    // reloaded instance in the ping gap (they already hold live pins). The generation
+    // stamp below is the discriminator: it is bumped at eviction observation time and
+    // stamped on every pin acquisition, so "stamp current" == "pin is live on the
+    // current instance".
+
+    private long currentChunkPinGeneration(String world, long key) {
+        ConcurrentHashMap<Long, Long> gen = chunkPinGeneration.get(world);
+        return gen == null ? 0L : gen.getOrDefault(key, 0L);
+    }
+
+    /**
+     * Records that this zone's keep-loaded pin was (re-)acquired on the chunk's current
+     * instance. A null zone is a no-op (legacy callers).
+     */
+    public void recordPinAcquisition(String zoneId, String worldName, int cx, int cz) {
+        if (zoneId == null) return;
+        long key = packChunkIndex(cx, cz);
+        ownerPinGeneration.computeIfAbsent(worldName, w -> new ConcurrentHashMap<>())
+                .computeIfAbsent(key, k -> new ConcurrentHashMap<>())
+                .put(zoneId, currentChunkPinGeneration(worldName, key));
+    }
+
+    /**
+     * True when this zone's keep-loaded pin is live on the chunk's current instance
+     * (stamped on or after the most recent eviction observation).
+     */
+    public boolean hasLivePin(String zoneId, String worldName, int cx, int cz) {
+        if (zoneId == null) return false;
+        long key = packChunkIndex(cx, cz);
+        ConcurrentHashMap<Long, ConcurrentHashMap<String, Long>> worldStamps =
+                ownerPinGeneration.get(worldName);
+        ConcurrentHashMap<String, Long> stamps = worldStamps == null ? null : worldStamps.get(key);
+        Long stamp = stamps == null ? null : stamps.get(zoneId);
+        return stamp != null && stamp >= currentChunkPinGeneration(worldName, key);
+    }
+
+    /**
+     * Records an eviction observation: the keepalive pass found this chunk missing from
+     * the store while zones still own it. Bumps the chunk's pin generation so recovery
+     * can distinguish pins that lapsed with the old instance from live pins acquired
+     * by owners that register in the ping gap. Distinct from {@link #onChunksEvicted},
+     * which is the auditor's ownership-strip path (it removes the mapping, it does not
+     * observe engine eviction).
+     */
+    public void noteChunkEvicted(String worldName, int cx, int cz) {
+        chunkPinGeneration.computeIfAbsent(worldName, w -> new ConcurrentHashMap<>())
+                .merge(packChunkIndex(cx, cz), 1L, Long::sum);
+    }
+
+    /** Drops this zone's pin stamp (its pin was released or its ownership stripped). */
+    private void removePinStamp(String worldName, long key, String zoneId) {
+        ConcurrentHashMap<Long, ConcurrentHashMap<String, Long>> worldStamps =
+                ownerPinGeneration.get(worldName);
+        if (worldStamps == null) return;
+        ConcurrentHashMap<String, Long> stamps = worldStamps.get(key);
+        if (stamps != null) {
+            stamps.remove(zoneId);
+            if (stamps.isEmpty()) worldStamps.remove(key, stamps);
+        }
+    }
+
+    /**
+     * Whether this chunk is currently present in the store. Production check via the
+     * concurrent chunk-component read; test seams may override this seam (the engine
+     * pin dispatch silently skips requests for missing chunks, so callers use this to
+     * know whether a queued pin request actually applies to a live instance).
+     */
+    protected boolean isChunkStorePresent(String worldName, long engineIndex) {
+        com.hypixel.hytale.server.core.universe.world.World world =
+                worldRegistry.getWorld(worldName);
+        if (world == null) return false;
+        return chunkIfInMemory(world, engineIndex) != null;
     }
 
     /**
@@ -653,10 +763,15 @@ public class CacheManager {
      * @param zoneId Zone ID to register as owner
      * @param world World name
      * @param chunkCoords List of chunk coordinates [cx, cz] to register
-     * @return the number of keep-loaded pins acquired by this call (chunks for which
-     *         the zone was a new owner) - 0 when the zone already owned every chunk in
-     *         the batch (its pins are intact, or must be re-acquired via
-     *         {@link #reacquireKeepLoadedPin} after an engine eviction re-loaded them)
+     * @return the number of NEW OWNERSHIP CLAIMS by this call (chunks for which the
+     *         zone was a new owner) - 0 when the zone already owned every chunk in the
+     *         batch. A claim is a queued pin request, not a confirmed engine
+     *         acquisition: the dispatch is fire-and-forget and silently skips chunks
+     *         that are not in the store, and a claim only applies to the chunk
+     *         instance present at dispatch time. Callers recovering from an engine
+     *         eviction must pair this with {@link #hasLivePin} /
+     *         {@link #reacquireKeepLoadedPin(String, int, int, String)} - not infer
+     *         pin loss from the returned count alone.
      */
     public int registerOwnershipBatch(String zoneId, String world, java.util.List<int[]> chunkCoords) {
         if (zoneId == null || chunkCoords == null || chunkCoords.isEmpty()) return 0;
@@ -675,6 +790,13 @@ public class CacheManager {
             reverseKeys.add(key);
             if (added) {
                 engineIndexes.add(ChunkUtil.indexChunk(coord[0], coord[1]));
+                // A new owner's pin request only applies if the chunk is present in the
+                // store (the engine dispatch skips missing chunks). Stamp the
+                // acquisition so keepalive recovery can tell this live pin from one that
+                // lapsed with an evicted instance (double-pin guard).
+                if (isChunkStorePresent(world, ChunkUtil.indexChunk(coord[0], coord[1]))) {
+                    recordPinAcquisition(zoneId, world, coord[0], coord[1]);
+                }
             }
         }
         if (!engineIndexes.isEmpty()) {
@@ -713,6 +835,11 @@ public class CacheManager {
         if (added) {
             addKeepLoadedAsync(world, cx, cz);
             LOG.fine(() -> "[OptiPortal] addKeepLoaded: " + world + ":" + cx + ":" + cz + " (zone: " + zoneId + ")");
+            // The chunk parameter is a resolved chunk component: a non-null value means
+            // the chunk is in the store, so the queued pin applies to a live instance.
+            if (chunk != null) {
+                recordPinAcquisition(zoneId, world, cx, cz);
+            }
         }
     }
 
@@ -738,6 +865,9 @@ public class CacheManager {
                     if (removed) {
                         // Release this zone's own pin unconditionally (per-zone pinning).
                         tryReleaseKeepLoaded(world, cx + finalDx, cz + finalDz);
+                        // The released pin is no longer live: drop the stamp so a
+                        // re-registration (or a later recovery) cannot inherit it.
+                        removePinStamp(world, key, zoneId);
                     }
                     return owners.isEmpty() ? null : owners;
                 });
@@ -882,6 +1012,10 @@ public class CacheManager {
             Set<String> owners = worldMap.remove(key);
             if (owners == null || owners.isEmpty()) continue;
             for (String zoneId : owners) {
+                // Stripped owners no longer hold live pins on this chunk: drop their
+                // stamps so the retention reference cannot feed a stale stamp into a
+                // later recovery cycle.
+                removePinStamp(worldName, key, zoneId);
                 // Remove from reverse index
                 ConcurrentHashMap<String, Set<Long>> zoneWorldMap = zoneToChunks.get(zoneId);
                 if (zoneWorldMap != null) {

@@ -250,6 +250,12 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
                         continue;
                     }
                     stats.attempted.incrementAndGet();
+                    // F3 generation stamp: observing an evicted-but-owned chunk is an
+                    // eviction observation. Bump the chunk's pin generation BEFORE the
+                    // reload so the recovery callback can distinguish pins that lapsed
+                    // with the old instance from live pins acquired by owners that
+                    // register in the ping gap (those must not be re-pinned).
+                    getCacheManager().noteChunkEvicted(worldName, coord.cx, coord.cz);
                     chunkFutures.add(surface.ping(index).whenComplete((r, ex) -> {
                         if (ex == null) {
                             // F2: a stop()/reschedule() in the ping gap must not let a
@@ -259,19 +265,29 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
                                 stats.succeeded.incrementAndGet();
                                 return;
                             }
-                            for (String zoneId : owners) {
+                            // F3: re-fetch the LIVE owner set. The reference captured at
+                            // collection time can be stale if the auditor stripped the
+                            // chunk's mapping in the ping gap - re-registering the
+                            // retained set would resurrect the stripped ownership and
+                            // leave pins with no owners.
+                            Set<String> liveOwners =
+                                    getCacheManager().getChunkOwners(worldName, coord.cx, coord.cz);
+                            for (String zoneId : liveOwners) {
                                 int pinned = getCacheManager().registerOwnershipBatch(
                                         zoneId, worldName, List.of(new int[]{coord.cx, coord.cz}));
-                                // F3: per-zone pinning - registration only acquires a pin
-                                // when the zone is NEW to the chunk (pinned > 0). After an
-                                // engine eviction the reloaded chunk's per-instance
-                                // keep-loaded counter starts at zero, so every owner whose
-                                // registration acquired no pin must re-acquire exactly one
-                                // of its own: the counter must end with one pin per owner
-                                // to stay balanced with the per-zone release path
-                                // (deregistration decrements once per zone).
-                                if (pinned == 0) {
-                                    getCacheManager().reacquireKeepLoadedPin(worldName, coord.cx, coord.cz);
+                                // F3: per-zone pinning - a registration only issues a
+                                // pin when the zone is NEW to the chunk (pinned > 0).
+                                // That pin applies to the reloaded instance and is
+                                // stamped live by registerOwnershipBatch, so re-pinning
+                                // would double-count the owner (a late owner that
+                                // registered in the ping gap already holds its own pin).
+                                // An existing owner (pinned == 0) whose stamp is missing
+                                // or older than the current generation lost its pin
+                                // when the old instance was evicted: re-acquire exactly
+                                // one, balanced with the per-zone release path.
+                                if (pinned == 0
+                                        && !getCacheManager().hasLivePin(zoneId, worldName, coord.cx, coord.cz)) {
+                                    getCacheManager().reacquireKeepLoadedPin(worldName, coord.cx, coord.cz, zoneId);
                                 }
                             }
                             stats.succeeded.incrementAndGet();
