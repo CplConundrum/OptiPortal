@@ -567,10 +567,12 @@ public class CacheManager {
                       .add(zoneId);
         recordReverseOwnership(zoneId, world, key);
         if (added) {
-            addKeepLoadedAsync(world, cx, cz);
-            if (isChunkStorePresent(world, ChunkUtil.indexChunk(cx, cz))) {
-                recordPinAcquisition(zoneId, world, cx, cz);
-            }
+            // Execution-time stamping (instance-anchored): the zone task skips
+            // chunks that already carry a live pin stamp and stamps the chunk
+            // instance that actually received the pin, so a chunk evicted and
+            // re-published between the presence check and the task's execution
+            // cannot be left with a missing or stale stamp (r4 P1).
+            addKeepLoadedBatchForZone(zoneId, world, java.util.List.of(ChunkUtil.indexChunk(cx, cz)));
         }
     }
 
@@ -592,6 +594,51 @@ public class CacheManager {
         } catch (Exception e) {
             return null;
         }
+    }
+
+    /**
+     * r4 test seam: submits a world-thread task for the named world. Production
+     * resolves the world from the registry and queues via world.execute()
+     * (fire-and-forget; a world that is shutting down drops the task). Tests
+     * override this to run tasks synchronously (simulating world-thread
+     * serialization) or hold them (queued-task interleavings).
+     */
+    protected void submitWorldTask(String worldName, Runnable task) {
+        com.hypixel.hytale.server.core.universe.world.World world = worldRegistry.getWorld(worldName);
+        if (world == null) return;
+        try {
+            world.execute(task);
+        } catch (Exception e) {
+            // world shutting down - the engine is cleaning up chunks; the task is a no-op
+        }
+    }
+
+    /**
+     * r4 test seam: applies one keep-loaded pin to the chunk instance currently
+     * resident at engineIndex (if any). Returns true when a pin was applied.
+     */
+    protected boolean applyKeepLoadedPin(String worldName, long engineIndex) {
+        com.hypixel.hytale.server.core.universe.world.World world = worldRegistry.getWorld(worldName);
+        if (world == null) return false;
+        com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk chunk =
+                chunkIfInMemory(world, engineIndex);
+        if (chunk == null) return false;
+        chunk.addKeepLoaded();
+        return true;
+    }
+
+    /**
+     * r4 test seam: releases one keep-loaded pin from the chunk instance currently
+     * resident at engineIndex (if any). Returns true when a pin was released.
+     */
+    protected boolean applyKeepLoadedRelease(String worldName, long engineIndex) {
+        com.hypixel.hytale.server.core.universe.world.World world = worldRegistry.getWorld(worldName);
+        if (world == null) return false;
+        com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk chunk =
+                chunkIfInMemory(world, engineIndex);
+        if (chunk == null) return false;
+        chunk.removeKeepLoaded();
+        return true;
     }
 
     /**
@@ -650,6 +697,76 @@ public class CacheManager {
     }
 
     /**
+     * r4 zone-aware pin dispatch. Queues a single world-thread task that applies
+     * this zone's keep-loaded pin to every chunk in the batch that is present at
+     * execution time. The live-pin stamp is recorded at execution time, against
+     * the chunk instance that actually received the pin (instance-anchored): a
+     * chunk evicted and re-published between the caller's presence check and this
+     * task's execution cannot be left with a missing or stale stamp. Tasks are
+     * idempotent: chunks that already carry a live stamp for this zone are
+     * skipped, so duplicate queued tasks for the same zone+chunk apply exactly
+     * one pin.
+     */
+    public void addKeepLoadedBatchForZone(String zoneId, String worldName, java.util.List<Long> engineIndexes) {
+        if (zoneId == null || engineIndexes == null || engineIndexes.isEmpty()) {
+            addKeepLoadedBatchAsync(worldName, engineIndexes);
+            return;
+        }
+        final String zone = zoneId;
+        final java.util.List<Long> indexes = engineIndexes;
+        submitWorldTask(worldName, () -> {
+            for (long packed : indexes) {
+                int cx = (int) (long) packed;
+                int cz = (int) (packed >>> 32);
+                if (hasLivePin(zone, worldName, cx, cz)) continue;
+                if (applyKeepLoadedPin(worldName, packed)) {
+                    recordPinAcquisition(zone, worldName, cx, cz);
+                }
+            }
+        });
+    }
+
+    /**
+     * r4 recovery reconciliation (world-thread-serialized). Re-fetches the LIVE
+     * owner set for this chunk, re-registers each owner (idempotent claim: an
+     * existing owner is not re-claimed), and queues a single world-thread task
+     * that re-acquires exactly one pin for every owner whose pin is not live on
+     * the reloaded instance (missing stamp, or a stamp older than the current
+     * pin generation). The task re-checks the live-pin stamp at execution time
+     * and skips zones whose pin was acquired in the meantime, so queued
+     * duplicates (a registration task and this reconciliation task racing on the
+     * same zone+chunk) apply exactly one pin.
+     *
+     * <p>Called from the keepalive recovery callback on the ping-completing
+     * thread; every pin mutation and stamp write happens on the world thread
+     * (via the queued task), total-ordered with registration pin tasks and the
+     * per-zone release path.
+     */
+    public void reconcileKeepLoadedPins(String worldName, int cx, int cz) {
+        java.util.Set<String> liveOwners = getChunkOwners(worldName, cx, cz);
+        if (liveOwners.isEmpty()) return;
+        long idx = ChunkUtil.indexChunk(cx, cz);
+        java.util.List<String> toRepin = new java.util.ArrayList<>();
+        for (String zoneId : liveOwners) {
+            int pinned = registerOwnershipBatch(zoneId, worldName, java.util.List.of(new int[]{cx, cz}));
+            if (pinned == 0 && !hasLivePin(zoneId, worldName, cx, cz)) {
+                toRepin.add(zoneId);
+            }
+        }
+        if (toRepin.isEmpty()) return;
+        final java.util.List<String> zones = toRepin;
+        final long finalIdx = idx;
+        submitWorldTask(worldName, () -> {
+            for (String zoneId : zones) {
+                if (hasLivePin(zoneId, worldName, cx, cz)) continue;
+                if (applyKeepLoadedPin(worldName, finalIdx)) {
+                    recordPinAcquisition(zoneId, worldName, cx, cz);
+                }
+            }
+        });
+    }
+
+    /**
      * F3: re-request ONE keep-loaded pin for a chunk the engine evicted. The pin
      * request lapsed together with the eviction, and the reloaded chunk's
      * per-instance counter (engine WorldChunk.keepLoaded) starts at zero, so the
@@ -668,13 +785,14 @@ public class CacheManager {
     }
 
     /**
-     * Zone-aware recovery re-pin: re-acquires this zone's keep-loaded pin on a reloaded
-     * chunk instance and stamps the acquisition on the current chunk pin generation, so
-     * a later recovery cycle on the same instance does not re-pin the same zone.
+     * Zone-aware recovery re-pin: re-acquires this zone's keep-loaded pin on a
+     * reloaded chunk instance. The zone task stamps the acquisition at execution
+     * time on the chunk instance that actually received the pin, so a later
+     * recovery cycle on the same instance does not re-pin the same zone (r4:
+     * queued duplicate pin tasks for the same zone+chunk are idempotent).
      */
     public void reacquireKeepLoadedPin(String worldName, int cx, int cz, String zoneId) {
-        addKeepLoadedBatchAsync(worldName, java.util.List.of(ChunkUtil.indexChunk(cx, cz)));
-        recordPinAcquisition(zoneId, worldName, cx, cz);
+        addKeepLoadedBatchForZone(zoneId, worldName, java.util.List.of(ChunkUtil.indexChunk(cx, cz)));
     }
 
     // ---- F3 pin-generation reconciliation -------------------------------------
@@ -769,9 +887,9 @@ public class CacheManager {
      *         acquisition: the dispatch is fire-and-forget and silently skips chunks
      *         that are not in the store, and a claim only applies to the chunk
      *         instance present at dispatch time. Callers recovering from an engine
-     *         eviction must pair this with {@link #hasLivePin} /
-     *         {@link #reacquireKeepLoadedPin(String, int, int, String)} - not infer
-     *         pin loss from the returned count alone.
+     *         eviction must use {@link #reconcileKeepLoadedPins(String, int, int)} -
+     *         it re-fetches the live owner set and re-pins only lapsed pins on the
+     *         world thread; do not infer pin loss from the returned count alone.
      */
     public int registerOwnershipBatch(String zoneId, String world, java.util.List<int[]> chunkCoords) {
         if (zoneId == null || chunkCoords == null || chunkCoords.isEmpty()) return 0;
@@ -789,18 +907,15 @@ public class CacheManager {
                     .add(zoneId);
             reverseKeys.add(key);
             if (added) {
+                // The zone task stamps at execution time (instance-anchored) - a
+                // check-time stamp could be stale (the chunk republished since) or
+                // missing (absent at check time, present at dispatch time), which is
+                // what left late-joining owners double-pinned (r4 P1).
                 engineIndexes.add(ChunkUtil.indexChunk(coord[0], coord[1]));
-                // A new owner's pin request only applies if the chunk is present in the
-                // store (the engine dispatch skips missing chunks). Stamp the
-                // acquisition so keepalive recovery can tell this live pin from one that
-                // lapsed with an evicted instance (double-pin guard).
-                if (isChunkStorePresent(world, ChunkUtil.indexChunk(coord[0], coord[1]))) {
-                    recordPinAcquisition(zoneId, world, coord[0], coord[1]);
-                }
             }
         }
         if (!engineIndexes.isEmpty()) {
-            addKeepLoadedBatchAsync(world, engineIndexes);
+            addKeepLoadedBatchForZone(zoneId, world, engineIndexes);
         }
         return engineIndexes.size();
     }
@@ -833,13 +948,12 @@ public class CacheManager {
                 .add(zoneId);
         recordReverseOwnership(zoneId, world, key);
         if (added) {
-            addKeepLoadedAsync(world, cx, cz);
+            // The chunk parameter being non-null means the chunk is in the store at
+            // call time; the zone task still resolves the instance at execution time
+            // (stamping is instance-anchored), so a re-published chunk is handled
+            // correctly (r4 P1).
+            addKeepLoadedBatchForZone(zoneId, world, java.util.List.of(ChunkUtil.indexChunk(cx, cz)));
             LOG.fine(() -> "[OptiPortal] addKeepLoaded: " + world + ":" + cx + ":" + cz + " (zone: " + zoneId + ")");
-            // The chunk parameter is a resolved chunk component: a non-null value means
-            // the chunk is in the store, so the queued pin applies to a live instance.
-            if (chunk != null) {
-                recordPinAcquisition(zoneId, world, cx, cz);
-            }
         }
     }
 
@@ -904,6 +1018,10 @@ public class CacheManager {
                     if (removed) {
                         // Per-zone pinning: release this zone's own pin unconditionally.
                         tryReleaseKeepLoaded(worldName, (int)(long) k, (int)(k >>> 32));
+                        // Clear this zone's stamp so a re-registered zone is not
+                        // skipped by the live-pin guard (parity with
+                        // deregisterOwnership and releaseZoneChunks).
+                        removePinStamp(worldName, k, zoneId);
                     }
                     return owners.isEmpty() ? null : owners;
                 });
@@ -947,6 +1065,12 @@ public class CacheManager {
     public void onChunkEvicted(String worldName, int cx, int cz) {
         ConcurrentHashMap<Long, Set<String>> worldMap = chunkOwnership.get(worldName);
         if (worldMap == null) return;
+
+        // Auditor-confirmed engine eviction = the same observation as a keepalive
+        // ping finding the chunk absent: the instance's pins are gone. Bump the
+        // pin generation so stale zone stamps for this chunk cannot feed the
+        // live-pin guard when the chunk is reloaded.
+        noteChunkEvicted(worldName, cx, cz);
 
         long key = packChunkIndex(cx, cz);
         Set<String> owners = worldMap.remove(key);
@@ -1009,6 +1133,10 @@ public class CacheManager {
         java.util.Map<String, CacheTier> downgrades = new java.util.HashMap<>();
         for (int[] coord : evictions) {
             long key = packChunkIndex(coord[0], coord[1]);
+            // Same generation semantics as the single-coord path: an engine
+            // eviction observed by the audit invalidates every stale zone stamp
+            // for this chunk (the instance's pins are gone).
+            noteChunkEvicted(worldName, coord[0], coord[1]);
             Set<String> owners = worldMap.remove(key);
             if (owners == null || owners.isEmpty()) continue;
             for (String zoneId : owners) {
@@ -1134,35 +1262,15 @@ public class CacheManager {
      * for each chunk — catastrophic when releasing a large zone during tier decay.
      */
     private void tryReleaseKeepLoaded(String worldName, int cx, int cz) {
-        com.hypixel.hytale.server.core.universe.world.World world = worldRegistry.getWorld(worldName);
-        if (world == null) return; // world unloaded — engine already cleaned up chunks
-
         long engineIndex = ChunkUtil.indexChunk(cx, cz);
-
-        // Fast pre-check: if the reference is absent the chunk is already evicted.
-        // getChunkReference() is thread-safe (StampedLock) and avoids an unnecessary
-        // world.execute() enqueue when there is nothing to release.
-        if (world.getChunkStore().getChunkReference(engineIndex) == null) return;
-
-        // Fire-and-forget dispatch to world thread. world.execute() just enqueues to
-        // the world's task queue — it does not block the calling thread.
-        // Wrap in try-catch: world.execute() throws SkipSentryException (RuntimeException)
-        // when acceptingTasks == false (world shutting down). In that case the engine is
-        // already cleaning up chunks, so the release is a no-op.
-        try {
-            world.execute(() -> {
-                com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk chunk =
-                        chunkIfInMemory(world, engineIndex); // fast path — we are on world thread
-                if (chunk != null) {
-                    chunk.removeKeepLoaded();
-                    LOG.fine(() -> "[OptiPortal] removeKeepLoaded: " + worldName + ":" + cx + ":" + cz);
-                }
-            });
-        } catch (Exception e) {
-            // SkipSentryException — world is shutting down, chunks are being cleaned up by engine
-            LOG.fine(() -> "[OptiPortal] tryReleaseKeepLoaded skipped (world shutting down): "
-                    + worldName + ":" + cx + ":" + cz);
-        }
+        // r4: the release resolves the live chunk instance at execution time and
+        // applies the decrement on the world thread (total-ordered with the
+        // pin-acquisition tasks), via the overridable seam.
+        submitWorldTask(worldName, () -> {
+            if (applyKeepLoadedRelease(worldName, engineIndex)) {
+                LOG.fine(() -> "[OptiPortal] removeKeepLoaded: " + worldName + ":" + cx + ":" + cz);
+            }
+        });
     }
 
     /** JSON-serialisable snapshot of tier state for persistence. */

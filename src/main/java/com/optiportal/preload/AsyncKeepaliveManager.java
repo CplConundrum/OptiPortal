@@ -259,35 +259,27 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
                     chunkFutures.add(surface.ping(index).whenComplete((r, ex) -> {
                         if (ex == null) {
                             // F2: a stop()/reschedule() in the ping gap must not let a
-                            // stale-generation pass re-register ownership (it would pin a
+                            // stale-generation pass reconcile pins (it would pin a
                             // former generation's chunk).
-                            if (epoch != lifecycleEpoch.get()) {
-                                stats.succeeded.incrementAndGet();
-                                return;
-                            }
-                            // F3: re-fetch the LIVE owner set. The reference captured at
-                            // collection time can be stale if the auditor stripped the
-                            // chunk's mapping in the ping gap - re-registering the
-                            // retained set would resurrect the stripped ownership and
-                            // leave pins with no owners.
-                            Set<String> liveOwners =
-                                    getCacheManager().getChunkOwners(worldName, coord.cx, coord.cz);
-                            for (String zoneId : liveOwners) {
-                                int pinned = getCacheManager().registerOwnershipBatch(
-                                        zoneId, worldName, List.of(new int[]{coord.cx, coord.cz}));
-                                // F3: per-zone pinning - a registration only issues a
-                                // pin when the zone is NEW to the chunk (pinned > 0).
-                                // That pin applies to the reloaded instance and is
-                                // stamped live by registerOwnershipBatch, so re-pinning
-                                // would double-count the owner (a late owner that
-                                // registered in the ping gap already holds its own pin).
-                                // An existing owner (pinned == 0) whose stamp is missing
-                                // or older than the current generation lost its pin
-                                // when the old instance was evicted: re-acquire exactly
-                                // one, balanced with the per-zone release path.
-                                if (pinned == 0
-                                        && !getCacheManager().hasLivePin(zoneId, worldName, coord.cx, coord.cz)) {
-                                    getCacheManager().reacquireKeepLoadedPin(worldName, coord.cx, coord.cz, zoneId);
+                            if (epoch == lifecycleEpoch.get()) {
+                                // r4: world-thread-serialized pin reconciliation.
+                                // Re-fetches the live owner set (a retained reference can
+                                // be stale if the auditor stripped the mapping in the
+                                // ping gap), re-registers each owner (idempotent claim),
+                                // and queues ONE world-thread task that re-pins exactly
+                                // the owners whose pin lapsed with the evicted instance
+                                // (missing/stale stamp). The task re-checks the live-pin
+                                // stamp at execution time, so queued duplicates (a
+                                // registration task and this reconciliation task racing
+                                // on the same zone+chunk) apply exactly one pin. All
+                                // pin mutations and stamp writes happen on the world
+                                // thread, total-ordered with registration pin tasks.
+                                try {
+                                    getCacheManager().reconcileKeepLoadedPins(
+                                            worldName, coord.cx, coord.cz);
+                                } catch (Exception e) {
+                                    LOG.warning(() -> "[OptiPortal] Keepalive recovery "
+                                            + "reconciliation failed: " + e.getMessage());
                                 }
                             }
                             stats.succeeded.incrementAndGet();

@@ -126,6 +126,16 @@ class AsyncKeepaliveManagerTest {
          *  behavior (a fake WorldRegistry has no worlds, so every check is false);
          *  a set = explicit control of which chunks the store reports present. */
         volatile Set<Long> presentChunks;
+        /** r4 test seam: the fake chunk instance's keep-loaded counters, keyed by
+         *  packed chunk index. A removed entry = a re-published (new) instance. */
+        final Map<Long, java.util.concurrent.atomic.AtomicInteger> pinCounters =
+                new java.util.concurrent.ConcurrentHashMap<>();
+        /** r4 test seam: records execution-time stamp writes (zone|world:cx,cz). */
+        final List<String> stampCalls = new ArrayList<>();
+        /** r4 test seam: world tasks held for explicit interleaving (holdWorldTasks). */
+        final List<Runnable> queuedWorldTasks = new ArrayList<>();
+        /** r4 test seam: hold world tasks until runQueuedWorldTasks() (queued interleavings). */
+        volatile boolean holdWorldTasks;
 
         RecordingCacheManager(FakePluginConfig cfg, ScheduledExecutorService exec) throws Exception {
             super(cfg, new WalManager(cfg), exec, new WorldRegistry(), null, new MetricsCollector());
@@ -150,6 +160,45 @@ class AsyncKeepaliveManagerTest {
         public void reacquireKeepLoadedPin(String worldName, int cx, int cz, String zoneId) {
             pinCalls.add(worldName + ":" + cx + ":" + cz + ":" + zoneId);
             super.reacquireKeepLoadedPin(worldName, cx, cz, zoneId);
+        }
+
+        @Override
+        protected void submitWorldTask(String worldName, Runnable task) {
+            if (holdWorldTasks) {
+                queuedWorldTasks.add(task);
+                return;
+            }
+            task.run();
+        }
+
+        @Override
+        protected boolean applyKeepLoadedPin(String worldName, long engineIndex) {
+            Set<Long> p = presentChunks;
+            if (p == null || !p.contains(engineIndex)) return false;
+            pinCounters.computeIfAbsent(engineIndex,
+                            k -> new java.util.concurrent.atomic.AtomicInteger()).incrementAndGet();
+            return true;
+        }
+
+        @Override
+        protected boolean applyKeepLoadedRelease(String worldName, long engineIndex) {
+            java.util.concurrent.atomic.AtomicInteger c = pinCounters.get(engineIndex);
+            if (c == null) return false;
+            c.decrementAndGet();
+            return true;
+        }
+
+        @Override
+        public void recordPinAcquisition(String zoneId, String worldName, int cx, int cz) {
+            stampCalls.add(zoneId + "|" + worldName + ":" + cx + "," + cz);
+            super.recordPinAcquisition(zoneId, worldName, cx, cz);
+        }
+
+        /** Runs (and clears) the world tasks held while holdWorldTasks was on. */
+        void runQueuedWorldTasks() {
+            holdWorldTasks = false;
+            for (Runnable t : queuedWorldTasks) t.run();
+            queuedWorldTasks.clear();
         }
     }
 
@@ -240,11 +289,18 @@ class AsyncKeepaliveManagerTest {
         fx.cm.registerOwnershipBatch("z2", "w1", List.of(new int[]{0, 0}));
         assertEquals(Set.of("z1", "z2"), fx.cm.getChunkOwners("w1", 0, 0), "precondition: two owners on one chunk");
 
+        // The ping's whenComplete callback runs synchronously here: reconciliation
+        // re-registers both owners (idempotent claims) and queues one world-thread
+        // task that re-pins the owners whose pin lapsed with the evicted instance
+        // (both - z1/z2 registered while the chunk was absent, so their pre-ping
+        // claims lapsed with the old instance).
+        ((RecordingCacheManager) fx.cm).presentChunks = java.util.Set.of(idx(0, 0));
         fx.ak.pingTier(CacheTier.HOT, "test");
-
-        assertEquals(Set.of("w1:0:0:z1", "w1:0:0:z2"),
-                new java.util.HashSet<>(((RecordingCacheManager) fx.cm).pinCalls),
+        RecordingCacheManager rec = (RecordingCacheManager) fx.cm;
+        assertEquals(2, pins(rec, idx(0, 0)),
                 "one re-acquired pin per current owner of the recovered chunk (balanced with the per-zone release path)");
+        assertTrue(rec.hasLivePin("z1", "w1", 0, 0) && rec.hasLivePin("z2", "w1", 0, 0),
+                "both owners' re-pins are stamped live on the reloaded instance");
         assertEquals(Set.of("z1", "z2"), fx.cm.getChunkOwners("w1", 0, 0), "F3: both owners' ownership is re-registered");
     }
     /**
@@ -279,13 +335,14 @@ class AsyncKeepaliveManagerTest {
         fx.surface.releaseLatch(); // the recovery callback runs now
 
         RecordingCacheManager rec = (RecordingCacheManager) fx.cm;
-        assertEquals(Set.of("w1:0:0:z1", "w1:0:0:z2"), new java.util.HashSet<>(rec.pinCalls),
-                "lapsed owners z1/z2 re-pinned once each; the late owner z3 already holds a live pin and must NOT be re-pinned");
         assertTrue(rec.regCalls.stream().anyMatch(c -> c.equals("z3|w1:0,0|1")),
                 "the late owner's own registration acquired its pin (pinned == 1)");
-        assertEquals(3, rec.pinCalls.size() + rec.regCalls.stream()
-                        .filter(c -> c.equals("z3|w1:0,0|1")).count(),
-                "3 owners hold 3 pin acquisitions on the live instance: z1+z2 re-acquires + z3's registration (z1/z2's pre-ping claims belonged to the evicted instance and lapsed with it)");
+        assertEquals(3, pins(rec, idx(0, 0)),
+                "3 owners hold exactly 3 pins on the live instance: z1+z2 re-acquires + z3's own registration (z1/z2's pre-ping claims belonged to the evicted instance and lapsed with it)");
+        assertTrue(rec.hasLivePin("z1", "w1", 0, 0)
+                        && rec.hasLivePin("z2", "w1", 0, 0)
+                        && rec.hasLivePin("z3", "w1", 0, 0),
+                "every owner holds exactly one live-stamped pin on the new instance");
         // Release every owner: each release balances exactly one acquisition, so no
         // keep-loaded count survives with zero owners (the reviewer's residue probe).
         fx.cm.releaseZoneChunks("z1");
@@ -293,6 +350,8 @@ class AsyncKeepaliveManagerTest {
         fx.cm.releaseZoneChunks("z3");
         assertEquals(Set.of(), fx.cm.getChunkOwners("w1", 0, 0),
                 "all owners released - no ownership (and therefore no orphaned pin) remains");
+        assertEquals(0, pins(rec, idx(0, 0)),
+                "no keep-loaded count survives after all owners release");
     }
 
     /**
@@ -318,10 +377,119 @@ class AsyncKeepaliveManagerTest {
         fx.cm.onChunksEvicted("w1", List.of(new int[]{0, 0}));
         fx.surface.releaseLatch(); // the recovery callback runs now
 
-        assertEquals(List.of(), ((RecordingCacheManager) fx.cm).pinCalls,
+        assertEquals(0, pins((RecordingCacheManager) fx.cm, idx(0, 0)),
                 "no re-pins for a stripped chunk (the live owner set is empty)");
+        assertTrue(((RecordingCacheManager) fx.cm).stampCalls.isEmpty(),
+                "no stamps were written for the stripped chunk");
         assertEquals(Set.of(), fx.cm.getChunkOwners("w1", 0, 0),
                 "stripped ownership is not resurrected by the recovery callback");
+    }
+
+    /** The fake chunk instance's keep-loaded counter for a packed chunk index. */
+    private static int pins(RecordingCacheManager cm, long idx) {
+        java.util.concurrent.atomic.AtomicInteger c = cm.pinCounters.get(idx);
+        return c == null ? 0 : c.get();
+    }
+
+    @Test
+    void registrationWhileAbsentThenRepublishPinsExactlyOncePerOwner() throws Exception {
+        Set<Long> resident = new java.util.LinkedHashSet<>();
+        Fixture fx = new Fixture(resident); // chunk (0,0) not resident: evicted
+        ((RecordingCacheManager) fx.cm).presentChunks = resident;
+        fx.storage.save(zone("z1", 0, 0, 1));
+        fx.storage.save(zone("z2", 0, 0, 1));
+        fx.cm.setZoneTier("z1", CacheTier.HOT);
+        fx.cm.setZoneTier("z2", CacheTier.HOT);
+        fx.cm.registerOwnershipBatch("z1", "w1", List.of(new int[]{0, 0}));
+        fx.cm.registerOwnershipBatch("z2", "w1", List.of(new int[]{0, 0}));
+        // Absent at registration: nothing to apply, no live stamps (their claims
+        // lapsed with the evicted instance).
+        resident.add(idx(0, 0)); // the republished (new) instance is now in the store
+        RecordingCacheManager rec = (RecordingCacheManager) fx.cm;
+        assertEquals(0, pins(rec, idx(0, 0)), "precondition: the absent chunk held no pins");
+        rec.reconcileKeepLoadedPins("w1", 0, 0);
+        assertEquals(2, pins(rec, idx(0, 0)),
+                "each current owner holds exactly one pin on the reloaded instance (the r4 P1 window: register while absent, republish, reconcile)");
+        assertTrue(rec.hasLivePin("z1", "w1", 0, 0) && rec.hasLivePin("z2", "w1", 0, 0),
+                "both pins are stamped live on the new instance (reconciliation is idempotent per zone+chunk)");
+        fx.cm.releaseZoneChunks("z1");
+        fx.cm.releaseZoneChunks("z2");
+        assertEquals(0, pins(rec, idx(0, 0)),
+                "releases balance exactly the re-pins - zero residue with zero owners");
+    }
+
+    @Test
+    void queuedDuplicatePinTasksApplyExactlyOnePin() throws Exception {
+        Set<Long> resident = new java.util.LinkedHashSet<>(java.util.Set.of(idx(0, 0)));
+        Fixture fx = new Fixture(resident);
+        ((RecordingCacheManager) fx.cm).presentChunks = resident;
+        fx.storage.save(zone("z1", 0, 0, 1));
+        fx.cm.setZoneTier("z1", CacheTier.HOT);
+        RecordingCacheManager rec = (RecordingCacheManager) fx.cm;
+        rec.registerOwnershipBatch("z1", "w1", List.of(new int[]{0, 0}));
+        rec.holdWorldTasks = true;
+        // Two tasks race for the same zone+chunk: the recovery re-pin (queued by the
+        // reconciliation) and a duplicate zone-aware re-pin (a registration task
+        // queued in the same window). The instance is evicted between the
+        // registration and task execution; the republished instance must receive
+        // exactly ONE pin from the two queued tasks.
+        rec.reacquireKeepLoadedPin("w1", 0, 0, "z1");
+        rec.noteChunkEvicted("w1", 0, 0); // the instance's pins are gone (gen bump)
+        rec.pinCounters.remove(idx(0, 0)); // the republished (new) instance
+        rec.reconcileKeepLoadedPins("w1", 0, 0);
+        assertEquals(2, rec.queuedWorldTasks.size(),
+                "both tasks are queued before either executes");
+        rec.runQueuedWorldTasks();
+        assertEquals(1, pins(rec, idx(0, 0)),
+                "queued duplicate pin tasks for the same zone+chunk apply exactly one pin (the execution-time live-pin guard makes tasks idempotent)");
+        assertTrue(rec.hasLivePin("z1", "w1", 0, 0),
+                "the surviving pin is stamped live on the new instance");
+        rec.holdWorldTasks = false;
+        fx.cm.releaseZoneChunks("z1");
+        assertEquals(0, pins(rec, idx(0, 0)), "the release balances the single pin");
+    }
+
+    @Test
+    void auditorEvictionInvalidatesStaleStamps() throws Exception {
+        Set<Long> resident = new java.util.LinkedHashSet<>();
+        Fixture fx = new Fixture(resident); // chunk (0,0) not resident
+        ((RecordingCacheManager) fx.cm).presentChunks = resident;
+        fx.storage.save(zone("z1", 0, 0, 1));
+        fx.cm.setZoneTier("z1", CacheTier.HOT);
+        RecordingCacheManager rec = (RecordingCacheManager) fx.cm;
+        rec.registerOwnershipBatch("z1", "w1", List.of(new int[]{0, 0})); // absent: nothing applied
+        // Auditor-confirmed engine eviction (a different observation path than the
+        // keepalive ping): it must invalidate every stale zone stamp, so a later
+        // re-registration on the reloaded chunk re-pins from scratch.
+        rec.onChunkEvicted("w1", 0, 0);
+        assertEquals(Set.of(), rec.getChunkOwners("w1", 0, 0), "the eviction stripped the ownership mapping");
+        resident.add(idx(0, 0)); // the reloaded (new) instance
+        rec.registerOwnership("z1", "w1", 0, 0);
+        assertEquals(1, pins(rec, idx(0, 0)),
+                "the re-registration re-pinned the reloaded instance exactly once (no stale stamp from the evicted instance fed the live-pin guard)");
+        fx.cm.releaseZoneChunks("z1");
+        assertEquals(0, pins(rec, idx(0, 0)), "the release balances the re-registration");
+    }
+
+    @Test
+    void releaseClearsPinStampSoReclaimIsNotSkipped() throws Exception {
+        Set<Long> resident = new java.util.LinkedHashSet<>(java.util.Set.of(idx(0, 0)));
+        Fixture fx = new Fixture(resident);
+        ((RecordingCacheManager) fx.cm).presentChunks = resident;
+        fx.storage.save(zone("z1", 0, 0, 1)); // COLD tier (default)
+        RecordingCacheManager rec = (RecordingCacheManager) fx.cm;
+        rec.registerOwnershipBatch("z1", "w1", List.of(new int[]{0, 0}));
+        assertEquals(1, pins(rec, idx(0, 0)), "precondition: the pin applied and stamped");
+        // Engine eviction of a COLD-owned chunk runs deregisterAllChunks (the full
+        // deregistration path): it must clear the zone's stamp, so a re-registered
+        // zone is not skipped by the live-pin guard.
+        rec.onChunksEvicted("w1", List.of(new int[]{0, 0}));
+        rec.pinCounters.remove(idx(0, 0)); // the republished (new) instance
+        rec.registerOwnership("z1", "w1", 0, 0);
+        assertEquals(1, pins(rec, idx(0, 0)),
+                "re-registration after a full deregistration re-pins the new instance exactly once (the deregistration cleared the stale stamp)");
+        fx.cm.releaseZoneChunks("z1");
+        assertEquals(0, pins(rec, idx(0, 0)), "the release balances the re-registration");
     }
 
     @Test
