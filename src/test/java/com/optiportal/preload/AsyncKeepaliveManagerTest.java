@@ -163,12 +163,13 @@ class AsyncKeepaliveManagerTest {
         }
 
         @Override
-        protected void submitWorldTask(String worldName, Runnable task) {
+        protected boolean submitWorldTask(String worldName, Runnable task) {
             if (holdWorldTasks) {
                 queuedWorldTasks.add(task);
-                return;
+                return true;
             }
             task.run();
+            return true;
         }
 
         @Override
@@ -192,6 +193,17 @@ class AsyncKeepaliveManagerTest {
         public void recordPinAcquisition(String zoneId, String worldName, int cx, int cz) {
             stampCalls.add(zoneId + "|" + worldName + ":" + cx + "," + cz);
             super.recordPinAcquisition(zoneId, worldName, cx, cz);
+        }
+
+        /** F7 test seam: force reconcileKeepLoadedPins to throw (keepalive-error accounting). */
+        volatile boolean failReconcile;
+
+        @Override
+        public void reconcileKeepLoadedPins(String worldName, int cx, int cz) {
+            if (failReconcile) {
+                throw new IllegalStateException("forced reconciliation failure (test)");
+            }
+            super.reconcileKeepLoadedPins(worldName, cx, cz);
         }
 
         /** Runs (and clears) the world tasks held while holdWorldTasks was on. */
@@ -451,22 +463,27 @@ class AsyncKeepaliveManagerTest {
 
     @Test
     void auditorEvictionInvalidatesStaleStamps() throws Exception {
-        Set<Long> resident = new java.util.LinkedHashSet<>();
-        Fixture fx = new Fixture(resident); // chunk (0,0) not resident
+        Set<Long> resident = new java.util.LinkedHashSet<>(java.util.Set.of(idx(0, 0))); // chunk IS resident
+        Fixture fx = new Fixture(resident);
         ((RecordingCacheManager) fx.cm).presentChunks = resident;
         fx.storage.save(zone("z1", 0, 0, 1));
         fx.cm.setZoneTier("z1", CacheTier.HOT);
         RecordingCacheManager rec = (RecordingCacheManager) fx.cm;
-        rec.registerOwnershipBatch("z1", "w1", List.of(new int[]{0, 0})); // absent: nothing applied
+        rec.registerOwnershipBatch("z1", "w1", List.of(new int[]{0, 0}));
+        assertEquals(1, pins(rec, idx(0, 0)),
+                "precondition: the pin applied and stamped while the chunk was present");
         // Auditor-confirmed engine eviction (a different observation path than the
-        // keepalive ping): it must invalidate every stale zone stamp, so a later
-        // re-registration on the reloaded chunk re-pins from scratch.
+        // keepalive ping): it must invalidate the LIVE stamp written above (generation
+        // bump), so a later re-registration on the reloaded chunk re-pins from scratch.
+        // (A register-while-ABSENT fixture would never write a stamp and cannot detect
+        // a missing generation bump - the register-while-PRESENT shape is the one that
+        // discriminates the eviction-stamp path.)
         rec.onChunkEvicted("w1", 0, 0);
         assertEquals(Set.of(), rec.getChunkOwners("w1", 0, 0), "the eviction stripped the ownership mapping");
-        resident.add(idx(0, 0)); // the reloaded (new) instance
+        rec.pinCounters.remove(idx(0, 0)); // the republished (new) instance
         rec.registerOwnership("z1", "w1", 0, 0);
         assertEquals(1, pins(rec, idx(0, 0)),
-                "the re-registration re-pinned the reloaded instance exactly once (no stale stamp from the evicted instance fed the live-pin guard)");
+                "the re-registration re-pinned the reloaded instance exactly once (the live stamp from the evicted instance did not feed the live-pin guard - the eviction bumped the pin generation)");
         fx.cm.releaseZoneChunks("z1");
         assertEquals(0, pins(rec, idx(0, 0)), "the release balances the re-registration");
     }
@@ -490,6 +507,73 @@ class AsyncKeepaliveManagerTest {
                 "re-registration after a full deregistration re-pins the new instance exactly once (the deregistration cleared the stale stamp)");
         fx.cm.releaseZoneChunks("z1");
         assertEquals(0, pins(rec, idx(0, 0)), "the release balances the re-registration");
+    }
+
+    @Test
+    void deregisterAllChunksClearsPinStampSoReclaimIsNotSkipped() throws Exception {
+        Set<Long> resident = new java.util.LinkedHashSet<>(java.util.Set.of(idx(0, 0)));
+        Fixture fx = new Fixture(resident);
+        ((RecordingCacheManager) fx.cm).presentChunks = resident;
+        fx.storage.save(zone("z1", 0, 0, 1));
+        RecordingCacheManager rec = (RecordingCacheManager) fx.cm;
+        rec.registerOwnershipBatch("z1", "w1", List.of(new int[]{0, 0}));
+        assertEquals(1, pins(rec, idx(0, 0)), "precondition: the pin applied and stamped");
+        // Full zone deregistration WITHOUT an engine eviction (e.g. the zone went COLD
+        // while the chunk stayed loaded): the chunk instance is still live, so the only
+        // thing that can keep a later re-registration from being skipped by the
+        // live-pin guard is the stamp clear on the deregistration path.
+        rec.deregisterAllChunks("z1");
+        assertEquals(0, pins(rec, idx(0, 0)),
+                "the release balanced the zone's pin (no eviction, instance still live)");
+        rec.registerOwnership("z1", "w1", 0, 0);
+        assertEquals(1, pins(rec, idx(0, 0)),
+                "re-registration after a full deregistration re-pins exactly once (the deregistration path cleared the zone's stamp)");
+        fx.cm.releaseZoneChunks("z1");
+        assertEquals(0, pins(rec, idx(0, 0)), "the release balances the re-registration");
+    }
+
+    @Test
+    void releaseOfLapsedPinDoesNotTouchNewInstanceCounter() throws Exception {
+        Set<Long> resident = new java.util.LinkedHashSet<>(java.util.Set.of(idx(0, 0)));
+        Fixture fx = new Fixture(resident);
+        ((RecordingCacheManager) fx.cm).presentChunks = resident;
+        fx.storage.save(zone("z1", 0, 0, 1));
+        fx.storage.save(zone("z2", 0, 0, 1));
+        fx.cm.setZoneTier("z1", CacheTier.HOT);
+        fx.cm.setZoneTier("z2", CacheTier.HOT);
+        RecordingCacheManager rec = (RecordingCacheManager) fx.cm;
+        rec.registerOwnershipBatch("z1", "w1", List.of(new int[]{0, 0})); // z1 pins instance A (stamped @gen0)
+        // Engine eviction: A's pins are gone; a republished (new) instance starts at zero.
+        rec.noteChunkEvicted("w1", 0, 0);
+        rec.pinCounters.remove(idx(0, 0));
+        // z2 registers after the republish: its pin is live on the new instance.
+        rec.registerOwnershipBatch("z2", "w1", List.of(new int[]{0, 0}));
+        assertEquals(1, pins(rec, idx(0, 0)), "precondition: only z2's live pin on the new instance");
+        // z1's pin lapsed with the evicted instance. Release z1 now: at execution time
+        // its stamp is stale (gen0 < gen1), so the release must NOT decrement the new
+        // instance's counter (P3) - z2's pin must survive untouched.
+        fx.cm.releaseZoneChunks("z1");
+        assertEquals(1, pins(rec, idx(0, 0)),
+                "a lapsed pin's release does not touch the republished instance's counter (z2's live pin survives)");
+        fx.cm.releaseZoneChunks("z2");
+        assertEquals(0, pins(rec, idx(0, 0)), "z2's release balances its own pin - zero residue");
+    }
+
+    @Test
+    void reconciliationFailureRecordsKeepaliveError() throws Exception {
+        Set<Long> resident = new java.util.LinkedHashSet<>(); // the zone's chunk is NOT resident
+        Fixture fx = new Fixture(resident);
+        ((RecordingCacheManager) fx.cm).presentChunks = resident;
+        fx.storage.save(zone("z1", 0, 0, 1));
+        fx.cm.setZoneTier("z1", CacheTier.HOT);
+        RecordingCacheManager rec = (RecordingCacheManager) fx.cm;
+        // Register first so the chunk has an owner (the F3 recovery path only runs for
+        // owned chunks); the chunk is absent, so the ping drives the recovery.
+        rec.registerOwnershipBatch("z1", "w1", List.of(new int[]{0, 0})); // absent: nothing applied
+        rec.failReconcile = true;
+        fx.ak.pingTier(CacheTier.HOT, "test");
+        assertTrue(fx.metrics.getKeepaliveErrorCount() >= 1,
+                "F7: a failed keepalive reconciliation is a keepalive error, not a log-only blip");
     }
 
     @Test

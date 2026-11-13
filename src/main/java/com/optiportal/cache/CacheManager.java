@@ -286,8 +286,10 @@ public class CacheManager {
                 worldMap.computeIfPresent(key, (k, owners) -> {
                     boolean removed = owners.remove(zoneId);
                     if (removed) {
-                        tryReleaseKeepLoaded(worldName, (int)(long) k, (int)(k >>> 32));
-                        removePinStamp(worldName, k, zoneId);
+                        // P3: stamp-conditional release — the queued world task
+                        // decrements only if this zone's pin is live on the current
+                        // instance, and the task owns the stamp clear.
+                        tryReleaseKeepLoaded(worldName, (int)(long) k, (int)(k >>> 32), zoneId);
                     }
                     return owners.isEmpty() ? null : owners;
                 });
@@ -602,14 +604,21 @@ public class CacheManager {
      * (fire-and-forget; a world that is shutting down drops the task). Tests
      * override this to run tasks synchronously (simulating world-thread
      * serialization) or hold them (queued-task interleavings).
+     *
+     * @return true when the task was accepted (queued or run); false when the
+     *         world is gone or shutting down and the task was dropped. P3 callers
+     *         that own state the task would have cleared (e.g. a pin stamp) use
+     *         this to fall back to clearing it on the calling thread.
      */
-    protected void submitWorldTask(String worldName, Runnable task) {
+    protected boolean submitWorldTask(String worldName, Runnable task) {
         com.hypixel.hytale.server.core.universe.world.World world = worldRegistry.getWorld(worldName);
-        if (world == null) return;
+        if (world == null) return false;
         try {
             world.execute(task);
+            return true;
         } catch (Exception e) {
             // world shutting down - the engine is cleaning up chunks; the task is a no-op
+            return false;
         }
     }
 
@@ -641,31 +650,6 @@ public class CacheManager {
         return true;
     }
 
-    /**
-     * Fire-and-forget world-thread dispatch to increment keepLoaded on a chunk.
-     * Mirror of tryReleaseKeepLoaded — used by the dedup registerOwnership path
-     * to give each zone its own independent keepLoaded pin.
-     */
-    private void addKeepLoadedAsync(String worldName, int cx, int cz) {
-        com.hypixel.hytale.server.core.universe.world.World world = worldRegistry.getWorld(worldName);
-        if (world == null) return;
-        long engineIndex = ChunkUtil.indexChunk(cx, cz);
-        if (world.getChunkStore().getChunkReference(engineIndex) == null) return;
-        try {
-            world.execute(() -> {
-                com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk chunk =
-                        chunkIfInMemory(world, engineIndex);
-                if (chunk != null) {
-                    chunk.addKeepLoaded();
-                    LOG.fine(() -> "[OptiPortal] addKeepLoaded (dedup): " + worldName + ":" + cx + ":" + cz);
-                }
-            });
-        } catch (Exception e) {
-            // SkipSentryException — world shutting down, engine is cleaning up chunks
-            LOG.fine(() -> "[OptiPortal] addKeepLoadedAsync skipped (world shutting down): "
-                    + worldName + ":" + cx + ":" + cz);
-        }
-    }
 
     /**
      * Batch variant of addKeepLoadedAsync — submits a single world.execute() task
@@ -776,13 +760,6 @@ public class CacheManager {
      * addKeepLoadedBatchAsync skips absent chunks, so this is a no-op before the
      * reload lands.
      */
-    /**
-     * Legacy recovery re-pin: re-acquires the keep-loaded pin without recording which
-     * zone's pin it is (no stamp). Use the zone-aware overload from keepalive recovery.
-     */
-    public void reacquireKeepLoadedPin(String worldName, int cx, int cz) {
-        reacquireKeepLoadedPin(worldName, cx, cz, null);
-    }
 
     /**
      * Zone-aware recovery re-pin: re-acquires this zone's keep-loaded pin on a
@@ -885,8 +862,9 @@ public class CacheManager {
      *         zone was a new owner) - 0 when the zone already owned every chunk in the
      *         batch. A claim is a queued pin request, not a confirmed engine
      *         acquisition: the dispatch is fire-and-forget and silently skips chunks
-     *         that are not in the store, and a claim only applies to the chunk
-     *         instance present at dispatch time. Callers recovering from an engine
+     *         that are not in the store, and a claim applies only to the chunk
+     *         instance present when the zone task executes (execution-time
+     *         instance anchoring). Callers recovering from an engine
      *         eviction must use {@link #reconcileKeepLoadedPins(String, int, int)} -
      *         it re-fetches the live owner set and re-pins only lapsed pins on the
      *         world thread; do not infer pin loss from the returned count alone.
@@ -977,11 +955,10 @@ public class CacheManager {
                 worldMap.computeIfPresent(key, (k, owners) -> {
                     boolean removed = owners.remove(zoneId);
                     if (removed) {
-                        // Release this zone's own pin unconditionally (per-zone pinning).
-                        tryReleaseKeepLoaded(world, cx + finalDx, cz + finalDz);
-                        // The released pin is no longer live: drop the stamp so a
-                        // re-registration (or a later recovery) cannot inherit it.
-                        removePinStamp(world, key, zoneId);
+                        // P3: stamp-conditional release — the queued world task
+                        // decrements only if the zone's pin is live on the current
+                        // instance, and the task owns the stamp clear.
+                        tryReleaseKeepLoaded(world, cx + finalDx, cz + finalDz, zoneId);
                     }
                     return owners.isEmpty() ? null : owners;
                 });
@@ -1016,12 +993,10 @@ public class CacheManager {
                 worldMap.computeIfPresent(key, (k, owners) -> {
                     boolean removed = owners.remove(zoneId);
                     if (removed) {
-                        // Per-zone pinning: release this zone's own pin unconditionally.
-                        tryReleaseKeepLoaded(worldName, (int)(long) k, (int)(k >>> 32));
-                        // Clear this zone's stamp so a re-registered zone is not
-                        // skipped by the live-pin guard (parity with
-                        // deregisterOwnership and releaseZoneChunks).
-                        removePinStamp(worldName, k, zoneId);
+                        // P3: stamp-conditional release — the queued world task
+                        // decrements only if the zone's pin is live on the current
+                        // instance, and the task owns the stamp clear.
+                        tryReleaseKeepLoaded(worldName, (int)(long) k, (int)(k >>> 32), zoneId);
                     }
                     return owners.isEmpty() ? null : owners;
                 });
@@ -1248,29 +1223,43 @@ public class CacheManager {
     }
 
     /**
-     * Release the engine keep-loaded pin on a chunk when the last OptiPortal zone
-     * relinquishes ownership of it.
+     * Release a single chunk's keep-loaded pin, conditionally and zone-scoped (P3).
      *
-     * Threading: safe to call from any thread. Uses two non-blocking steps:
-     *   1. getChunkReference() — StampedLock map lookup, thread-safe, no dispatch.
-     *   2. world.execute(Runnable) — enqueues a task on the world-thread task queue and
-     *      returns immediately (fire-and-forget). The task calls getChunkIfInMemory()
-     *      on the world thread (fast path — no re-dispatch) then decrements keepLoaded.
+     * Threading: safe to call from any thread. The decrement is applied on the
+     * world thread via a queued task (total-ordered with the pin-acquisition
+     * tasks), and the task runs stamp-conditionally: it decrements the live
+     * instance's counter only when this zone's pin is live on that instance
+     * ({@link #hasLivePin} — the stamp was written at or after the chunk's last
+     * observed eviction). A pin that lapsed with an evicted instance must not
+     * touch the new instance's counter (the pin died with the old instance):
+     * the stale stamp is cleared instead, so a later re-registration is not
+     * skipped by the live-pin guard. The task owns the stamp clear so the
+     * decrement and the clear stay total-ordered with all other world-thread
+     * pin tasks; if the world is already gone (shutdown/reload, task would be
+     * dropped) the stamp is cleared on the calling thread instead.
      *
-     * Does NOT use getChunkIfInMemory() directly off-thread because that overload calls
-     * CompletableFuture.supplyAsync(..., world).join(), which blocks the calling thread
-     * for each chunk — catastrophic when releasing a large zone during tier decay.
+     * @param worldName the world name
+     * @param cx        chunk X
+     * @param cz        chunk Z
+     * @param zoneId    the zone whose pin is being released
      */
-    private void tryReleaseKeepLoaded(String worldName, int cx, int cz) {
+    private void tryReleaseKeepLoaded(String worldName, int cx, int cz, String zoneId) {
         long engineIndex = ChunkUtil.indexChunk(cx, cz);
-        // r4: the release resolves the live chunk instance at execution time and
-        // applies the decrement on the world thread (total-ordered with the
-        // pin-acquisition tasks), via the overridable seam.
-        submitWorldTask(worldName, () -> {
-            if (applyKeepLoadedRelease(worldName, engineIndex)) {
-                LOG.fine(() -> "[OptiPortal] removeKeepLoaded: " + worldName + ":" + cx + ":" + cz);
-            }
-        });
+        // P3: stamp-conditional decrement — the queued world task touches the live
+        // instance's counter only when this zone's pin is live on it, and owns the
+        // stamp clear so the two stay total-ordered with all pin tasks. If the task
+        // is dropped (world shutting down), the stamp is cleared on the calling
+        // thread instead so a re-registered zone is not skipped by the live-pin guard.
+        if (!submitWorldTask(worldName, () -> {
+                if (hasLivePin(zoneId, worldName, cx, cz)) {
+                    if (applyKeepLoadedRelease(worldName, engineIndex)) {
+                        LOG.fine(() -> "[OptiPortal] removeKeepLoaded: " + worldName + ":" + cx + ":" + cz);
+                    }
+                }
+                removePinStamp(worldName, engineIndex, zoneId);
+            })) {
+            removePinStamp(worldName, engineIndex, zoneId);
+        }
     }
 
     /** JSON-serialisable snapshot of tier state for persistence. */

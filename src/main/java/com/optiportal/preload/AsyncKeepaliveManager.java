@@ -278,6 +278,9 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
                                     getCacheManager().reconcileKeepLoadedPins(
                                             worldName, coord.cx, coord.cz);
                                 } catch (Exception e) {
+                                    // F7: a failed reconciliation is a keepalive error
+                                    // (metrics-visible), not a log-only blip.
+                                    metrics.recordKeepaliveError(tier.name());
                                     LOG.warning(() -> "[OptiPortal] Keepalive recovery "
                                             + "reconciliation failed: " + e.getMessage());
                                 }
