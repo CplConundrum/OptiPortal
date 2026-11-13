@@ -136,6 +136,9 @@ class AsyncKeepaliveManagerTest {
         final List<Runnable> queuedWorldTasks = new ArrayList<>();
         /** r4 test seam: hold pin tasks until runQueuedWorldTasks() (queued interleavings). */
         volatile boolean holdWorldTasks;
+        /** P3 test seam: drop pin tasks (executor shut down) — the caller-side
+         *  fallback path must then clear the stamp on the calling thread. */
+        volatile boolean rejectPinTasks;
 
         RecordingCacheManager(FakePluginConfig cfg, ScheduledExecutorService exec) throws Exception {
             super(cfg, new WalManager(cfg), exec, new WorldRegistry(), null, new MetricsCollector());
@@ -168,6 +171,7 @@ class AsyncKeepaliveManagerTest {
                 queuedWorldTasks.add(task);
                 return true;
             }
+            if (rejectPinTasks) return false;
             task.run();
             return true;
         }
@@ -539,6 +543,102 @@ class AsyncKeepaliveManagerTest {
         // Now run the rest (the release task): it balances nothing and leaves zero residue.
         rec.runQueuedWorldTasks();
         assertEquals(0, pins(rec, idx(0, 0)), "the release is a no-op balance - zero residue");
+    }
+
+    @Test
+    void nonDiagonalChunkReleaseClearsStamp() throws Exception {
+        // Goldfish battery Blocker regression: pin stamps are bookkept under
+        // packChunkIndex (low 32 = cx, high 32 = cz) while the engine counter
+        // uses ChunkUtil.indexChunk (high 32 = cx, low 32 = cz). For a
+        // non-diagonal chunk these DIFFER, so clearing the stamp with the
+        // engine index would leave the stamp live and make hasLivePin (and
+        // therefore re-registration) believe the pin is still held.
+        Set<Long> resident = new java.util.LinkedHashSet<>(java.util.Set.of(idx(1, 2)));
+        Fixture fx = new Fixture(resident);
+        ((RecordingCacheManager) fx.cm).presentChunks = resident;
+        fx.storage.save(zone("z1", 1, 2, 1));
+        fx.cm.setZoneTier("z1", CacheTier.HOT);
+        RecordingCacheManager rec = (RecordingCacheManager) fx.cm;
+        rec.registerOwnershipBatch("z1", "w1", List.of(new int[]{1, 2}));
+        assertEquals(1, pins(rec, idx(1, 2)), "precondition: one pin + live stamp on the non-diagonal chunk");
+        assertTrue(rec.hasLivePin("z1", "w1", 1, 2), "precondition: the stamp is live");
+        fx.cm.releaseZoneChunks("z1");
+        assertEquals(0, pins(rec, idx(1, 2)), "the release decremented the counter");
+        assertFalse(rec.hasLivePin("z1", "w1", 1, 2),
+                "the stamp was cleared under its bookkeeping key (a re-registration must re-pin, not skip)");
+    }
+
+    @Test
+    void heldReleaseTaskSeesExecutionTimeStampState() throws Exception {
+        // P3 timing discrimination (goldfish battery): the release task's
+        // hasLivePin check must run at EXECUTION time, not submission time.
+        // Hold the release task, swap the chunk instance in the gap, then drain:
+        // an execution-time check sees the lapsed stamp and leaves the new
+        // instance's counter untouched; a submission-time decision would
+        // decrement it.
+        Set<Long> resident = new java.util.LinkedHashSet<>(java.util.Set.of(idx(0, 0)));
+        Fixture fx = new Fixture(resident);
+        ((RecordingCacheManager) fx.cm).presentChunks = resident;
+        fx.storage.save(zone("z1", 0, 0, 1));
+        fx.cm.setZoneTier("z1", CacheTier.HOT);
+        RecordingCacheManager rec = (RecordingCacheManager) fx.cm;
+        rec.registerOwnershipBatch("z1", "w1", List.of(new int[]{0, 0}));
+        assertEquals(1, pins(rec, idx(0, 0)), "precondition: one pin + live stamp");
+        rec.holdWorldTasks = true;
+        fx.cm.releaseZoneChunks("z1"); // release task queued (held)
+        // The instance swaps in the gap: the old instance's pin lapses (gen
+        // bump) and the new instance starts at counter 0.
+        rec.noteChunkEvicted("w1", 0, 0);
+        rec.pinCounters.put(idx(0, 0), new java.util.concurrent.atomic.AtomicInteger(0));
+        rec.runQueuedWorldTasks();
+        assertEquals(0, pins(rec, idx(0, 0)),
+                "the execution-time check saw the lapsed stamp and left the new instance's counter untouched");
+        assertFalse(rec.hasLivePin("z1", "w1", 0, 0), "the stale stamp was cleared by the task");
+    }
+
+    @Test
+    void droppedReleaseTaskClearsStampOnCallingThread() throws Exception {
+        // P3 dropped-task fallback (goldfish battery): when the executor drops
+        // the release task (shutdown), the caller-side fallback must clear the
+        // stamp so a later re-registration is not skipped by the live-pin guard.
+        Set<Long> resident = new java.util.LinkedHashSet<>(java.util.Set.of(idx(0, 0)));
+        Fixture fx = new Fixture(resident);
+        ((RecordingCacheManager) fx.cm).presentChunks = resident;
+        fx.storage.save(zone("z1", 0, 0, 1));
+        fx.cm.setZoneTier("z1", CacheTier.HOT);
+        RecordingCacheManager rec = (RecordingCacheManager) fx.cm;
+        rec.registerOwnershipBatch("z1", "w1", List.of(new int[]{0, 0}));
+        assertEquals(1, pins(rec, idx(0, 0)), "precondition: one pin + live stamp");
+        rec.rejectPinTasks = true;
+        fx.cm.releaseZoneChunks("z1"); // the decrement task is dropped
+        assertEquals(1, pins(rec, idx(0, 0)), "the dropped task did not decrement the counter");
+        assertFalse(rec.hasLivePin("z1", "w1", 0, 0),
+                "the caller-side fallback cleared the stamp (a re-registration must not skip the pin)");
+    }
+
+    @Test
+    void queuedReleaseThenReacquisitionEndsBalanced() throws Exception {
+        // Goldfish battery (release-before-acquisition ordering): a release task
+        // queued at deregistration, then a re-registration task, drained in
+        // queue order must end balanced: the release clears the old pin and the
+        // re-acquisition pins the still-owned chunk exactly once.
+        Set<Long> resident = new java.util.LinkedHashSet<>(java.util.Set.of(idx(0, 0)));
+        Fixture fx = new Fixture(resident);
+        ((RecordingCacheManager) fx.cm).presentChunks = resident;
+        fx.storage.save(zone("z1", 0, 0, 1));
+        fx.cm.setZoneTier("z1", CacheTier.HOT);
+        RecordingCacheManager rec = (RecordingCacheManager) fx.cm;
+        rec.registerOwnershipBatch("z1", "w1", List.of(new int[]{0, 0}));
+        assertEquals(1, pins(rec, idx(0, 0)), "precondition: one pin + live stamp");
+        rec.holdWorldTasks = true;
+        fx.cm.deregisterAllChunks("z1"); // ownership gone; release task queued (held)
+        rec.registerOwnershipBatch("z1", "w1", List.of(new int[]{0, 0})); // re-register; reg task queued (held)
+        assertEquals(2, rec.queuedWorldTasks.size(), "release task + re-acquisition task are both held");
+        rec.runQueuedWorldTasks(); // queue order: release, then re-acquisition
+        assertEquals(1, pins(rec, idx(0, 0)),
+                "the release cleared the old pin and the re-acquisition pinned exactly once");
+        assertTrue(rec.hasLivePin("z1", "w1", 0, 0), "the re-acquisition stamped the live pin");
+        assertTrue(rec.getChunkOwners("w1", 0, 0).contains("z1"), "ownership was re-established");
     }
 
     @Test

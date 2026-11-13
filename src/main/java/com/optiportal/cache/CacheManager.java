@@ -53,13 +53,15 @@ public class CacheManager {
     // observation belong to the evicted chunk instance and lapsed with it.
     private final ConcurrentHashMap<String, ConcurrentHashMap<Long, Long>> chunkPinGeneration =
             new ConcurrentHashMap<>();
-    // Commit-2 (off-world-thread): per-chunk locks for off-thread pin tasks. Keyed per
-    // world by packed chunk index — the same key space as chunkPinGeneration, so the
-    // map is bounded by the pin-stamp key space. A pin/reconcile/release task locks
-    // its chunk around the check-owner -> check-stamp -> apply -> write-stamp
-    // critical section; this per-chunk mutual exclusion replaces the world-thread
-    // FIFO serialization the r4 design relied on. Batch tasks lock chunks in
-    // ascending engine-index order (the lock-ordering protocol).
+    // Commit-2 (off-world-thread): per-chunk locks for off-thread pin tasks. Keyed
+    // per world by the ENGINE chunk index (ChunkUtil.indexChunk space — the same key
+    // every pin task already carries for its counter calls), distinct from the
+    // pin-stamp bookkeeping space (packChunkIndex): the lock map only needs
+    // one key per chunk, so any consistent key space works. A pin/reconcile/release
+    // task locks its chunk around the check-owner -> check-stamp -> apply ->
+    // write-stamp critical section; this per-chunk mutual exclusion replaces the
+    // world-thread FIFO serialization the r4 design relied on. Batch tasks lock
+    // chunks in ascending engine-index order (the lock-ordering protocol).
     private final ConcurrentHashMap<String, ConcurrentHashMap<Long, java.util.concurrent.locks.ReentrantLock>> chunkTaskLocks =
             new ConcurrentHashMap<>();
     // world name → packed chunk index → zone ID → the chunk pin generation at the time
@@ -727,8 +729,12 @@ public class CacheManager {
         java.util.Collections.sort(sorted);
         submitPinTask(worldName, () -> {
             for (long packed : sorted) {
-                int cx = (int) (long) packed;
-                int cz = (int) (packed >>> 32);
+                // ChunkUtil.indexChunk layout: high 32 = cx, low 32 = cz (NOT the
+                // packChunkIndex bookkeeping layout - the two differ for non-diagonal
+                // chunks; a swapped unpack made the owner check query the wrong
+                // chunk and skipped the pin).
+                int cz = (int) (long) packed;
+                int cx = (int) (packed >>> 32);
                 java.util.concurrent.locks.ReentrantLock lock = chunkTaskLock(worldName, packed);
                 lock.lock();
                 try {
@@ -1294,7 +1300,14 @@ public class CacheManager {
      * @param zoneId    the zone whose pin is being released
      */
     private void tryReleaseKeepLoaded(String worldName, int cx, int cz, String zoneId) {
+        // Engine counter space (ChunkUtil.indexChunk: high 32 = cx, low 32 = cz)
+        // vs pin-stamp bookkeeping space (packChunkIndex: low 32 = cx, high 32 = cz):
+        // for non-diagonal chunks (cx != cz) these DIFFER, so the counter call and
+        // the stamp clear must each use their own key (goldfish battery: clearing
+        // the stamp with the engine index left non-diagonal stamps un-cleared,
+        // keeping hasLivePin true and making re-registration skip the pin).
         long engineIndex = ChunkUtil.indexChunk(cx, cz);
+        long stampKey = packChunkIndex(cx, cz);
         // P3: stamp-conditional decrement — the queued executor task (commit-2:
         // off-world-thread, under the chunk's per-chunk lock) touches the live
         // instance's counter only when this zone's pin is live on it, and owns
@@ -1311,12 +1324,12 @@ public class CacheManager {
                             LOG.fine(() -> "[OptiPortal] removeKeepLoaded: " + worldName + ":" + cx + ":" + cz);
                         }
                     }
-                    removePinStamp(worldName, engineIndex, zoneId);
+                    removePinStamp(worldName, stampKey, zoneId);
                 } finally {
                     lock.unlock();
                 }
             })) {
-            removePinStamp(worldName, engineIndex, zoneId);
+            removePinStamp(worldName, stampKey, zoneId);
         }
     }
 
