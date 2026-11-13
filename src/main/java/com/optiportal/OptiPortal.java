@@ -113,8 +113,16 @@ public class OptiPortal extends JavaPlugin {
         try {
             getLogger().at(Level.INFO).log("[OptiPortal] Starting up...");
 
-            // Shared async executor for all plugin work
-            executor = new java.util.concurrent.ScheduledThreadPoolExecutor(4, new ThreadFactory() {
+            // Load config — getDataDirectory() returns java.nio.file.Path
+            config = PluginConfig.load(getDataDirectory().toFile());
+
+            // Shared async executor for all plugin work.
+            // Tier-3 knob: thread count comes from config (async.executorThreadCount,
+            // default 4 = legacy behavior; clamped to >= 1). Created after config load
+            // because the knob requires it — nothing before the first executor consumer
+            // (tpsMonitor wiring below) touches the executor field.
+            int executorThreads = Math.max(1, config.getExecutorThreadCount());
+            executor = new java.util.concurrent.ScheduledThreadPoolExecutor(executorThreads, new ThreadFactory() {
                 private final java.util.concurrent.atomic.AtomicInteger counter = new java.util.concurrent.atomic.AtomicInteger(0);
                 @Override
                 public Thread newThread(Runnable r) {
@@ -123,9 +131,6 @@ public class OptiPortal extends JavaPlugin {
                     return t;
                 }
             });
-
-            // Load config — getDataDirectory() returns java.nio.file.Path
-            config = PluginConfig.load(getDataDirectory().toFile());
 
             // Initialize storage — handles meta.txt detection and auto-migration if backend changed
             storage = StorageFactory.create(config);
@@ -159,8 +164,14 @@ public class OptiPortal extends JavaPlugin {
                     worldRegistry
             );
 
-            // Cache manager
-            cacheManager = new CacheManager(config, walManager, executor, worldRegistry, null, metricsCollector);
+            // Cache manager — pass a real registry file so tier/ownership state (P11)
+            // persists across restarts. The previous `null` made loadRegistry/saveRegistry
+            // no-ops, losing the warm cache on every restart (tier 1, improvement pass).
+            java.io.File cacheRegistry =
+                    new java.io.File(new java.io.File(config.getDataFolder(), "preload-cache"),
+                            "cache-registry.json");
+            cacheRegistry.getParentFile().mkdirs();
+            cacheManager = new CacheManager(config, walManager, executor, worldRegistry, cacheRegistry, metricsCollector);
             cacheManager.loadRegistry();
 
             // TTL enforcement for expired zones
@@ -196,7 +207,7 @@ public class OptiPortal extends JavaPlugin {
             warmZoneManager.registerWorldsLoadedListener(getEventRegistry());
 
             // Player trackers
-            respawnTracker = new RespawnTracker(config, storage, cacheManager, chunkPreloader);
+            respawnTracker = new RespawnTracker(config, storage, cacheManager, chunkPreloader, executor);
             deathLocationTracker = new DeathLocationTracker(config, storage, cacheManager, chunkPreloader);
 
             // Gravestone integration — create before TeleportInterceptor to ensure it's initialized

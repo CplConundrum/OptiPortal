@@ -66,6 +66,23 @@ public class CacheManager {
     // Used for WARM-strategy zones that should always stay loaded but should still reflect active/idle state.
     private final java.util.Set<String> warmFloorZones = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
+    // Per-zone generation counter for generation-safe expiry (tier 1, improvement pass).
+    // Every promotion (setZoneTier HOT/WARM) and ownership re-registration bumps the
+    // generation; a WARM→COLD expiry captures the generation at scan time and its
+    // deferred cleanup (deregisterAllChunks) is skipped if the zone was re-promoted in
+    // the meantime, so a stale expiry can never strip current ownership.
+    private final java.util.concurrent.ConcurrentHashMap<String, Long> zoneGenerations =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    // Zones that expired WARM→COLD during the most recent decay scan (package-private
+    // so tests can assert the batch was collected and paced as one task, not N unbounded
+    // parallel unload storms).
+    volatile java.util.List<String> lastDecayedBatch = java.util.List.of();
+
+    // Pacing between keep-loaded release tasks of one decay batch (ms). Bounded so a
+    // multi-zone expiry cannot flood the world thread with unload work in one tick.
+    int decayReleasePacingMs = 250;
+
     // Persistence fields for P11
     private final File registryFile;
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
@@ -223,6 +240,9 @@ public class CacheManager {
      * @return number of NEW chunks loaded (not already owned by any zone)
      */
     public int registerZoneChunks(String zoneId, String world, Set<long[]> chunkCoords) {
+        // Re-registration of ownership bumps the generation too: a pending WARM→COLD
+        // cleanup that captured the older generation must not strip the fresh ownership.
+        zoneGenerations.merge(zoneId, 1L, Long::sum);
         ConcurrentHashMap<Long, Set<String>> worldMap =
                 chunkOwnership.computeIfAbsent(world, w -> new ConcurrentHashMap<>());
         int newChunks = 0;
@@ -273,6 +293,13 @@ public class CacheManager {
     public void setZoneTier(String zoneId, CacheTier tier) {
         tierSnapshotLock.readLock().lock();
         try {
+            // Bump the zone generation on every promotion BEFORE the tier write: any
+            // WARM→COLD expiry that captured the previous generation must treat this
+            // promotion as "re-promoted" and skip its deferred cleanup (generation-safe
+            // expiry — a stale expiry can never strip current ownership).
+            if (tier == CacheTier.HOT || tier == CacheTier.WARM) {
+                zoneGenerations.merge(zoneId, 1L, Long::sum);
+            }
             zoneTiers.put(zoneId, tier);
             if (tier == CacheTier.HOT || tier == CacheTier.WARM) {
                 long now = System.currentTimeMillis();
@@ -358,15 +385,25 @@ public class CacheManager {
         }
     }
 
-    private void decayTiersInternal() {
+    // Package-private (not private) so unit tests can drive a decay cycle
+    // deterministically without waiting for the 10s scheduled task.
+    void decayTiersInternal() {
         long now = System.currentTimeMillis();
-        if (now < earliestDecayMs.get()) {
-            return; // Nothing due yet — skip the full map iteration
-        }
-
+        // The former fast path (`if (now < earliestDecayMs.get()) return;`) was removed:
+        // setZoneTier() lowers earliestDecayMs concurrently (under the same read lock),
+        // so a scan that early-returned on a stale deadline could indefinitely skip a
+        // freshly promoted zone whose deadline was later overwritten by a subsequent
+        // `.set(nextEarliest)` in this very loop. A full tier scan every 10 seconds is
+        // cheap (O(zones)), so the deadline is now advisory only.
         long hotMs  = config.getHotDecaySeconds()  * 1000L;
         long warmMs = config.getWarmDecayMinutes() * 60_000L;
         long nextEarliest = Long.MAX_VALUE;
+        // WARM→COLD expiries collected during this scan. Cleanup (deregisterAllChunks)
+        // is batched into ONE paced task after the loop instead of N unbounded parallel
+        // executor submissions — a multi-zone expiry must not flood the world thread with
+        // unload work in a single tick (tier 1, improvement pass).
+        java.util.List<String> expiredZones = new java.util.ArrayList<>();
+        java.util.List<Long> expiredGens = new java.util.ArrayList<>();
 
         tierSnapshotLock.readLock().lock();
         try {
@@ -392,8 +429,13 @@ public class CacheManager {
                     } else {
                         zoneTiers.put(zoneId, CacheTier.COLD);
                         tierTimestamps.remove(zoneId);
-                        final String decayedZone = zoneId;
-                        executor.submit(() -> deregisterAllChunks(decayedZone));   // non-blocking
+                        // Generation-safe expiry: capture the generation now; the deferred
+                        // cleanup is skipped if the zone is re-promoted (or re-registered)
+                        // before the paced task runs, so a stale expiry can never strip
+                        // current ownership.
+                        final long expGen = zoneGenerations.getOrDefault(zoneId, 0L);
+                        expiredZones.add(zoneId);
+                        expiredGens.add(expGen);
                         LOG.fine(() -> "[OptiPortal] Tier decay: " + zoneId + " WARM → COLD");
                     }
                 } else {
@@ -405,6 +447,32 @@ public class CacheManager {
             earliestDecayMs.set(nextEarliest);
         } finally {
             tierSnapshotLock.readLock().unlock();
+        }
+
+        // Batched + paced keep-loaded release for everything that expired this scan.
+        if (!expiredZones.isEmpty()) {
+            final java.util.List<String> batch = java.util.List.copyOf(expiredZones);
+            final java.util.List<Long> gens = java.util.List.copyOf(expiredGens);
+            lastDecayedBatch = batch;
+            executor.submit(() -> {
+                for (int i = 0; i < batch.size(); i++) {
+                    String z = batch.get(i);
+                    if (zoneGenerations.getOrDefault(z, 0L) != gens.get(i)) {
+                        LOG.info(() -> "[OptiPortal] Skipping stale WARM→COLD cleanup for "
+                                + z + " (zone was re-promoted since the decay scan)");
+                        continue;
+                    }
+                    if (i > 0) {
+                        try {
+                            Thread.sleep(decayReleasePacingMs);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                    }
+                    deregisterAllChunks(z);   // non-blocking per-zone cleanup
+                }
+            });
         }
     }
 
@@ -472,6 +540,26 @@ public class CacheManager {
     }
 
     /**
+     * 0.7.7: World no longer exposes getChunkIfInMemory — resolve the chunk
+     * component through the ChunkStore. Uses the seq-validated concurrent read
+     * (getComponentConcurrent): safe off-thread, null on invalid refs.
+     */
+    private static com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk chunkIfInMemory(
+            com.hypixel.hytale.server.core.universe.world.World world, long engineIndex) {
+        try {
+            com.hypixel.hytale.server.core.universe.world.storage.ChunkStore store = world.getChunkStore();
+            com.hypixel.hytale.component.Ref<com.hypixel.hytale.server.core.universe.world.storage.ChunkStore> ref =
+                    store.getChunkReference(engineIndex);
+            if (ref == null || !ref.isValid()) return null;
+            return store.getStore().getComponentConcurrent(
+                    ref,
+                    com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk.getComponentType());
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
      * Fire-and-forget world-thread dispatch to increment keepLoaded on a chunk.
      * Mirror of tryReleaseKeepLoaded — used by the dedup registerOwnership path
      * to give each zone its own independent keepLoaded pin.
@@ -484,7 +572,7 @@ public class CacheManager {
         try {
             world.execute(() -> {
                 com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk chunk =
-                        world.getChunkIfInMemory(engineIndex);
+                        chunkIfInMemory(world, engineIndex);
                 if (chunk != null) {
                     chunk.addKeepLoaded();
                     LOG.fine(() -> "[OptiPortal] addKeepLoaded (dedup): " + worldName + ":" + cx + ":" + cz);
@@ -517,7 +605,7 @@ public class CacheManager {
             world.execute(() -> {
                 for (long idx : present) {
                     com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk chunk =
-                            world.getChunkIfInMemory(idx);
+                            chunkIfInMemory(world, idx);
                     if (chunk != null) chunk.addKeepLoaded();
                 }
             });
@@ -861,7 +949,7 @@ public class CacheManager {
         try {
             world.execute(() -> {
                 com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk chunk =
-                        world.getChunkIfInMemory(engineIndex); // fast path — we are on world thread
+                        chunkIfInMemory(world, engineIndex); // fast path — we are on world thread
                 if (chunk != null) {
                     chunk.removeKeepLoaded();
                     LOG.fine(() -> "[OptiPortal] removeKeepLoaded: " + worldName + ":" + cx + ":" + cz);

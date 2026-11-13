@@ -2,6 +2,18 @@
 
 ---
 
+## [1.3.0] - 2026-11-12
+
+- **0.7.7 engine port**: chunk loading moved to the `ChunkStore` reference API; removed `World`-overload calls and deprecated `readEnvironmentRuns` usage; builds against the 2026.03.26 server jar.
+- **Cache-tier hardening (Stage 1)**: generation-safe tier expiry, centralized WARM-floor policy, batched + paced WARM→COLD decay, cache registry persisted to `cache-registry.json` (warm cache survives restart).
+- **Async-core hardening (Stage 2)**: queue admission re-check at drain time, atomic batch enqueue/retire, single-owner circuit-breaker accounting, wider TPS clamp, authoritative TPS in load stats.
+- **Threading and data fixes**: JDBC moved off player-event threads, TTL `-1` (never-expire) sentinel preserved end-to-end, H2 upsert rewritten to `MERGE INTO` (H2 2.2 plain mode rejects `ON CONFLICT` — H2-mode saves were silently no-ops), save-lifecycle fences against post-shutdown callbacks.
+- **New config knob**: `async.executorThreadCount` (default 4 = legacy behavior) in `config.json`.
+- **Cleanup**: four dormant classes archived out of the published tree; full test suite now 55 tests.
+
+### Notes
+- Config keys unchanged from 1.2.3 except the new `async.executorThreadCount`; no data-migration required.
+
 ## [1.2.3] - 2026-04-13
 
 - **Optional integrations are safer**: Missing companion plugins now stay a clean no-op, and BetterGravestone support can track death-location graves without adding a hard dependency.

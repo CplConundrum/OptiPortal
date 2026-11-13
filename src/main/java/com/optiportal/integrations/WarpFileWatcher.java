@@ -159,7 +159,7 @@ public class WarpFileWatcher {
             Transform transform = warp.getTransform();
             if (transform == null || transform.getPosition() == null) continue;
 
-            com.hypixel.hytale.math.vector.Vector3d pos = transform.getPosition();
+            org.joml.Vector3d pos = transform.getPosition();
             float yaw = 0.0f;  // Transform.getYaw() not available in this Hytale build; yaw not critical for preloading
 
             String mappedWorld = config.remapWorldName(warp.getWorld());

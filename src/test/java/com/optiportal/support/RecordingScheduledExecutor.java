@@ -20,10 +20,33 @@ import java.util.concurrent.TimeoutException;
 public class RecordingScheduledExecutor implements ScheduledExecutorService {
 
     private final List<Runnable> scheduledRunnables = new ArrayList<>();
+    private final List<Runnable> executedRunnables = new ArrayList<>();
     private volatile boolean shutdown;
 
     public List<Runnable> getScheduledRunnables() {
         return scheduledRunnables;
+    }
+
+    /**
+     * Runnables handed to {@link #execute}/{@link #submit}. They are recorded but NOT
+     * run (same no-background-firing guarantee as scheduled tasks) so tests stay
+     * deterministic; tests drive them manually via {@link #runExecutedOnce()} or
+     * {@link #runAllExecuted()}.
+     */
+    public List<Runnable> getExecutedRunnables() {
+        return executedRunnables;
+    }
+
+    public void runExecutedOnce() {
+        if (!executedRunnables.isEmpty()) {
+            executedRunnables.remove(0).run();
+        }
+    }
+
+    public void runAllExecuted() {
+        for (Runnable r : new ArrayList<>(executedRunnables)) {
+            r.run();
+        }
     }
 
     // ---- ScheduledExecutorService -------------------------------------------
@@ -53,7 +76,7 @@ public class RecordingScheduledExecutor implements ScheduledExecutorService {
 
     // ---- ExecutorService ----------------------------------------------------
 
-    @Override public void execute(Runnable command) {}
+    @Override public void execute(Runnable command) { executedRunnables.add(command); }
 
     @Override public void shutdown() { shutdown = true; }
 
@@ -70,10 +93,10 @@ public class RecordingScheduledExecutor implements ScheduledExecutorService {
     public <T> Future<T> submit(Callable<T> task) { return noOpFuture(); }
 
     @Override
-    public <T> Future<T> submit(Runnable task, T result) { return noOpFuture(); }
+    public <T> Future<T> submit(Runnable task, T result) { executedRunnables.add(task); return noOpFuture(); }
 
     @Override
-    public Future<?> submit(Runnable task) { return noOpFuture(); }
+    public Future<?> submit(Runnable task) { executedRunnables.add(task); return noOpFuture(); }
 
     @Override
     public <T> List<Future<T>> invokeAll(Collection<? extends Callable<T>> tasks) { return List.of(); }

@@ -481,7 +481,7 @@ public class WarmZoneManager {
             PortalWorld portalWorld = destWorld.getEntityStore()
                     .getStore().getResource(PortalWorld.getResourceType());
             if (portalWorld != null && portalWorld.getSpawnPoint() != null) {
-                com.hypixel.hytale.math.vector.Vector3d pos =
+                org.joml.Vector3d pos =
                         portalWorld.getSpawnPoint().getPosition();
                 if (pos != null) { x = pos.x; y = pos.y; z = pos.z; }
             }

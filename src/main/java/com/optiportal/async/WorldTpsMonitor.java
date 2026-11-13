@@ -131,8 +131,13 @@ public class WorldTpsMonitor {
                 HistoricMetric tickLen = world.getBufferedTickLengthMetricSet();
                 long lastTickNanos = tickLen.getLastValue();
                 if (lastTickNanos <= 0) continue;
-                // Convert tick duration → TPS; clamp to [0, 1.5×NOMINAL].
-                double worldTps = Math.min(1_000_000_000.0 / lastTickNanos, HYTALE_TARGET_TPS * 1.5);
+                // Convert tick duration → TPS. Clamp to [0, 3×NOMINAL] (A5,
+                // improvement pass): the old 1.5× clamp made the telemetry report
+                // CAPACITY instead of actual TPS — a healthy or catch-up-burst server
+                // (30–60+ TPS) was indistinguishable from a 30 TPS one. 3×target
+                // keeps genuine telemetry while the decision logic (all low-side
+                // "<" threshold guards) is unaffected by the wider ceiling.
+                double worldTps = Math.min(1_000_000_000.0 / lastTickNanos, HYTALE_TARGET_TPS * 3.0);
                 worldTps = Math.max(worldTps, 0.0);
                 minTps = Math.min(minTps, worldTps);
                 sampledCount++;

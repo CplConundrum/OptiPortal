@@ -7,11 +7,12 @@ import com.hypixel.hytale.component.Ref;
 import com.hypixel.hytale.component.Store;
 import com.hypixel.hytale.component.query.Query;
 import com.hypixel.hytale.math.util.ChunkUtil;
-import com.hypixel.hytale.math.vector.Vector3d;
+import org.joml.Vector3d;
 import com.hypixel.hytale.server.core.HytaleServer;
 import com.hypixel.hytale.server.core.asset.type.blocktype.config.BlockType;
 import com.hypixel.hytale.server.core.entity.entities.Player;
 import com.hypixel.hytale.server.core.modules.block.BlockModule;
+import com.hypixel.hytale.server.core.universe.world.chunk.section.BlockSection;
 import com.hypixel.hytale.server.core.modules.entity.component.TransformComponent;
 import com.hypixel.hytale.server.core.modules.entity.damage.DeathComponent;
 import com.hypixel.hytale.server.core.modules.entity.damage.DeathSystems;
@@ -158,20 +159,52 @@ public class BetterGravestoneWatcher {
                 continue;
             }
 
-            long chunkIndex = ChunkUtil.indexChunk(tracked.x(), tracked.z());
-            WorldChunk chunk = world.getChunkIfLoaded(chunkIndex);
-            if (chunk == null) {
-                continue;
+            // 0.7.7: chunk section resolution (getChunkSectionReferenceAtBlock /
+            // getChunkComponent) requires the world thread — this scheduled task
+            // runs on the executor, so dispatch the per-world check.
+            final UUID uid = playerId;
+            final TrackedGravestone t = tracked;
+            try {
+                world.execute(() -> validateTrackedGravestoneOnWorldThread(world, uid, t));
+            } catch (Exception e) {
+                LOG.fine(() -> "[OptiPortal] BetterGravestone: world dispatch failed for "
+                        + uid + " (world shutting down?): " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * 0.7.7: world-thread half of {@link #validateTrackedGravestones()} —
+     * section lookup + block value check + container validation.
+     */
+    private void validateTrackedGravestoneOnWorldThread(World world, UUID playerId, TrackedGravestone tracked) {
+        try {
+            ChunkStore store = world.getChunkStore();
+            Ref<ChunkStore> sectionRef = store.getChunkSectionReferenceAtBlock(tracked.x(), tracked.y(), tracked.z());
+            if (sectionRef == null || !sectionRef.isValid()) {
+                return; // section not loaded — keep tracking (same as the old getChunkIfLoaded skip)
+            }
+            // Ref-based concurrent read: sectionRef's entity slot is NOT a spatial
+            // key, and this half runs inside world.execute where the plain
+            // getComponent would also be fine — getComponentConcurrent is uniform
+            // and seq-validated (null if the section is mid-unload).
+            BlockSection section = store.getStore().getComponentConcurrent(
+                    sectionRef, BlockSection.getComponentType());
+            if (section == null) {
+                return; // section mid-unload — keep tracking
             }
 
-            if (chunk.getBlock(tracked.x(), tracked.y(), tracked.z()) != gravestoneBlockId) {
+            if (section.get(tracked.x() & 15, tracked.y() & 15, tracked.z() & 15) != gravestoneBlockId) {
                 releaseTrackedGravestone(playerId);
-                continue;
+                return;
             }
 
             if (isContainerEmptyOrMismatched(world, tracked, playerId)) {
                 releaseTrackedGravestone(playerId);
             }
+        } catch (Exception e) {
+            LOG.fine(() -> "[OptiPortal] BetterGravestone: on-world-thread validation failed for "
+                    + playerId + ": " + e.getMessage());
         }
     }
 
@@ -215,7 +248,18 @@ public class BetterGravestoneWatcher {
 
     private void releaseTrackedGravestone(UUID playerId) {
         trackedGravestones.remove(playerId);
-        deathTracker.onGravestoneReleased(playerId);
+        // Keep the SQL delete off the world thread: this method runs inside
+        // world.execute (the gravestone validation half) and a blocking JDBC
+        // delete would stall the tick. Fire-and-forget on the plugin executor.
+        executor.execute(() -> {
+            if (plugin.isShuttingDown()) return;
+            try {
+                deathTracker.onGravestoneReleased(playerId);
+            } catch (Exception e) {
+                LOG.fine(() -> "[OptiPortal] BetterGravestone: deferred release of "
+                        + playerId + " failed: " + e.getMessage());
+            }
+        });
     }
 
     private boolean isPluginAvailable() {

@@ -141,6 +141,9 @@ public class PluginConfig {
     private double tpsLowThreshold = 18.0;
     private double tpsCriticalThreshold = 12.0;
 
+    // Shared async executor (Tier-3 knob: thread count was hardcoded at 4)
+    private int executorThreadCount = 4;
+
     // Corridor prioritization (Phase 4)
     private boolean corridorPrioritizationEnabled = true;
     private int corridorRadiusChunks = 3;
@@ -404,6 +407,8 @@ public class PluginConfig {
             if (async.has("tpsMonitorEnabled")) tpsMonitorEnabled = async.get("tpsMonitorEnabled").getAsBoolean();
             if (async.has("tpsLowThreshold")) tpsLowThreshold = async.get("tpsLowThreshold").getAsDouble();
             if (async.has("tpsCriticalThreshold")) tpsCriticalThreshold = async.get("tpsCriticalThreshold").getAsDouble();
+            // Tier-3 knob: shared async executor thread count (default 4 = legacy behavior)
+            if (async.has("executorThreadCount")) executorThreadCount = async.get("executorThreadCount").getAsInt();
         }
 
         if (json.has("tpsMonitor")) {
@@ -713,6 +718,7 @@ public class PluginConfig {
     public boolean isRebuildFromChunksOnCorruption() { return rebuildFromChunksOnCorruption; }
     public int getScheduledRebuildIntervalHours() { return scheduledRebuildIntervalHours; }
     public boolean isTpsMonitorEnabled() { return tpsMonitorEnabled; }
+    public int getExecutorThreadCount() { return executorThreadCount; }
     public double getTpsLowThreshold() { return tpsLowThreshold; }
     public double getTpsCriticalThreshold() { return tpsCriticalThreshold; }
     public boolean isCorridorPrioritizationEnabled() { return corridorPrioritizationEnabled; }

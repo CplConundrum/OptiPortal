@@ -7,7 +7,7 @@
 
     <groupId>com.optiportal</groupId>
     <artifactId>OptiPortal</artifactId>
-    <version>1.2.3</version>
+    <version>1.3.0</version>
     <packaging>jar</packaging>
 
     <properties>
@@ -168,6 +168,21 @@
                         </configuration>
                     </execution>
                 </executions>
+            </plugin>
+            <!-- Surefire: Hytale server classes (used by the §2 port tests) force
+                 java.util.logging.manager=HytaleLogManager in their static
+                 initializers; the property must be set at JVM start, before any
+                 engine class loads. Safe: HytaleLogManager extends
+                 java.util.logging.LogManager with no file I/O at init. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.5.4</version>
+                <configuration>
+                    <systemPropertyVariables>
+                        <java.util.logging.manager>com.hypixel.hytale.logger.backend.HytaleLogManager</java.util.logging.manager>
+                    </systemPropertyVariables>
+                </configuration>
             </plugin>
         </plugins>
     </build>

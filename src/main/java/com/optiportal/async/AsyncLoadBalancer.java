@@ -213,12 +213,18 @@ public class AsyncLoadBalancer {
      * @return Load statistics
      */
     public LoadStats getLoadStats() {
+        // A6 (improvement pass): surface AUTHORITATIVE TPS (WorldTpsMonitor) in the
+        // stats record — previously the live-path telemetry carried only the
+        // load-balancer's internal EMA execution times, not the engine's tick data.
+        // -1.0 marks "no TPS monitor attached".
+        double tps = (tpsMonitor != null) ? tpsMonitor.getCurrentTps() : -1.0;
         return new LoadStats(
             activeOperations.get(),
             totalOperations.get(),
             getAverageExecutionTime(),
             currentBatchSize.get(),
-            getQueuedTaskCount()
+            getQueuedTaskCount(),
+            tps
         );
     }
     
@@ -232,15 +238,24 @@ public class AsyncLoadBalancer {
     private CompletableFuture<Void> queueOperation(Supplier<CompletableFuture<Void>> operation,
                                                    AsyncMetrics.AsyncTaskPriority priority) {
         CompletableFuture<Void> future = new CompletableFuture<>();
-        Deque<Supplier<CompletableFuture<Void>>> queue = pendingTasks.get(priority);
-        queue.addLast(() -> {
-            return operation.get().whenComplete((result, ex) -> {
-                if (ex == null) {
-                    future.complete(null);
-                } else {
-                    future.completeExceptionally(ex);
-                }
-            });
+        Deque<Supplier<CompletableFuture<Void>>> pendingTasksForPriority = pendingTasks.get(priority);
+        pendingTasksForPriority.addLast(() -> {
+            try {
+                return operation.get().whenComplete((result, ex) -> {
+                    if (ex == null) {
+                        future.complete(null);
+                    } else {
+                        future.completeExceptionally(ex);
+                    }
+                });
+            } catch (Exception ex) {
+                // A1 (improvement pass): the queued supplier threw SYNCHRONOUSLY when the
+                // drain processor dispatched it. Without this catch the waiting caller's
+                // future is never completed (executeOperation's own catch returns a failed
+                // future but nothing propagates it back here) — the caller hangs forever.
+                future.completeExceptionally(ex);
+                return CompletableFuture.failedFuture(ex);
+            }
         });
         totalQueuedCount.incrementAndGet();
         LOG.fine("Queued operation with priority: " + priority);
@@ -365,9 +380,16 @@ public class AsyncLoadBalancer {
 
         int dispatched = 0;
 
+        // A2 (improvement pass): re-apply the critical-load admission gate at DRAIN time.
+        // scheduleLoad() queues (instead of executing) non-CRITICAL work while the TPS
+        // monitor reports critical load — if the drain processor dispatched those queued
+        // tasks anyway, the admission gate would be bypassed the moment a slot freed up.
+        boolean criticalNow = tpsMonitor != null && tpsMonitor.isCriticallyLoaded();
+
         // Process tasks by priority (CRITICAL first, then HIGH, NORMAL, LOW, BACKGROUND)
         for (AsyncMetrics.AsyncTaskPriority priority : AsyncMetrics.AsyncTaskPriority.values()) {
             if (dispatched >= available) break;
+            if (criticalNow && priority != AsyncMetrics.AsyncTaskPriority.CRITICAL) continue;
 
             Deque<Supplier<CompletableFuture<Void>>> queue = pendingTasks.get(priority);
 
@@ -409,21 +431,24 @@ public class AsyncLoadBalancer {
         public final double averageExecutionTime;
         public final int currentBatchSize;
         public final int queuedTasks;
-        
+        /** A6 (improvement pass): authoritative TPS from WorldTpsMonitor; -1.0 = no monitor attached. */
+        public final double currentTps;
+
         public LoadStats(int activeOperations, long totalOperations, double averageExecutionTime,
-                        int currentBatchSize, int queuedTasks) {
+                        int currentBatchSize, int queuedTasks, double currentTps) {
             this.activeOperations = activeOperations;
             this.totalOperations = totalOperations;
             this.averageExecutionTime = averageExecutionTime;
             this.currentBatchSize = currentBatchSize;
             this.queuedTasks = queuedTasks;
+            this.currentTps = currentTps;
         }
-        
+
         @Override
         public String toString() {
             return String.format(
-                "LoadStats{active=%d, total=%d, avgTime=%.1fms, batchSize=%d, queued=%d}",
-                activeOperations, totalOperations, averageExecutionTime, currentBatchSize, queuedTasks
+                "LoadStats{active=%d, total=%d, avgTime=%.1fms, batchSize=%d, queued=%d, tps=%.1f}",
+                activeOperations, totalOperations, averageExecutionTime, currentBatchSize, queuedTasks, currentTps
             );
         }
     }

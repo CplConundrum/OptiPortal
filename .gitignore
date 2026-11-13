@@ -1,17 +1,54 @@
+# Maven build output
 target/
-pom.xml.tag
-pom.xml.releaseBackup
-pom.xml.versionsBackup
-pom.xml.next
-release.properties
-dependency-reduced-pom.xml
-buildNumber.properties
-.mvn/timing.properties
-# https://maven.apache.org/wrapper/#usage-without-binary-jar
-.mvn/wrapper/maven-wrapper.jar
 
-# Eclipse m2e generated files
-# Eclipse Core
-.project
-# JDT-specific (Eclipse Java Development Tools)
-.classpath
+# Runtime-generated plugin data
+portal-links.json
+optiportal-cache/
+preload-cache/
+
+# Config files that may contain credentials
+# Uncomment if you store config.json outside version control
+# config.json
+
+# IDE files
+.idea/
+*.iml
+.vscode/
+*.classpath
+*.project
+.settings/
+
+.roo/
+_archive/
+.claude/
+libs/
+memory/
+target/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Local dev / agent tooling (not for public tree)
+.continue/
+.github/
+.mcp.json
+.roomodes
+META-INF/
+OPTIPORTAL_COMPLETE_REFERENCE.md
+_deleted-*/
+decompiled/
+docs/
+memory/
+plans/
+reports/
+tmp/
+package-lock.json
+revertlog.md
+vineflower-*.jar
+%USERPROFILE%/
+

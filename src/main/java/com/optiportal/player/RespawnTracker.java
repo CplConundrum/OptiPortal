@@ -30,49 +30,74 @@ public class RespawnTracker {
     private final StorageBackend storage;
     private final CacheManager cacheManager;
     private final ChunkPreloader preloader;
+    private final java.util.concurrent.ScheduledExecutorService executor;
 
     public RespawnTracker(PluginConfig config, StorageBackend storage,
-                          CacheManager cacheManager, ChunkPreloader preloader) {
+                          CacheManager cacheManager, ChunkPreloader preloader,
+                          java.util.concurrent.ScheduledExecutorService executor) {
         this.config = config;
         this.storage = storage;
         this.cacheManager = cacheManager;
         this.preloader = preloader;
+        this.executor = executor;
     }
 
     /**
      * Called by TeleportInterceptor.onPlayerReady when a pending respawn capture
      * flag is set for this player. Records their spawn-in position as the new
      * respawn cache entry, overwriting any previous one.
+     *
+     * <p>Tier-1 (improvement pass): the whole body now runs on the plugin executor —
+     * the old code performed synchronous JDBC (storage.save) and chunk release on
+     * the PlayerReadyEvent thread.
      */
     public void onRespawn(UUID playerId, double x, double y, double z, String world) {
         String id = "respawn:" + playerId;
+        double fx = x, fy = y, fz = z;
+        final String fid = id;
+        executor.execute(() -> {
+            try {
+                // Release old cache entry before overwriting
+                cacheManager.releaseZoneChunks(fid);
 
-        // Release old cache entry before overwriting
-        cacheManager.releaseZoneChunks(id);
+                PortalEntry entry = new PortalEntry(fid, world, fx, fy, fz, 0);
+                entry.setType(PortalEntry.EntryType.BED); // player-data type, excluded from zone list
+                entry.setCacheTTLDays(config.getTtlBed());
+                entry.setLastActive(java.time.Instant.now());
+                storage.save(entry);
 
-        PortalEntry entry = new PortalEntry(id, world, x, y, z, 0);
-        entry.setType(PortalEntry.EntryType.BED); // player-data type, excluded from zone list
-        entry.setCacheTTLDays(config.getTtlBed());
-        entry.setLastActive(java.time.Instant.now());
-        storage.save(entry);
-
-        LOG.info("[OptiPortal] Respawn location recorded for " + playerId
-                + " at " + world + " " + x + "," + y + "," + z);
+                LOG.info("[OptiPortal] Respawn location recorded for " + playerId
+                        + " at " + world + " " + fx + "," + fy + "," + fz);
+            } catch (Exception e) {
+                LOG.warning("[OptiPortal] RespawnTracker onRespawn off-thread work failed for "
+                        + playerId + ": " + e.getMessage());
+            }
+        });
     }
 
     /**
      * Pre-loads chunks around the player's last recorded respawn location.
      * Called on PlayerReadyEvent for players without a pending capture flag —
      * i.e. normal logins where we want to warm their known respawn point.
+     *
+     * <p>Tier-1 (improvement pass): the body now runs on the plugin executor —
+     * the old code did synchronous JDBC (storage.loadById) on the event thread.
      */
     public void preloadRespawn(UUID playerId) {
         String id = "respawn:" + playerId;
-        storage.loadById(id).ifPresent(entry -> {
-            int cx = ChunkPreloader.toChunkCoord(entry.getX());
-            int cz = ChunkPreloader.toChunkCoord(entry.getZ());
-            preloader.predictiveLoad(id, entry.getWorld(), cx, cz, config.getPredictiveRadius());
-            LOG.fine("[OptiPortal] Respawn preload: " + playerId
-                    + " cx=" + cx + " cz=" + cz);
+        executor.execute(() -> {
+            try {
+                storage.loadById(id).ifPresent(entry -> {
+                    int cx = ChunkPreloader.toChunkCoord(entry.getX());
+                    int cz = ChunkPreloader.toChunkCoord(entry.getZ());
+                    preloader.predictiveLoad(id, entry.getWorld(), cx, cz, config.getPredictiveRadius());
+                    LOG.fine("[OptiPortal] Respawn preload: " + playerId
+                            + " cx=" + cx + " cz=" + cz);
+                });
+            } catch (Exception e) {
+                LOG.warning("[OptiPortal] RespawnTracker preloadRespawn off-thread work failed for "
+                        + playerId + ": " + e.getMessage());
+            }
         });
     }
 }

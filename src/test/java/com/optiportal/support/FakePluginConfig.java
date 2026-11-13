@@ -12,6 +12,8 @@ public class FakePluginConfig extends PluginConfig {
     private final File dataFolder;
     private int writeBehindDelayMs;
     private double activationDistance = super.getActivationDistance();
+    private int hotDecaySeconds = super.getHotDecaySeconds();
+    private int warmDecayMinutes = super.getWarmDecayMinutes();
 
     public FakePluginConfig(File dataFolder) {
         this(dataFolder, 0);
@@ -43,5 +45,23 @@ public class FakePluginConfig extends PluginConfig {
 
     public void setActivationDistance(double activationDistance) {
         this.activationDistance = activationDistance;
+    }
+
+    @Override
+    public int getHotDecaySeconds() {
+        return hotDecaySeconds;
+    }
+
+    @Override
+    public int getWarmDecayMinutes() {
+        return warmDecayMinutes;
+    }
+
+    public void setHotDecaySeconds(int seconds) {
+        this.hotDecaySeconds = seconds;
+    }
+
+    public void setWarmDecayMinutes(int minutes) {
+        this.warmDecayMinutes = minutes;
     }
 }

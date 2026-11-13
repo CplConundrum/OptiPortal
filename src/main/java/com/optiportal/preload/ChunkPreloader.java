@@ -166,8 +166,19 @@ public class ChunkPreloader {
             if (pendingEntrySaveTask != null && !pendingEntrySaveTask.isDone()) {
                 return;
             }
-            pendingEntrySaveTask = executor.schedule(this::flushPendingEntrySaves,
-                    ENTRY_SAVE_BATCH_DELAY_MS, TimeUnit.MILLISECONDS);
+            // Tier-2 (improvement pass, save-lifecycle fence): completion
+            // callbacks (queueEntrySave's callers) can fire after stop() has
+            // shut the executor down — the old code let RejectedExecutionException
+            // escape onto the world/event thread. The entry stays queued in
+            // pendingEntrySaves (picked up by the shutdown flush if it is still
+            // running; otherwise it is stats-only and acceptable to drop).
+            try {
+                pendingEntrySaveTask = executor.schedule(this::flushPendingEntrySaves,
+                        ENTRY_SAVE_BATCH_DELAY_MS, TimeUnit.MILLISECONDS);
+            } catch (java.util.concurrent.RejectedExecutionException ex) {
+                LOG.warning("[OptiPortal] queueEntrySave: executor already shut down — "
+                        + "save for " + entry.getId() + " left queued for the shutdown flush");
+            }
         }
     }
 
@@ -193,7 +204,20 @@ public class ChunkPreloader {
                     break;
                 }
                 pendingEntrySaves = new ConcurrentHashMap<>();
-                storage.saveAll(new ArrayList<>(batch.values()));
+                // Tier-2 (improvement pass, save-lifecycle fence): a flush task
+                // can still run while stop() is between executor shutdown and
+                // storage.close() (or after close if the await was interrupted —
+                // see OptiPortal.stop()). A closed Hikari pool throws on
+                // saveAll; without this guard the exception escaped the task
+                // thread. Stats-only data — warn and stop flushing.
+                try {
+                    storage.saveAll(new ArrayList<>(batch.values()));
+                } catch (Exception ex) {
+                    LOG.warning("[OptiPortal] flushPendingEntrySaves: storage save failed "
+                            + "(" + batch.size() + " entries dropped — storage may be closed): "
+                            + ex.getMessage());
+                    break;
+                }
             }
         } finally {
             entrySaveFlushRunning.set(false);
@@ -766,12 +790,15 @@ public class ChunkPreloader {
                                 + ") — on failure backoff");
                         futures[i] = CompletableFuture.completedFuture((WorldChunk) null);
                     } else {
-                        // Store.getComponent() requires the WorldThread — use the async API
-                        // for all chunks; the engine returns a completed future for already-
+                        // 0.7.7: load via the ChunkStore reference API (the World overloads
+                        // are gone); the engine returns a completed future for already-
                         // resident chunks without a disk hop.
-                        CompletableFuture<WorldChunk> base = nonTicking
-                                ? world.getNonTickingChunkAsync(ChunkUtil.indexChunk(cx, cz))
-                                : world.getChunkAsync(ChunkUtil.indexChunk(cx, cz));
+                        ChunkStore store = world.getChunkStore();
+                        CompletableFuture<WorldChunk> base = store
+                                .getChunkReferenceAsync(chunkIndex)
+                                .thenApply(ref -> ref == null || !ref.isValid()
+                                        ? null
+                                        : store.getStore().getComponentConcurrent(ref, WorldChunk.getComponentType()));
                         futures[i] = base;
                     }
                 }

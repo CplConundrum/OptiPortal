@@ -128,9 +128,11 @@ class TeleportInterceptorReversePreloadTest {
         }
 
         @Override
-        protected void predictiveLoadWithRam(String zoneId, String worldName, int cx, int cz, int radius) {
+        protected java.util.concurrent.CompletableFuture<Void> predictiveLoadWithRam(
+                String zoneId, String worldName, int cx, int cz, int radius) {
             predictedZoneId = zoneId;
             predictedWorldName = worldName;
+            return java.util.concurrent.CompletableFuture.completedFuture(null);
         }
 
         @Override

@@ -218,7 +218,9 @@ public class OptiPortalUIPage extends InteractiveCustomUIPage<OptiPortalUIPage.P
         if (entry.getActivationDistanceHorizontal() != null)
             detail.append("Activation dist: ").append(entry.getActivationDistanceHorizontal()).append("\n");
         if (entry.getCacheTTLDays() != null)
-            detail.append("TTL (days): ").append(entry.getCacheTTLDays()).append("\n");
+            detail.append("TTL (days): ")
+                    .append(entry.getCacheTTLDays() == -1 ? "-1 (never expire)" : entry.getCacheTTLDays())
+                    .append("\n");
         if (entry.getActivationShape() != null)
             detail.append("Shape: ").append(entry.getActivationShape()).append("\n");
         if (detail.length() == 0) detail.append("No overrides set.\n");

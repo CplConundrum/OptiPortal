@@ -28,27 +28,23 @@ public class H2StorageBackend extends AbstractSqlStorageBackend {
 
     @Override
     protected String upsertSql() {
+        // Tier-1 (improvement pass): the original SQL used SQLite/PostgreSQL
+        // "ON CONFLICT(id) DO UPDATE SET ... excluded.*" syntax, which H2 2.2
+        // plain mode REJECTS — and save() swallows the SQLException, so every
+        // H2-mode save was a silent no-op. H2's native upsert is
+        // "MERGE INTO ... KEY(id) USING VALUES()" (insert when the key is new,
+        // update every listed column when it exists). Verified by H2UpsertSqlTest.
         return """
-            INSERT INTO portal_entries (
+            MERGE INTO portal_entries (
                 id, world, x, y, z, yaw, creator, creation_date,
                 strategy, warm_radius, warm_radius_x, warm_radius_z,
                 instanced, notes, cache_ttl_days,
                 ram_estimated, ram_marginal,
                 preload_count, last_cache_tier, last_active, last_status,
                 entry_type, activation_json, destination_world_uuid, updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(id) DO UPDATE SET
-                world=excluded.world, x=excluded.x, y=excluded.y, z=excluded.z,
-                yaw=excluded.yaw, strategy=excluded.strategy,
-                warm_radius=excluded.warm_radius, warm_radius_x=excluded.warm_radius_x,
-                warm_radius_z=excluded.warm_radius_z, instanced=excluded.instanced,
-                notes=excluded.notes, cache_ttl_days=excluded.cache_ttl_days,
-                ram_estimated=excluded.ram_estimated, ram_marginal=excluded.ram_marginal,
-                preload_count=excluded.preload_count, last_cache_tier=excluded.last_cache_tier,
-                last_active=excluded.last_active, last_status=excluded.last_status,
-                entry_type=excluded.entry_type, activation_json=excluded.activation_json,
-                destination_world_uuid=excluded.destination_world_uuid,
-                updated_at=excluded.updated_at
+            )
+            KEY(id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """;
     }
 

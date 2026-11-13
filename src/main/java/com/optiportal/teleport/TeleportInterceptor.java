@@ -521,7 +521,7 @@ public class TeleportInterceptor {
                                             String destWorld = dest.getWorld();
                                             // Same-world teleports omit the world name in TeleportRecord
                                             if (destWorld == null) destWorld = w.getName();
-                                            com.hypixel.hytale.math.vector.Vector3d pos = dest.getPosition();
+                                            org.joml.Vector3d pos = dest.getPosition();
                                             if (pos != null) {
                                                 final String dw = destWorld;
                                                 final double dx = pos.x, dy = pos.y, dz = pos.z;
@@ -649,12 +649,17 @@ public class TeleportInterceptor {
         if (holder != null) {
             UsedTeleporter usedTeleporter = holder.getComponent(UsedTeleporter.getComponentType());
             if (usedTeleporter != null) {
-                com.hypixel.hytale.math.vector.Vector3d dest = usedTeleporter.getDestinationPosition();
+                org.joml.Vector3d dest = usedTeleporter.getDestinationPosition();
                 // Only check proximity if destination position is valid
                 if (dest != null && !Double.isNaN(dest.x) && !Double.isNaN(dest.y) && !Double.isNaN(dest.z)) {
                     LOG.fine(() -> "[OptiPortal] UsedTeleporter detected: dest="
                         + dest.x + "," + dest.y + "," + dest.z + " world=" + worldName);
-                    checkProximityAndPreload(null, worldName, dest.x, dest.y, dest.z);
+                    // Tier-1 (improvement pass): resolve the player UUID so the PREDICTIVE
+                    // cooldown (isOnCooldown/recordCooldown) can actually throttle this
+                    // player; null (previous behaviour) made both calls no-ops.
+                    UUIDComponent uuidComp = holder.getComponent(UUIDComponent.getComponentType());
+                    UUID callerUuid = (uuidComp != null) ? uuidComp.getUuid() : null;
+                    checkProximityAndPreload(callerUuid, worldName, dest.x, dest.y, dest.z);
                 } else {
                     LOG.fine("[OptiPortal] AddPlayerToWorld: UsedTeleporter has invalid destination position");
                 }
@@ -717,13 +722,18 @@ public class TeleportInterceptor {
                     }
                 }
             } else {
-                // PREDICTIVE: cooldown guards chunk load
-                if (isOnCooldown(null, id)) continue;
+                // PREDICTIVE: cooldown guards chunk load.
+                // Tier-1 (improvement pass): the old code passed a hardcoded null here,
+                // which made BOTH isOnCooldown (always false) and recordCooldown
+                // (no-op) dead — the predictive re-trigger was unthrottled. Use the
+                // real player UUID when available; the null guards keep the old
+                // behaviour when the caller genuinely has no player identity.
+                if (isOnCooldown(playerUuid, id)) continue;
                 // H3: skip if destination portal world is dead or has no spawn
                 World destWorld = chunkPreloader.getWorldRegistry()
                         .resolveWorld(entry.getDestinationWorldUuid(), worldName);
                 if (!com.optiportal.preload.WarmZoneManager.isPortalWorldUsable(destWorld)) continue;
-                recordCooldown(null, id);
+                recordCooldown(playerUuid, id);
                 LOG.fine(() -> "[OptiPortal] Proximity PREDICTIVE: " + id
                     + " dist=" + String.format("%.1f", Math.sqrt(horizDistSq)) + " → load cx=" + cx + " cz=" + cz);
                 predictiveLoadWithRam(id, worldName, cx, cz, radius);
@@ -965,7 +975,7 @@ public class TeleportInterceptor {
                         Location dest = last.destination();
                         if (dest != null) {
                             String destWorld = dest.getWorld() != null ? dest.getWorld() : worldName;
-                            com.hypixel.hytale.math.vector.Vector3d pos = dest.getPosition();
+                            org.joml.Vector3d pos = dest.getPosition();
                             if (pos != null) {
                                 LOG.fine(() -> "[OptiPortal] TeleportRecord dest: "
                                     + pos.x + "," + pos.y + "," + pos.z + " world=" + destWorld);
@@ -993,11 +1003,13 @@ public class TeleportInterceptor {
         // Guard against post-shutdown execution
         if (plugin.isShuttingDown()) return;
         
-        World world = event.getWorld();
+        // 0.7.7: DrainPlayerFromWorldEvent no longer exposes getWorld() — the
+        // departing world is getSourceWorld().
+        World world = event.getSourceWorld();
         Transform transform = event.getTransform();
         if (world == null || transform == null) return;
 
-        com.hypixel.hytale.math.vector.Vector3d pos = transform.getPosition();
+        org.joml.Vector3d pos = transform.getPosition();
         if (pos == null) return;
 
         // Resolve player UUID from the departing entity's UUIDComponent.
@@ -1054,23 +1066,27 @@ public class TeleportInterceptor {
             LOG.fine(() -> "[OptiPortal] onPlayerConnect: null UUID, skipping spawn prewarm");
             return;
         }
-        // getSpawnPoint may throw if spawn not configured
-        Transform spawnTransform;
-        try {
-            spawnTransform = spawnProvider.getSpawnPoint(world, playerUuid);
-        } catch (Exception e) {
-            return;
-        }
-        if (spawnTransform == null || spawnTransform.getPosition() == null) return;
-
-        com.hypixel.hytale.math.vector.Vector3d pos = spawnTransform.getPosition();
-        final String worldName = world.getName();
-        final double spawnX = pos.x;
-        final double spawnZ = pos.z;
-
-        // Fire predictive load on executor — never block the connect event handler
-        executor.execute(() -> {
+        // 0.7.7: ISpawnProvider.getSpawnPoint is gone — getSpawnPointAsync returns
+        // a CompletableFuture<Transform>. Chain the continuation instead of
+        // join()-ing on a shared executor worker: a slow or hung spawn future
+        // must not occupy one of the 4 OptiPortal workers (4 concurrent
+        // connections would starve the keepalive/preload/async pipeline). The
+        // continuation is non-blocking (predictiveLoad enqueues internally), so
+        // running it on whichever thread completes the future is safe —
+        // including the world thread when the provider resolves synchronously.
+        spawnProvider.getSpawnPointAsync(world, playerUuid).whenComplete((spawnTransform, ex) -> {
+            if (ex != null) {
+                LOG.fine("[OptiPortal] onPlayerConnect: spawn point not available: " + ex.getMessage());
+                return;
+            }
             if (plugin.isShuttingDown()) return; // Guard against post-shutdown execution
+            if (spawnTransform == null || spawnTransform.getPosition() == null) return;
+
+            org.joml.Vector3d pos = spawnTransform.getPosition();
+            final String worldName = world.getName();
+            final double spawnX = pos.x;
+            final double spawnZ = pos.z;
+
             int cx = com.optiportal.preload.ChunkPreloader.toChunkCoord(spawnX);
             int cz = com.optiportal.preload.ChunkPreloader.toChunkCoord(spawnZ);
             String zoneId = "spawn:" + worldName + ":" + cx + ":" + cz;
@@ -1436,15 +1452,21 @@ public class TeleportInterceptor {
 
     /**
      * Fire a predictive load and record RAM delta + estimate on completion.
+     *
+     * <p>Tier-1 (improvement pass): returns the completion future. The old void
+     * signature discarded the {@code .exceptionally(...)} result, so load failures
+     * were unobservable to callers and tests. Fire-and-forget callers may still
+     * ignore the return value.
      */
-    protected void predictiveLoadWithRam(String zoneId, String worldName, int cx, int cz, int radius) {
+    protected java.util.concurrent.CompletableFuture<Void> predictiveLoadWithRam(
+            String zoneId, String worldName, int cx, int cz, int radius) {
         int chunkCount = (2 * radius + 1) * (2 * radius + 1);
 
         // bytesPerChunk already includes the 1.5x overhead factor — do not multiply again.
         double estimatedMB = (chunkCount * (double) config.getBytesPerChunk())
                              / (1024.0 * 1024.0);
 
-        chunkPreloader.predictiveLoad(zoneId, worldName, cx, cz, radius)
+        return chunkPreloader.predictiveLoad(zoneId, worldName, cx, cz, radius)
                 // D4: thenRunAsync dispatches storage I/O to the plugin executor instead of
                 //     running on whichever thread completed the chunk future (may be world thread).
                 .thenRunAsync(() -> {

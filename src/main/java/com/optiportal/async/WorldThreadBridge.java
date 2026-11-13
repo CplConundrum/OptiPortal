@@ -18,7 +18,9 @@ import com.hypixel.hytale.server.core.modules.entity.teleport.TeleportRecord;
 import com.hypixel.hytale.server.core.modules.physics.component.Velocity;
 import com.hypixel.hytale.server.core.universe.PlayerRef;
 import com.hypixel.hytale.server.core.universe.world.World;
+import com.hypixel.hytale.component.Ref;
 import com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk;
+import com.hypixel.hytale.server.core.universe.world.storage.ChunkStore;
 
 /**
  * Bridge component for safe async access to world thread operations.
@@ -176,7 +178,12 @@ public class WorldThreadBridge {
                 } catch (Exception e) {
                     long duration = System.currentTimeMillis() - startTime;
 
-                    circuitBreaker.recordFailure();
+                    // A4 (improvement pass): do NOT record the breaker failure here —
+                    // errorHandler.handleWorldThreadError() (single owner of circuit
+                    // breaker accounting) records exactly one failure per error via
+                    // handleWorldThreadOverload/Timeout/Generic. Recording here too
+                    // double-counted every failure and opened the breaker at half the
+                    // real failure rate.
                     metrics.recordWorldThreadError("executeOnWorldThread", duration);
                     errorHandler.handleWorldThreadError(e, "executeOnWorldThread");
                     future.completeExceptionally(e);
@@ -184,6 +191,9 @@ public class WorldThreadBridge {
             });
         } catch (Exception e) {
             // world.execute() rejected the task — world is shutting down.
+            // A4 (improvement pass): this path is the SOLE owner of the breaker failure
+            // here — unlike the lambda-catch path above, it does not call
+            // errorHandler.handleWorldThreadError(), so recording once is correct.
             long duration = System.currentTimeMillis() - startTime;
             circuitBreaker.recordFailure();
             metrics.recordWorldThreadError("executeOnWorldThread", duration);
@@ -208,10 +218,20 @@ public class WorldThreadBridge {
             return CompletableFuture.completedFuture(null);
         }
         
-        // Add to queue for batched processing
-        Queue<BatchedOperation> queue = operationQueues.computeIfAbsent(world, k -> new ConcurrentLinkedQueue<>());
-        CompletableFuture<Void> future = new CompletableFuture<>();
-        queue.add(new BatchedOperation(operations, future));
+        // Add to queue for batched processing.
+        // A3 (improvement pass): enqueue ATOMICALLY with respect to batch-processor
+        // retirement. The old computeIfAbsent()+add() pair raced with processBatch's
+        // retire path: a batch could land in a queue the processor had just observed
+        // empty, and the processor's two-arg remove() would then retire a queue that
+        // now held a batch — losing it (the caller's future would never complete).
+        // Both sides now go through compute/computeIfPresent, which are atomic per
+        // map bin, so a queue is only ever retired while still empty.
+        final CompletableFuture<Void> future = new CompletableFuture<>();
+        operationQueues.compute(world, (w, existing) -> {
+            Queue<BatchedOperation> queue = (existing == null) ? new ConcurrentLinkedQueue<>() : existing;
+            queue.add(new BatchedOperation(operations, future));
+            return queue;
+        });
         return future;
     }
     
@@ -362,9 +382,19 @@ public class WorldThreadBridge {
         
         long startTime = System.currentTimeMillis();
         
-        CompletableFuture<WorldChunk> future = nonTicking
-                ? world.getNonTickingChunkAsync(ChunkUtil.indexChunk(cx, cz))
-                : world.getChunkAsync(ChunkUtil.indexChunk(cx, cz));
+        // 0.7.7: World no longer exposes getChunkAsync / getNonTickingChunkAsync.
+        // Load via the ChunkStore reference API and resolve the chunk component.
+        // Ticking registration is now per-BlockSection (engine-managed), so the
+        // nonTicking flag is retained for API compatibility only.
+        // getComponentConcurrent (not getChunkComponent/ref.getIndex()): the Ref's
+        // entity slot is NOT the spatial chunk key, and the plain getComponent
+        // asserts the world thread while this continuation may run on the caller.
+        ChunkStore store = world.getChunkStore();
+        CompletableFuture<WorldChunk> future = store
+                .getChunkReferenceAsync(ChunkUtil.indexChunk(cx, cz))
+                .thenApply(ref -> ref == null || !ref.isValid()
+                        ? null
+                        : store.getStore().getComponentConcurrent(ref, WorldChunk.getComponentType()));
         
         return future.whenComplete((chunk, ex) -> {
             long duration = System.currentTimeMillis() - startTime;
@@ -402,8 +432,13 @@ public class WorldThreadBridge {
      * @param queue The operation queue
      */
     private void processBatch(World world, Queue<BatchedOperation> queue) {
+        // A3 (improvement pass): retire ATOMICALLY — only when the queue is still empty
+        // at the moment of the map mutation. The old two-arg remove() retired the queue
+        // based on a stale isEmpty() check, so a batch enqueued in between was lost.
+        // computeIfPresent is atomic with executeBatched's compute() on the same map
+        // bin: if a new batch landed, the queue is non-empty and is kept.
         if (queue.isEmpty()) {
-            operationQueues.remove(world, queue); // evict dead entry; two-arg remove avoids TOCTOU
+            operationQueues.computeIfPresent(world, (w, q) -> q.isEmpty() ? null : q);
             return;
         }
 

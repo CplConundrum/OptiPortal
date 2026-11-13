@@ -7,6 +7,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
 import com.hypixel.hytale.math.util.ChunkUtil;
+import com.hypixel.hytale.server.core.universe.world.storage.ChunkStore;
 import com.optiportal.cache.CacheManager;
 import com.optiportal.config.PluginConfig;
 import com.optiportal.model.CacheTier;
@@ -104,7 +105,10 @@ public class KeepaliveManager {
     }
 
     // Guard wrapper used by start() so any subclass override of pingTier() is also protected.
-    private void safeping(CacheTier tier, String label) {
+    // Package-private (not private) so the scheduler-survival test can schedule the REAL
+    // production task: JDK suppresses a scheduleWithFixedDelay task after an uncaught
+    // throw, so it is this guard — not the CF chains — that keeps keepalives alive.
+    void safeping(CacheTier tier, String label) {
         try {
             pingTier(tier, label);
         } catch (Exception e) {
@@ -169,11 +173,19 @@ public class KeepaliveManager {
             }
 
             if (allChunksPresent) {
-                // Fire and forget — we only care that the chunk future is requested,
-                // not when it completes. getNonTickingChunkAsync resets GC reachability.
+                // Fire and forget — we only care that the chunk load is requested,
+                // not when it completes. 0.7.7: the ping goes through the ChunkStore
+                // reference API; owned-chunk residency is maintained by the keep-loaded
+                // pins (CacheManager), not by the load call itself.
+                ChunkStore store = world.getChunkStore();
                 for (int dx = -radiusX; dx <= radiusX; dx++) {
                     for (int dz = -radiusZ; dz <= radiusZ; dz++) {
-                        world.getNonTickingChunkAsync(ChunkUtil.indexChunk(cx + dx, cz + dz));
+                        store.getChunkReferenceAsync(ChunkUtil.indexChunk(cx + dx, cz + dz))
+                                .exceptionally(ex -> {
+                                    LOG.fine(() -> "[OptiPortal] KeepaliveManager: chunk ping failed: "
+                                            + ex.getMessage());
+                                    return null;
+                                });
                     }
                 }
             } else {

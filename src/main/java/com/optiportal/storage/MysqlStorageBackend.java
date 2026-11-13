@@ -4,11 +4,11 @@ import com.optiportal.config.PluginConfig;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 
-public class MysqlStorageBackend extends AbstractSqlStorageBackend {
+public class MySqlStorageBackend extends AbstractSqlStorageBackend {
 
     private final PluginConfig config;
 
-    public MysqlStorageBackend(PluginConfig config) {
+    public MySqlStorageBackend(PluginConfig config) {
         this.config = config;
     }
 
@@ -38,8 +38,8 @@ public class MysqlStorageBackend extends AbstractSqlStorageBackend {
                 instanced, notes, cache_ttl_days,
                 ram_estimated, ram_marginal,
                 preload_count, last_cache_tier, last_active, last_status,
-                entry_type, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                entry_type, activation_json, destination_world_uuid, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON DUPLICATE KEY UPDATE
                 world=VALUES(world), x=VALUES(x), y=VALUES(y), z=VALUES(z),
                 yaw=VALUES(yaw), strategy=VALUES(strategy),
@@ -49,7 +49,9 @@ public class MysqlStorageBackend extends AbstractSqlStorageBackend {
                 ram_estimated=VALUES(ram_estimated), ram_marginal=VALUES(ram_marginal),
                 preload_count=VALUES(preload_count), last_cache_tier=VALUES(last_cache_tier),
                 last_active=VALUES(last_active), last_status=VALUES(last_status),
-                entry_type=VALUES(entry_type), updated_at=VALUES(updated_at)
+                entry_type=VALUES(entry_type), activation_json=VALUES(activation_json),
+                destination_world_uuid=VALUES(destination_world_uuid),
+                updated_at=VALUES(updated_at)
         """;
     }
 

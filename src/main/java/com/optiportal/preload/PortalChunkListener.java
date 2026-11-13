@@ -130,7 +130,8 @@ public class PortalChunkListener {
 
     private void onChunkPreLoad(ChunkPreLoadProcessEvent event) {
         WorldChunk chunk = event.getChunk();
-        World world = chunk.getWorld();
+        // 0.7.7: WorldChunk no longer exposes getWorld() — the event carries it.
+        World world = event.getWorld();
         if (world == null) return;
 
         // Get chunk coordinates directly from WorldChunk

@@ -126,7 +126,9 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
 
     /**
      * Returns the full upsert SQL for this backend's dialect.
-     * SQLite/H2 use ON CONFLICT(id) DO UPDATE SET ... excluded.*
+     * SQLite uses ON CONFLICT(id) DO UPDATE SET ... excluded.*
+     * H2 uses MERGE INTO ... KEY(id) VALUES(...) — ON CONFLICT is REJECTED
+     * by H2 2.2 plain mode (see H2UpsertSqlTest).
      * MySQL uses INSERT INTO ... ON DUPLICATE KEY UPDATE col=VALUES(col), ...
      */
     protected abstract String upsertSql();

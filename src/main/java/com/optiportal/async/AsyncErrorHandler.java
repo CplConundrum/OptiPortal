@@ -187,7 +187,12 @@ public class AsyncErrorHandler {
         }
 
         LOG.info("[OptiPortal] Retrying chunk load: " + cx + "," + cz);
-        return world.getChunkAsync(chunkIndex)
+        return world.getChunkStore().getChunkReferenceAsync(chunkIndex)
+                .thenApply(ref -> ref == null || !ref.isValid()
+                        ? null
+                        : world.getChunkStore().getStore().getComponentConcurrent(
+                                ref,
+                                com.hypixel.hytale.server.core.universe.world.chunk.WorldChunk.getComponentType()))
                 .handle((chunk, ex) -> {
                     if (ex != null) {
                         if (isEngineChunkBackoff(ex)) {

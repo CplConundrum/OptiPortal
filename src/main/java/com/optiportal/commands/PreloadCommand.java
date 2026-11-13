@@ -184,6 +184,14 @@ public class PreloadCommand extends AbstractCommand {
         return plugin.getStorage().loadById(id).map(entry -> {
             entry.setStrategy(strategy);
             plugin.getStorage().save(entry);
+            // Centralized WARM-floor policy: floor membership == "strategy is WARM".
+            // Entering WARM pins the zone at WARM minimum; leaving it (PREDICTIVE)
+            // clears the floor so the zone may decay to COLD.
+            if (strategy == WarmStrategy.WARM) {
+                plugin.getCacheManager().markWarmFloor(id);
+            } else {
+                plugin.getCacheManager().unmarkWarmFloor(id);
+            }
             reply(ctx, "[OptiPortal] " + id + " strategy → " + strategy + ".");
             return CompletableFuture.<Void>completedFuture(null);
         }).orElseGet(() -> { reply(ctx, "[OptiPortal] Portal '" + id + "' not found."); return done(); });
@@ -280,6 +288,9 @@ public class PreloadCommand extends AbstractCommand {
         return plugin.getStorage().loadById(id).map(entry -> {
             entry.setStrategy(WarmStrategy.PREDICTIVE);
             plugin.getStorage().save(entry);
+            // Leaving the WARM strategy — clear the WARM floor so the zone is allowed
+            // to decay to COLD (centralized floor policy: membership == "strategy is WARM").
+            plugin.getCacheManager().unmarkWarmFloor(id);
             plugin.getCacheManager().releaseZoneChunks(id);
             reply(ctx, "[OptiPortal] " + id + " → PREDICTIVE. Warm chunks released.");
             return CompletableFuture.<Void>completedFuture(null);
@@ -390,7 +401,7 @@ public class PreloadCommand extends AbstractCommand {
                      : "nominal";
         }
 
-        reply(ctx, "[OptiPortal] Status — 1.2.3");
+        reply(ctx, "[OptiPortal] Status — 1.3.0");
         
         // Circuit breaker info
         if (cb != null) {
@@ -402,8 +413,10 @@ public class PreloadCommand extends AbstractCommand {
         
         // Load balancer info
         if (lb != null) {
-            reply(ctx, String.format("  Load balancer   : active=%d queued=%d avgTime=%.0fms batchSize=%d",
-                    lb.activeOperations, lb.queuedTasks, lb.averageExecutionTime, lb.currentBatchSize));
+            // A6 (improvement pass): include the authoritative TPS from the stats
+            // record (A6 added it); -1.0 means the TPS monitor is not attached.
+            reply(ctx, String.format("  Load balancer   : active=%d queued=%d avgTime=%.0fms batchSize=%d tps=%.1f",
+                    lb.activeOperations, lb.queuedTasks, lb.averageExecutionTime, lb.currentBatchSize, lb.currentTps));
         } else {
             reply(ctx, "  Load balancer   : unavailable (async infrastructure inactive)");
         }
@@ -503,7 +516,13 @@ public class PreloadCommand extends AbstractCommand {
                     reply(ctx, "[OptiPortal] Days must be an integer or 'reset'.");
                     return CompletableFuture.<Void>completedFuture(null);
                 }
-                entry.setCacheTTLDays(days == -1 ? null : days);
+                // Tier-1 (improvement pass): -1 must be STORED as the -1
+                // never-expire sentinel (the enforcer skips ttlDays == -1).
+                // The old code collapsed -1 to null, which means "use the
+                // global default" — so "never expire" silently became
+                // "reset to default" and the -1 path was indistinguishable
+                // from /preload ttl <id> reset.
+                entry.setCacheTTLDays(days == -1 ? -1 : days);
                 plugin.getStorage().save(entry);
                 reply(ctx, days == -1
                         ? "[OptiPortal] " + id + " TTL → never expire (-1)."
