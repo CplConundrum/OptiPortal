@@ -62,12 +62,13 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
         hydrateMemory();
     }
 
-    protected abstract HikariDataSource createDataSource() throws Exception;
-
-    private void createTable() throws SQLException {
-        try (Connection conn = dataSource.getConnection();
-             Statement stmt = conn.createStatement()) {
-            stmt.execute("""
+    /**
+     * The CREATE TABLE statement for portal_entries.
+     * The default dialect is valid for H2, SQLite, and MySQL.
+     * Postgres overrides this (PostgreSQL has no bare DOUBLE type).
+     */
+    protected String createTableDdl() {
+        return """
                 CREATE TABLE IF NOT EXISTS portal_entries (
                     id                   VARCHAR(255) PRIMARY KEY,
                     world                VARCHAR(255),
@@ -95,7 +96,15 @@ public abstract class AbstractSqlStorageBackend implements StorageBackend {
                     destination_world_uuid VARCHAR(36),
                     updated_at           VARCHAR(64)
                 )
-            """);
+            """;
+    }
+
+    protected abstract HikariDataSource createDataSource() throws Exception;
+
+    protected void createTable() throws SQLException {
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement()) {
+            stmt.execute(createTableDdl());
             // Migrate existing databases that predate these columns
             migrateAddColumnIfMissing(stmt, "activation_json",       "TEXT");
             migrateAddColumnIfMissing(stmt, "destination_world_uuid", "VARCHAR(36)");

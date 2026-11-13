@@ -88,4 +88,28 @@ class PostgresUpsertSqlTest {
         assertFalse(sql.contains("creation_date=excluded.creation_date"),
                 "creation_date is an insert-once field and must not be overwritten");
     }
+
+    @Test
+    void postgresCreateTableDdlUsesDoublePrecision() {
+        // PostgreSQL has no bare DOUBLE type (live-verified on LXC 100 PG16:
+        // "type double does not exist"); the PG override must emit DOUBLE
+        // PRECISION for every numeric column.
+        String ddl = new PostgresStorageBackend(
+                new FakePluginConfig(new java.io.File("target"))).createTableDdl();
+        assertTrue(ddl.contains("DOUBLE PRECISION"),
+                "PG DDL must use DOUBLE PRECISION");
+        assertFalse(ddl.matches("(?s).*\\bDOUBLE(?! PRECISION).*"),
+                "PG DDL must not contain any bare DOUBLE type");
+    }
+
+    @Test
+    void postgresDdlSubstitutionDoesNotCascade() {
+        // The DOUBLE -> DOUBLE PRECISION substitution must run exactly once per
+        // column (a naive replace-all cascade would yield "DOUBLE PRECISION
+        // PRECISION").
+        String ddl = new PostgresStorageBackend(
+                new FakePluginConfig(new java.io.File("target"))).createTableDdl();
+        assertFalse(ddl.contains("DOUBLE PRECISION PRECISION"),
+                "no cascaded replacement");
+    }
 }

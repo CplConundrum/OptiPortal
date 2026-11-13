@@ -34,6 +34,13 @@ public class PostgresStorageBackend extends AbstractSqlStorageBackend {
     public String getBackendType() { return "POSTGRES"; }
 
     @Override
+    protected String createTableDdl() {
+        // PostgreSQL has no bare DOUBLE type - DOUBLE PRECISION is the 8-byte float.
+        return super.createTableDdl().replace("DOUBLE", "DOUBLE PRECISION");
+    }
+
+
+    @Override
     protected String upsertSql() {
         return """
             INSERT INTO portal_entries (
