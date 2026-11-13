@@ -6,6 +6,497 @@ mirror the version numbers in `changelog.md`.
 
 ---
 
+## [1.3.0] - 2026-11-13
+
+---
+
+### 0.7.7 engine port plus cache-tier and async-core hardening
+
+**Files:** 73 files, key ones: `ChunkPreloader.java`, `WorldThreadBridge.java`,
+`ChunkComplexityScorer.java`, `TeleportInterceptor.java`, `OptiPortal.java`,
+`PreloadCommand.java`, `PluginConfig.java`
+
+**Root cause:**
+The codebase targeted an older engine build. Hytale 0.7.7 changed the chunk-store
+surface (ChunkStore reference API, World-overload removal), dropped
+`getDiedInWorld`, and moved several vector types onto JOML `Vector3d`. The port
+landed together with two audited hardening batches (Stage 1 cache-tier S1-S5,
+Stage 2 async-core A1-A6) and a Tier 1/2 fix batch: JDBC calls off the event
+threads, the TTL `-1` sentinel, an H2 `MERGE INTO` upsert, save-lifecycle fences,
+and a new `async.executorThreadCount` config knob.
+
+**Fix:**
+- ported every engine call to the 0.7.7 surface (ChunkStore reference API,
+  removed World overloads, `getDiedInWorld` deleted, JOML `Vector3d` imports in
+  `PlayerDeathSystem` and `AsyncTeleportInterceptor`)
+- removed four dormant classes from the published tree (archived locally)
+- added `async.executorThreadCount` (default `4`, matching prior behavior) so the
+  shared plugin executor's worker count is operator-visible
+- test suite at this point: 55 tests
+
+**Behavioral note:**
+The executor thread count default preserves the pre-change concurrency; only the
+visibility of the setting is new. No data migration.
+
+---
+
+### `ChunkOwnershipAuditor` and `AsyncKeepaliveManager` are now wired into the live lifecycle
+
+**Files:** `OptiPortal.java`, `ChunkOwnershipAuditor.java`, `AsyncKeepaliveManager.java`,
+`CacheManager.java`, `PluginConfig.java`, `AsyncMetrics.java`, `config.json`
+
+**Root cause:**
+Two keepalive systems that keep portal areas resident - `AsyncKeepaliveManager`
+(HOT/WARM/COLD tier pings and recovery) and `ChunkOwnershipAuditor` (drift repair
+for chunks the engine evicted without OptiPortal noticing) - existed in the tree
+but were never constructed and started from the live startup path. Areas could
+therefore be forgotten by the engine between player visits, causing a slow reload
+on the next arrival. A goldfish review (F1-F7) had flagged the defects the wiring
+would have introduced: F1 subclass-typed supplier injection, F2 lifecycle epoch
+plus per-tier in-flight coalescing, F3 ownership-aware recovery, I2.2 per-world
+grouping with all-overlap demotion and dispatch revalidation, F7 keepalive-error
+accounting.
+
+**Fix:**
+- full rewrite of `ChunkOwnershipAuditor`: F4 generation guard, apply-time
+  residency re-read, F5 WARM->COLD via guarded cleanup
+- full rewrite of `AsyncKeepaliveManager`: F1/F2/F3/I2.2/F7 as above
+- 19 splices across `CacheManager` (S1 `packChunkIndex`, S2 generation-safe
+  `onChunksEvicted` WARM->COLD release) and `OptiPortal` (wiring plus the
+  async/classic keepalive switch)
+- `PluginConfig`: ownership-audit interval moved under the `chunkPressure`
+  section (`ownershipAuditIntervalMinutes`, default 60, and
+  `ownershipAuditEnabled`, default true) plus the `async.executorThreadCount`
+  surface; `AsyncMetrics.recordKeepaliveError` for F7 accounting
+- 3 new test classes (18 tests, JUnit 5 + fakes, no booted World):
+  `ChunkOwnershipAuditorTest`, `AsyncKeepaliveManagerTest`,
+  `CacheManagerOwnershipAuditTest`
+- suite 73/73 green
+
+**Threading:**
+Both components run on the shared plugin executor; the auditor's apply path
+re-reads residency at apply time, so a chunk that re-appeared between check and
+apply is not wrongly "repaired."
+
+---
+
+### Teleport poll now performs zero per-player world tasks (off-thread pass A+B+C1)
+
+**Files:** `TeleportInterceptor.java`, `PortalChunkListener.java`
+
+**Root cause:**
+The teleport poll path submitted one `world.execute()` task per player per poll
+cycle: transform capture, jump detection, position bookkeeping, and stale player
+ref cleanup all ran as world-thread work. On a busy server that was a constant
+world-thread tax scaling with the number of online players.
+
+**Fix:**
+- **A:** `pollTeleportRecords` now reads `TeleportRecord` through
+  `getComponentConcurrent` (a StampedLock-protected engine read, 0.7.7-verified),
+  so teleport detection runs on the scheduler thread with no world task.
+  Transform capture is batched into exactly one world task per world per poll
+  cycle (`pollWorlds` + `TransformSnap` cycle guard); jump detection and position
+  bookkeeping run on the executor; stale player refs are cleaned off-thread.
+- **B:** `PortalChunkListener.autoRegisterPortalDevice` keeps only the engine
+  reads and the rare one-shot destination-world scan on the world thread; zone
+  bookkeeping (entryCache/reverseIndex/storage/markNoDecay) moved off-thread via
+  `registerPortalDeviceZoneBookkeeping`.
+- **C1:** `processPlayerProximity`'s world task shrinks to the live-Transform
+  read; the skip check and proximity dispatch move to the executor
+  (`onProximityTransformCaptured`/`performProximityCheck`).
+- shutdown guards made null-safe for the executor paths
+- 8 new tests; suite 99/99
+
+**Threading:**
+World-thread traffic on this path is now the batched transform capture (one task
+per world per cycle) and the one-shot destination scan; everything else runs on
+the plugin executor.
+
+---
+
+### Goldfish triage: four verified off-thread defect classes fixed
+
+**Files:** `TeleportInterceptor.java`, `PortalChunkListener.java`
+
+**Root cause:**
+The off-thread pass introduced four verified defect classes:
+
+- **F1 (Blocker):** `dispatchTransformSnapshot` - `World.execute()` rejects a
+  shutting-down world with `SkipSentryException` (E1) before the lambda runs;
+  unguarded, the `RuntimeException` escapes `pollTeleportRecords` and silently
+  kills the `scheduleWithFixedDelay` polling task forever.
+- **F2 (Major):** `processPositionSnapshots` was global (all `playerRefs`) yet
+  ran once per completing world - a single jump was learned once per
+  concurrently completing world, falsely satisfying the hotspot threshold.
+- **F3 (Major):** the off-thread pass moved the destination-world scan ahead of
+  the existing-entry guard, re-scanning on every reload burst (the original
+  code scanned only for new entries).
+- **F4 (Blocker):** off-thread zone bookkeeping broke the `onChunkPreLoad`
+  ordering invariant - `promoteColdZones` and the event-driven ownership
+  registration run in the same event right after `autoRegisterPortalDevice`
+  returns and must see the new index.
+- **F5 (Major):** `transformSnaps` grew unbounded - no removal in
+  `cleanupStalePlayer`/`removePlayerRef`/`stop`.
+
+**Fix:**
+- F1: routed through an injectable `runWorldTask` seam with a rejection guard -
+  drop this world's capture for the cycle, log, next poll retries. New test A6
+  (RED before the guard: rejection propagated and killed the poll task).
+- F2: `processPositionSnapshots(world, cycle)` now filters to the completing
+  world's snapshots (`snap.worldName`). New test A5 (two completions -> exactly
+  one learn).
+- F3: `autoRegisterPortalDeviceZone` now returns `created`; the destination scan
+  runs only when `created && destination present`.
+- F4: zone bookkeeping (entryCache + reverse index + markNoDecay) is back on the
+  world thread, synchronously; only storage persistence stays off-thread.
+- F5: `transformSnaps` entries are dropped in all three removal sites.
+
+---
+
+### F3 shared-chunk pin underflow closed (per-owner recovery pins)
+
+**Files:** `CacheManager.java`, `AsyncKeepaliveManager.java`
+
+**Root cause:**
+QC round 2 verified against engine bytecode that `WorldChunk` keep-loaded state
+is a per-instance `AtomicInteger` (`addKeepLoaded` = increment,
+`removeKeepLoaded` = decrement). The F3 recovery path restored ONE keep-loaded
+pin per recovered chunk, while the per-zone release path
+(`deregisterAllChunks`) releases one pin PER OWNER. A chunk owned by N zones
+therefore came back with 1 pin: the first owner's release left it unpinned
+(evictable while still owned) and the last release underflowed the counter.
+
+**Fix:**
+- `CacheManager.registerOwnershipBatch` now returns the number of pins acquired
+  (the chunks the zone was new to; 0 when it already owned all of them). All
+  existing callers are fire-and-forget, so this is source-compatible.
+- the F3 `whenComplete` in `AsyncKeepaliveManager` re-registers per owner and
+  restores exactly the pin count that owner would have acquired, instead of one
+  blanket pin per chunk
+
+**Threading:**
+The recovery callback runs on the ping-completing thread; pin counter changes
+still flow through the world-thread task path, so the accounting stays
+total-ordered with the release path.
+
+---
+
+### Instance-aware pin reconciliation (generation stamps)
+
+**Files:** `AsyncKeepaliveManager.java`, `CacheManager.java`
+
+**Root cause:**
+The F3 recovery interleaving: the check-time presence stamp and the pin dispatch
+are separate steps, so a late owner registering while the chunk is absent
+escapes stamping, and a republish before the queued task lands leaves its pin
+un-stamped. The recovery callback (running on the ping-completing thread, not
+the world thread) then re-pins the chunk - producing 4 pins against 3 owners
+and a residue of 1 pin after all releases.
+
+**Fix:**
+- pin stamps are now instance-aware generation stamps: a stamp is bound to the
+  chunk instance it was written on, so a republished chunk invalidates stale
+  stamps, and reconciliation only re-pins owners whose pin actually lapsed with
+  the evicted instance
+- 122 new test lines covering the register-while-absent and republish
+  interleavings
+
+---
+
+### Class-closing: world-thread-serialized pin reconciliation
+
+**Files:** `CacheManager.java`, `AsyncKeepaliveManager.java`
+
+**Root cause:**
+QC round 4 found the deeper F3 variant: because the check-time stamp and the pin
+dispatch are separate steps, a late owner registering while the chunk is absent
+escapes the stamp, and a republish before the queued task lands leaves its pin
+un-stamped; the recovery callback then re-pins it - 4 pins / 3 owners, residue
+1 after all releases. This commit closes the defect class, not just the variant.
+
+**Fix:**
+- r4 seams (test-override points): `submitWorldTask` / `applyKeepLoadedPin` /
+  `applyKeepLoadedRelease` - every pin acquisition, re-pin, and release now runs
+  as a world-thread task that resolves the live chunk instance at execution time
+- `addKeepLoadedBatchForZone`: zone-aware dispatch; the task skips chunks that
+  already carry a live stamp for the zone (idempotent) and stamps the instance
+  that actually received the pin (instance-anchored). All registration/re-pin
+  sites (the 4-arg `registerOwnership`, `registerOwnershipBatch`, the chunk
+  overload, and 4-arg reacquire) route through it
+- `reconcileKeepLoadedPins`: recovery reconciliation - re-fetches the live owner
+  set, re-registers each owner (idempotent claim), and queues ONE world-thread
+  task re-pinning exactly the owners whose pin lapsed with the evicted
+  instance; the task re-checks the live-pin stamp at execution time. All pin
+  mutation and stamp writes happen on the world thread, total-ordered with the
+  registration tasks and the per-zone release path
+- the recovery callback now only enqueues `reconcileKeepLoadedPins` - no pin
+  mutation on the ping-completing thread
+- `deregisterAllChunks` clears the zone pin stamp (parity with
+  `deregisterOwnership`/`releaseZoneChunks`) so a re-registered zone is not
+  skipped by the live-pin guard
+- `onChunkEvicted`/`onChunksEvicted` bump the chunk pin generation on
+  auditor-confirmed engine eviction, so stale zone stamps cannot feed the
+  live-pin guard after a reload
+
+**Verification:**
+4 new discriminating tests (queued-duplicate idempotency, register-while-absent
+then republish, auditor-eviction stamp invalidation, release-then-reclaim) plus
+`RecordingCacheManager` world-task/counter/stamp seams. RED-GREEN: with the
+execution-time guard disabled (the r4 shape)
+`queuedDuplicatePinTasksApplyExactlyOnePin` FAILS (expected 1 pin, was 2 - the
+double pin); with it restored, full suite 80/80 (was 76/76 at the
+instance-aware commit).
+
+---
+
+### P3/P4 carryover: stamp-conditional release plus F7 error accounting
+
+**Files:** `AsyncKeepaliveManager.java`
+
+**Root cause:**
+Two carried-over items from the QC battery: (P3) pin release was not conditioned
+on the stamp actually being present, so a release racing a lapsed or re-stamped
+pin could decrement the counter for the wrong instance state; (P4/F7)
+keepalive-path errors were not accounted for anywhere in the metrics surface,
+so a degraded keepalive loop was invisible to `/preload status`.
+
+**Fix:**
+- stamp-conditional release in the keepalive recovery path: a release only
+  decrements when the zone's live-pin stamp is present on the live instance
+- F7 keepalive-error accounting via `AsyncMetrics.recordKeepaliveError`,
+  surfaced in the status reporting path
+- discriminating tests added for the race window
+
+---
+
+### Goldfish battery Blocker: stamp key-space mismatch and reg-task coordinate swap
+
+**Files:** `CacheManager.java`
+
+**Root cause:**
+The commit-1 battery (6-persona goldfish wave) converged on a Blocker: pin
+stamps are bookkept under `packChunkIndex` (low 32 = cx, high 32 = cz) but
+`tryReleaseKeepLoaded` cleared them with the engine index
+(`ChunkUtil.indexChunk`: high 32 = cx, low 32 = cz). For non-diagonal chunks
+(`cx != cz`) these keys differ, so the stamp clear missed its key and
+`hasLivePin` stayed true after a release - re-registration then skipped the pin,
+leaving bookkeeping and the engine counter out of step on essentially every
+real chunk (only the `cx == cz` diagonal was consistent, and the existing test
+suite only exercised (0,0)). Separately, the registration task's packed-index
+unpack was using the `packChunkIndex` layout on `ChunkUtil.indexChunk` values
+(inherited from the r4 body), swapping cx/cz for non-diagonal chunks.
+
+**Fix:**
+- `tryReleaseKeepLoaded` now computes both key spaces explicitly:
+  `engineIndex` (`ChunkUtil.indexChunk`) for the counter call and `stampKey`
+  (`packChunkIndex`) for `removePinStamp` - on both the task path and the
+  dropped-task caller-side fallback
+- the registration task unpack now uses the correct `ChunkUtil.indexChunk`
+  layout for cx/cz
+- 100 new test lines exercising non-diagonal chunks
+
+---
+
+### Keep-loaded pin path fully off the world thread
+
+**Files:** `CacheManager.java`
+
+**Root cause:**
+After the class-closing pass, the pin path (registration, reconciliation,
+release) still queued every pin operation as a world-thread task. World-thread
+traffic therefore still scaled with portal activity even though the operations
+are bookkeeping over an in-memory stamp map plus a per-instance engine counter.
+
+**Fix:**
+- `submitWorldTask` seam replaced by `submitPinTask`: production runs pin tasks
+  on the plugin's shared `ScheduledExecutorService` (zero `world.execute` calls
+  on the pin path); tests override the seam to run tasks synchronously or hold
+  them
+- a per-chunk `ReentrantLock` (`chunkTaskLocks`, keyed per world by packed chunk
+  index) wraps the check-owner -> check-stamp -> apply -> write-stamp critical
+  section of zone/reconcile/release tasks. This per-chunk mutual exclusion
+  replaces the r4 world-thread FIFO total ordering for same-chunk operations.
+  Batch tasks lock chunks in ascending engine-index order (lock-ordering
+  protocol)
+- execution-time owner-liveness check in registration and reconciliation tasks:
+  skip a chunk whose owner set no longer contains the zone (the zone
+  deregistered between submission and execution - no orphan pins on a
+  re-published instance)
+
+**Threading:**
+World-thread traffic is now limited to genuine engine mutations (chunk-load
+dispatch, teleport, `openCustomPage`); the pin path is pure executor work.
+
+---
+
+### Desloppify qd-001: duplicated radius-resolve helpers consolidated into `PortalRadii`
+
+**Files:** `PortalRadii.java` (new), `ChunkPreloader.java`, `KeepaliveManager.java`,
+`WarmZoneManager.java`, `TeleportInterceptor.java`, `AsyncTeleportInterceptor.java`
+
+**Root cause:**
+The desloppify scan flagged 43 boilerplate-dup blocks; byte-verification of the
+top candidates identified the radius-resolve family: per-axis
+`resolveRadiusX`/`resolveRadiusZ` duplicated byte-identically across
+`ChunkPreloader`, `KeepaliveManager`, and `WarmZoneManager` (FQCN spelling
+aside); a uniform `resolveRadius` duplicated with TWO fallback families (preload
+layer falls back to `defaultWarmRadius`, teleport layer to
+`predictiveRadius`); and two of the preload-layer uniform copies were dead
+private methods.
+
+**Fix:**
+- new neutral `com.optiportal.model.PortalRadii` with the fallback passed as a
+  parameter (the call-site families intentionally differ)
+- five local methods deleted, 13 call sites migrated (including the missed
+  inherited caller `AsyncKeepaliveManager`), imports added, per-file line
+  endings preserved
+- deliberately NOT consolidated here: the `PreloadCommand`/`OptiPortalUIPage`
+  strategy-aware variants (different semantics) - tracked as qd-003
+
+---
+
+### Desloppify qd-003: strategy-aware radius variants moved to `PortalRadii`
+
+**Files:** `PortalRadii.java`, `PreloadCommand.java`, `OptiPortalUIPage.java`,
+`PortalRadiiTest.java` (new)
+
+**Root cause:**
+The command/UI surfaces (expected-chunk-count estimation) carried their own
+strategy-aware radius variants - `entry explicit axis radius > uniform warm
+radius > (WARM ? defaultWarmRadius : predictiveRadius)` - as byte-identical
+private X/Z resolver pairs (12 lines each) in both files.
+
+**Fix:**
+- added `PortalRadii.resolveRadiusXStrategy`/`resolveRadiusZStrategy` implementing
+  the command/UI fallback family
+- `PreloadCommand` and `OptiPortalUIPage` `expectedChunkCount` now delegate to
+  the neutral helper; the duplicated private resolver pairs are deleted
+- `PortalRadiiTest` pins all five radius helpers across the branch matrix
+  (10 tests). Behavior unchanged by construction (pure de-duplication)
+
+**Verification:**
+Gate: 112/112 (102 baseline + 10 new).
+
+---
+
+### Desloppify qd-002: shared watcher helpers moved to `PortalSyncSupport`
+
+**Files:** `PortalSyncSupport.java` (new), `WarpFileWatcher.java`,
+`HyTeleportersXWatcher.java`, `BetterGravestoneWatcher.java`,
+`PortalSyncSupportTest.java` (new)
+
+**Root cause:**
+The integration watchers carried two byte-identical leaf blocks: the
+watcher-owned deletion loop (duplicated in `HyTeleportersXWatcher.syncTeleporters`
+and `WarpFileWatcher.syncWarps`) and the engine plugin-availability probe
+(duplicated in `HyTeleportersXWatcher.isPluginAvailable` and
+`BetterGravestoneWatcher.isPluginAvailable`).
+
+**Fix:**
+- `PortalSyncSupport` now carries `deleteMissing` (the deletion loop; log label
+  preserved via parameter) and `isPluginLoaded` (the probe; both former sites
+  are now thin wrappers)
+- `HyTeleportersXWatcher` drops three now-unused engine imports
+- the remaining shared skeleton (constructor/polling/parse shapes with divergent
+  sync semantics) stays deferred as the larger base-class item
+- `PortalSyncSupportTest` pins `deleteMissing` (3 tests); the engine-coupled
+  `isPluginLoaded` stays pinned by byte-parity with the migrated call sites
+
+**Verification:**
+Gate: 115/115 (112 + 3 new).
+
+---
+
+### Stale case-duplicate index entry removed from the MySQL backend
+
+**Files:** git index only (`MysqlStorageBackend.java`)
+
+**Root cause:**
+The index tracked both `MySqlStorageBackend.java` and `MysqlStorageBackend.java`
+(lowercase-s spelling) pointing at the same blob. On case-insensitive disks only
+the uppercase-S file exists, so the compiler sees one class and builds stay
+green; on a case-sensitive checkout (Linux CI, a fresh clone) both would
+materialize and fail with a duplicate-class error.
+
+**Fix:**
+Dropped the stale index entry (58 index lines removed); the on-disk file is
+untouched and the active backend (wired by `StorageFactory`'s `MYSQL` case) is
+unchanged.
+
+---
+
+### PostgreSQL storage backend plus DDL dialect hook
+
+**Files:** `PostgresStorageBackend.java` (new), `AbstractSqlStorageBackend.java`,
+`PluginConfig.java`, `StorageFactory.java`, `StorageMigrator.java`,
+`PostgresUpsertSqlTest.java` (new), `pom.xml`
+
+**Root cause:**
+The storage matrix offered the JSON file, embedded H2, SQLite, and MariaDB/MySQL
+backends but no PostgreSQL - operators who run Postgres as their database of
+record had no first-class backend, and migrating existing data to one required a
+custom build.
+
+**Fix:**
+- `PostgresStorageBackend`: HikariCP `jdbc:postgresql` pool with the native
+  `ON CONFLICT (id) DO UPDATE SET ... excluded.*` upsert (same shape as the
+  proven SQLite upsert); insert-once fields (`creator`, `creation_date`) and the
+  conflict key are excluded from the update set, matching MySQL semantics
+- `PluginConfig`: `postgres` block (`host`/`port`/`database`/`username`/
+  `password`/`tablePrefix`, default user `postgres`), JSON parse, defaults
+  write-back, and getters
+- `StorageFactory`: `case "POSTGRES"`; `StorageMigrator`: PostgreSQL added to
+  the migration matrix and the backup case (the remote DB is never modified by
+  a migration)
+- `pom.xml`: `org.postgresql:postgresql:42.7.4` (the shade merge carries the
+  driver's SPI registration into the release jar, same as the other drivers)
+- `PostgresUpsertSqlTest`: structural pin of the upsert statement - the house
+  pattern for external-DB backends, which carry no in-gate live-DB test; live
+  dialect proof is an ops step against a real Postgres
+
+**Verification (live dialect proof):**
+Executed against a real PostgreSQL 16 server: the verbatim DDL and upsert were
+run twice - first an INSERT, then the CONFLICT-overwrite path - proving dialect
+validity and overwrite semantics (the overwritten row kept its `creator` and
+`creation_date`). That proof caught one dialect bug: the shared `createTable()`
+DDL used bare `DOUBLE`, which PostgreSQL rejects (`type double does not
+exist`). Fixed with a DDL dialect hook:
+
+- `AbstractSqlStorageBackend.createTable()` made `protected`, with the DDL text
+  extracted into an overridable `protected createTableDdl()` - byte-identical
+  default for H2/SQLite/MySQL
+- `PostgresStorageBackend` overrides `createTableDdl()` with
+  `super.createTableDdl().replace("DOUBLE", "DOUBLE PRECISION")` (six columns)
+- two structural tests pin the DDL shape: the PG DDL uses `DOUBLE PRECISION`,
+  contains no bare `DOUBLE`, and the replacement does not cascade
+
+The proof was re-run after the hook: both statements succeeded on real PG 16.
+
+---
+
+### Regression coverage grew across the cycle
+
+**Files:** `src/test/java/com/optiportal/...`
+
+**Root cause:**
+The 1.3.0 work touched concurrency-sensitive paths (off-thread polling, pin
+reconciliation, world-thread serialization) and added an external-DB backend.
+Without focused regression coverage, the defect classes fixed in this cycle
+would be exposed to quiet regression during later refactors.
+
+**Fix:**
+- new test classes this cycle: `AsyncKeepaliveManagerTest`,
+  `ChunkOwnershipAuditorTest`, `CacheManagerOwnershipAuditTest` (keepalive and
+  auditor wiring), `TeleportInterceptorOffThreadPollTest` and
+  `PortalChunkListenerOffThreadTest` (off-thread pass and defect triage),
+  `PortalRadiiTest` (radius-helper branch matrix), `PortalSyncSupportTest`
+  (watcher helpers), and `PostgresUpsertSqlTest` (upsert + DDL structural
+  pins)
+- suite grew from 55 tests at the 0.7.7 port to 121 tests at release; all
+  passing on the final gate (121/121)
+
+---
+
 ## [1.2.3] - 2026-04-08
 
 ---
