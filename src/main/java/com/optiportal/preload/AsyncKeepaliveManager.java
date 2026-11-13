@@ -111,51 +111,59 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
         }
         final long epoch = lifecycleEpoch.get();
 
-        // One snapshot per pass (F6: the supplier defaults to a fresh in-memory storage
-        // snapshot - never a stale interceptor cache).
-        List<PortalEntry> entries =
-                portalCacheSupplier != null ? portalCacheSupplier.get() : getStorage().loadAllCached();
+        try {
+            List<PortalEntry> entries =
+                    portalCacheSupplier != null ? portalCacheSupplier.get() : getStorage().loadAllCached();
 
-        Map<String, List<ChunkCoordinate>> chunksByWorld = new HashMap<>();
-        Map<String, List<HotZoneCandidate>> hotCandidates = new HashMap<>();
-        collectPassWork(tier, entries, chunksByWorld, hotCandidates);
+            Map<String, List<ChunkCoordinate>> chunksByWorld = new HashMap<>();
+            Map<String, List<HotZoneCandidate>> hotCandidates = new HashMap<>();
+            collectPassWork(tier, entries, chunksByWorld, hotCandidates);
 
-        if (chunksByWorld.isEmpty()) {
-            inFlight.set(false);
-            return;
-        }
-
-        // F2/I2.2: concurrency-safe dedupe set shared across delayed batches - a zone
-        // demoted by an early batch is not demoted (or logged) again by a later one.
-        Set<String> demotedThisPass = ConcurrentHashMap.newKeySet();
-
-        List<CompletableFuture<Void>> batchFutures = new ArrayList<>();
-        for (Map.Entry<String, List<ChunkCoordinate>> worldEntry : chunksByWorld.entrySet()) {
-            String worldName = worldEntry.getKey();
-            List<ChunkCoordinate> chunks = worldEntry.getValue();
-            int batchSize = calculateOptimalBatchSize(chunks.size());
-            List<HotZoneCandidate> candidates = hotCandidates.getOrDefault(worldName, List.of());
-            for (int i = 0; i < chunks.size(); i += batchSize) {
-                List<ChunkCoordinate> batch =
-                        List.copyOf(chunks.subList(i, Math.min(i + batchSize, chunks.size())));
-                batchFutures.add(loadBalancer.scheduleLoad(() -> {
-                    // F2: stale-generation guard (stop/reschedule bumped the epoch after queueing).
-                    if (epoch != lifecycleEpoch.get()) {
-                        return CompletableFuture.completedFuture(null);
-                    }
-                    return pingChunkBatch(worldName, batch, tier, candidates, demotedThisPass);
-                }, AsyncMetrics.AsyncTaskPriority.NORMAL));
+            if (chunksByWorld.isEmpty()) {
+                inFlight.set(false);
+                return;
             }
+
+            // F2/I2.2: concurrency-safe dedupe set shared across delayed batches - a zone
+            // demoted by an early batch is not demoted (or logged) again by a later one.
+            Set<String> demotedThisPass = ConcurrentHashMap.newKeySet();
+
+            List<CompletableFuture<Void>> batchFutures = new ArrayList<>();
+            for (Map.Entry<String, List<ChunkCoordinate>> worldEntry : chunksByWorld.entrySet()) {
+                String worldName = worldEntry.getKey();
+                List<ChunkCoordinate> chunks = worldEntry.getValue();
+                int batchSize = calculateOptimalBatchSize(chunks.size());
+                List<HotZoneCandidate> candidates = hotCandidates.getOrDefault(worldName, List.of());
+                for (int i = 0; i < chunks.size(); i += batchSize) {
+                    List<ChunkCoordinate> batch =
+                            List.copyOf(chunks.subList(i, Math.min(i + batchSize, chunks.size())));
+                    batchFutures.add(loadBalancer.scheduleLoad(() -> {
+                        // F2: stale-generation guard (stop/reschedule bumped the epoch after queueing).
+                        if (epoch != lifecycleEpoch.get()) {
+                            return CompletableFuture.completedFuture(null);
+                        }
+                        return pingChunkBatch(worldName, batch, tier, candidates, demotedThisPass, epoch);
+                    }, AsyncMetrics.AsyncTaskPriority.NORMAL));
+                }
+            }
+            CompletableFuture.allOf(batchFutures.toArray(new CompletableFuture[0]))
+                    .whenComplete((result, ex) -> {
+                        inFlight.set(false);
+                        if (epoch != lifecycleEpoch.get()) return; // stale generation: no records
+                        if (ex != null) {
+                            LOG.warning("[OptiPortal] Keepalive error for tier " + tier + ": " + ex.getMessage());
+                            metrics.recordKeepaliveError(tier.name());
+                        }
+                    });
+        } catch (RuntimeException ex) {
+            // F2: a synchronous failure after the in-flight gate was acquired (snapshot,
+            // collection, batching, or scheduling) must release the gate, or this tier
+            // stays permanently coalesced (the latch is otherwise only cleared by the
+            // async completion path).
+            inFlight.set(false);
+            metrics.recordKeepaliveError(tier.name());
+            throw ex; // the inherited safePing handler logs it
         }
-        CompletableFuture.allOf(batchFutures.toArray(new CompletableFuture[0]))
-                .whenComplete((result, ex) -> {
-                    inFlight.set(false);
-                    if (epoch != lifecycleEpoch.get()) return; // stale generation: no records
-                    if (ex != null) {
-                        LOG.warning("[OptiPortal] Keepalive error for tier " + tier + ": " + ex.getMessage());
-                        metrics.recordKeepaliveError(tier.name());
-                    }
-                });
     }
 
     /**
@@ -198,7 +206,7 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
 
     private CompletableFuture<Void> pingChunkBatch(String worldName, List<ChunkCoordinate> batch,
                                                    CacheTier tier, List<HotZoneCandidate> candidates,
-                                                   Set<String> demotedThisPass) {
+                                                   Set<String> demotedThisPass, long epoch) {
         ChunkSurface surface = chunkSurface(worldName);
         if (surface == null) {
             return CompletableFuture.completedFuture(null); // world not loaded (gone)
@@ -206,6 +214,21 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
 
         BatchStats stats = new BatchStats();
         List<CompletableFuture<Void>> chunkFutures = new ArrayList<>();
+
+        // I2.2: execution-time validity - a delayed batch must not demote a zone by
+        // snapshot coordinates the warp watcher has since moved/deleted. Revalidated
+        // against the CURRENT stored entries at dispatch time.
+        Map<String, PortalEntry> currentEntries;
+        try {
+            currentEntries = new HashMap<>();
+            for (PortalEntry e : getStorage().loadAllCached()) {
+                if (e != null && e.getId() != null) currentEntries.put(e.getId(), e);
+            }
+        } catch (Exception e) {
+            // storage unavailable: demotion validation degrades to the safe direction
+            // (no demotion without coordinate verification).
+            currentEntries = Map.of();
+        }
 
         for (ChunkCoordinate coord : batch) {
             long index = ((long) coord.cx << 32) | (coord.cz & 0xFFFFFFFFL);
@@ -215,7 +238,7 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
                 if (tier == CacheTier.HOT) {
                     // I2.2: demote all same-world HOT zones covering the evicted coord
                     // (candidates are pre-grouped per world - cross-world zones are excluded).
-                    demoteOverlappingHotZones(coord, candidates, demotedThisPass);
+                    demoteOverlappingHotZones(coord, candidates, demotedThisPass, worldName, currentEntries);
 
                     // F3: ownership/pin-aware recovery. A missing chunk owned by a zone is
                     // re-loaded and its ownership re-registered (idempotent: re-pins only if
@@ -229,10 +252,22 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
                     stats.attempted.incrementAndGet();
                     chunkFutures.add(surface.ping(index).whenComplete((r, ex) -> {
                         if (ex == null) {
+                            // F2: a stop()/reschedule() in the ping gap must not let a
+                            // stale-generation pass re-register ownership (it would pin a
+                            // former generation's chunk).
+                            if (epoch != lifecycleEpoch.get()) {
+                                stats.succeeded.incrementAndGet();
+                                return;
+                            }
                             for (String zoneId : owners) {
                                 getCacheManager().registerOwnershipBatch(
                                         zoneId, worldName, List.of(new int[]{coord.cx, coord.cz}));
                             }
+                            // F3: the ping re-loaded the chunk (its pin lapsed with the
+                            // eviction) - re-issue the keep-loaded request now that the
+                            // chunk is back in the store (the pre-store filter in
+                            // addKeepLoadedBatchAsync would have skipped an absent chunk).
+                            getCacheManager().reacquireKeepLoadedPin(worldName, coord.cx, coord.cz);
                             stats.succeeded.incrementAndGet();
                         } else {
                             stats.failed.incrementAndGet();
@@ -259,7 +294,17 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
         }
 
         return CompletableFuture.allOf(chunkFutures.toArray(new CompletableFuture[0]))
-                .thenAccept(v -> {
+                .whenComplete((v, ex) -> {
+                    // F7: any chunk failure in the batch (partial or total, aborted or
+                    // not) is a keepalive error - a partial failure must not be
+                    // absorbed into the success path.
+                    if (ex != null || stats.failed.get() > 0) {
+                        metrics.recordKeepaliveError(tier.name());
+                        LOG.warning("[OptiPortal] Keepalive " + tier
+                                + ": " + (ex != null ? "batch aborted" : "batch partially failed")
+                                + " for world '" + worldName + "'"
+                                + (ex != null ? " (" + ex.getMessage() + ")" : ""));
+                    }
                     if (stats.attempted.get() > 0) {
                         LOG.info("[OptiPortal] Keepalive " + tier + ": pinged "
                                 + stats.succeeded.get() + "/" + stats.attempted.get()
@@ -267,29 +312,29 @@ public class AsyncKeepaliveManager extends KeepaliveManager {
                                 + (stats.skipped.get() > 0 ? " (" + stats.skipped.get() + " unowned/absent skipped)" : "")
                                 + (stats.failed.get() > 0 ? " (" + stats.failed.get() + " failed)" : ""));
                     }
-                })
-                .exceptionally(ex -> {
-                    if (stats.succeeded.get() == 0) {
-                        // F7: a fully-failed (or aborted) tier is a keepalive error, not a success.
-                        metrics.recordKeepaliveError(tier.name());
-                        LOG.warning("[OptiPortal] Keepalive " + tier
-                                + ": batch failed for world '" + worldName + "': " + ex.getMessage());
-                    }
-                    return null;
                 });
     }
 
     /**
      * I2.2: demote (HOT → WARM) every candidate zone covering the evicted coord. Deduped
      * across batches via {@code demotedThisPass} and revalidated at dispatch time: a zone
-     * that decayed, was deleted, or was re-promoted between the snapshot and this delayed
-     * batch is left alone.
+     * that decayed, was deleted, was moved, or was re-promoted between the snapshot and
+     * this delayed batch is left alone (tier + generation + current stored coordinates).
      */
     private void demoteOverlappingHotZones(ChunkCoordinate coord, List<HotZoneCandidate> candidates,
-                                           Set<String> demotedThisPass) {
+                                           Set<String> demotedThisPass, String worldName,
+                                           Map<String, PortalEntry> currentEntries) {
         for (HotZoneCandidate c : candidates) {
             if (Math.abs(coord.cx - c.cx) > c.radiusX || Math.abs(coord.cz - c.cz) > c.radiusZ) continue;
             if (!demotedThisPass.add(c.zoneId)) continue; // already handled by an earlier batch/coord
+            // I2.2 execution-time validity: a zone moved or deleted since the snapshot
+            // may still read HOT/same-generation - revalidate the coordinates against
+            // the current stored entry before demoting.
+            PortalEntry current = currentEntries.get(c.zoneId);
+            if (current == null) continue; // zone deleted since the snapshot
+            if (!current.getWorld().equals(worldName)
+                    || ChunkPreloader.toChunkCoord(current.getX()) != c.cx
+                    || ChunkPreloader.toChunkCoord(current.getZ()) != c.cz) continue; // zone moved since the snapshot
             if (getCacheManager().getZoneTier(c.zoneId) != CacheTier.HOT) continue;
             if (getCacheManager().getZoneGeneration(c.zoneId) != c.capturedGen) continue;
             getCacheManager().setZoneTier(c.zoneId, CacheTier.WARM);

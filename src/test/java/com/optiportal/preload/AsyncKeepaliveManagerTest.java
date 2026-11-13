@@ -124,9 +124,11 @@ class AsyncKeepaliveManagerTest {
     @Test
     void hotPassDemotesAllOverlappingZones() throws Exception {
         // z1 at chunk (0,0), z2 at chunk (1,0): radii of 1 overlap on the shared chunks.
-        // Every chunk is evicted (empty resident set) and NO zone owns any chunk, so the
-        // pass must still demote BOTH zones (I2.2: all-overlap demotion, deduped).
-        Fixture fx = new Fixture(Set.of());
+        // Chunk (0,0) is resident and (1,0) is evicted, and NO zone owns any chunk, so
+        // the SINGLE evicted coord must still demote BOTH zones (I2.2: all-overlap
+        // demotion, deduped) - a first-match-only implementation that demotes only the
+        // first covering candidate would leave the other zone HOT.
+        Fixture fx = new Fixture(Set.of(0L)); // chunk (0,0) resident; (1,0) evicted
         fx.storage.save(zone("z1", 0, 0, 1));
         fx.storage.save(zone("z2", 16, 0, 1));
         fx.cm.setZoneTier("z1", CacheTier.HOT);
@@ -136,7 +138,7 @@ class AsyncKeepaliveManagerTest {
 
         assertEquals(CacheTier.WARM, fx.cm.getZoneTier("z1"), "overlapping HOT zone z1 demoted");
         assertEquals(CacheTier.WARM, fx.cm.getZoneTier("z2"), "overlapping HOT zone z2 demoted too (all-overlap)");
-        assertTrue(fx.surface.pinged.isEmpty(), "unowned chunks are never pinged (3-tier model owns resurrection)");
+        assertEquals(Set.of(0L), fx.surface.pinged, "only the resident chunk is pinged; the unowned evicted chunk is never resurrected");
     }
 
     @Test
@@ -147,9 +149,13 @@ class AsyncKeepaliveManagerTest {
         fx.cm.registerOwnershipBatch("z1", "w1", List.of(new int[]{0, 0}));
         // The engine evicted (0,0) while the ownership map stayed intact (the Fixture's
         // resident set is empty - no audit pass ran yet). F3 must re-request the chunk
-        // and idempotently re-register its ownership. (An auditor-stripped chunk is
-        // indistinguishable from unowned geometry by design - keepalive never
-        // resurrects unowned chunks; the 3-tier model owns that decision.)
+        // and idempotently re-register its ownership. The successful ping also triggers
+        // the keep-loaded pin re-acquisition (reacquireKeepLoadedPin) once the chunk is
+        // back in the store - pin state is only observable on the world thread, so this
+        // test asserts the ownership side and the pin ordering is verified by code
+        // review. (An auditor-stripped chunk is indistinguishable from unowned geometry
+        // by design - keepalive never resurrects unowned chunks; the 3-tier model owns
+        // that decision.)
         assertEquals(Set.of("z1"), fx.cm.getChunkOwners("w1", 0, 0), "precondition: ownership intact");
 
         fx.ak.pingTier(CacheTier.HOT, "test");

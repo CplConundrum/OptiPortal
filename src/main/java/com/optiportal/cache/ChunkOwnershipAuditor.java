@@ -1,13 +1,16 @@
 package com.optiportal.cache;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Logger;
 
 import com.hypixel.hytale.math.util.ChunkUtil;
@@ -45,6 +48,10 @@ public class ChunkOwnershipAuditor {
 
     /** Lifecycle fence: a pass in flight at stop() time applies no mutations. */
     private final AtomicBoolean active = new AtomicBoolean(false);
+    // Lifecycle fence: bumped on every stop()/reschedule(); an in-flight pass that
+    // outlives the stop (or survives a reschedule that re-armed `active`) sees a
+    // changed epoch and applies nothing.
+    private final AtomicLong passEpoch = new AtomicLong(0);
     /** Arm guard: a double start() is a no-op. */
     private final AtomicBoolean armed  = new AtomicBoolean(false);
 
@@ -120,6 +127,7 @@ public class ChunkOwnershipAuditor {
 
     public void stop() {
         active.set(false);
+        passEpoch.incrementAndGet();
         ScheduledFuture<?> t = task;
         task = null;
         if (t != null) {
@@ -157,6 +165,7 @@ public class ChunkOwnershipAuditor {
 
     private void auditWorld(String worldName) {
         // ---- observation phase ----------------------------------------------------
+        final long epoch = passEpoch.get();
         LongSet loaded;
         try {
             loaded = snapshots.loadedIndexes(worldName);
@@ -175,6 +184,7 @@ public class ChunkOwnershipAuditor {
         int evictedCount = 0;
         List<int[]> evictions = new ArrayList<>();
         List<Set<String>> observedOwners = new ArrayList<>();
+        List<Map<String, Long>> observedZoneGens = new ArrayList<>();
 
         for (Long key : ownedKeys) {
             int cx = (int) (long) key;
@@ -184,9 +194,17 @@ public class ChunkOwnershipAuditor {
             if (!loaded.contains(engineIndex)) {
                 evictedCount++;
                 evictions.add(new int[]{cx, cz});
-                // F4: capture the observed owner set at observation time; the application
-                // phase skips the coord if ownership moved in the gap.
-                observedOwners.add(new HashSet<>(cacheManager.getChunkOwners(worldName, cx, cz)));
+                // F4: capture the observed owner set AND the per-owner zone generation
+                // at observation time; the application phase skips the coord if ownership
+                // moved OR any observed zone advanced its generation (re-promotion /
+                // re-registration) in the gap.
+                Set<String> obsOwners = new HashSet<>(cacheManager.getChunkOwners(worldName, cx, cz));
+                observedOwners.add(obsOwners);
+                Map<String, Long> obsGens = new HashMap<>();
+                for (String z : obsOwners) {
+                    obsGens.put(z, cacheManager.getZoneGeneration(z));
+                }
+                observedZoneGens.add(obsGens);
             }
         }
 
@@ -207,11 +225,14 @@ public class ChunkOwnershipAuditor {
 
         // ---- F4: conditional application -------------------------------------------
         // Revalidate before applying: (a) a chunk reloaded in the observation-to-apply gap
-        // must not be re-evicted, and (b) a coord whose ownership changed in the gap
-        // (re-registration/transfer) must not be erased by the stale observation.
-        // A re-registration between the check and the apply is still not atomic; a rare
-        // double-apply is bounded to a single coord and self-heals on the next audit.
-        if (!active.get()) return; // I1.1: stop fence
+        // must not be re-evicted, (b) a coord whose ownership changed in the gap
+        // (re-registration/transfer) must not be erased by the stale observation, and
+        // (c) a coord whose observed zone advanced its generation in the gap
+        // (re-promotion / re-registration) must not be downgraded from the fresh state.
+        // Residual: a release+re-registration of the SAME zone with no tier change is
+        // indistinguishable from the observed state (bounded to one coord, self-heals
+        // on the next audit pass).
+        if (!active.get() || passEpoch.get() != epoch) return; // I1.1: stop/reschedule fence
         LongSet loadedNow = loaded;
         try {
             loadedNow = snapshots.loadedIndexes(worldName);
@@ -221,7 +242,7 @@ public class ChunkOwnershipAuditor {
 
         List<int[]> toApply = new ArrayList<>();
         for (int i = 0; i < evictions.size(); i++) {
-            if (!active.get()) return; // I1.1: stop fence (per-coord)
+            if (!active.get() || passEpoch.get() != epoch) return; // I1.1: stop/reschedule fence (per-coord)
             int[] c = evictions.get(i);
             long engineIndex = ChunkUtil.indexChunk(c[0], c[1]);
             if (loadedNow != null && loadedNow.contains(engineIndex)) {
@@ -230,6 +251,16 @@ public class ChunkOwnershipAuditor {
             Set<String> nowOwners = cacheManager.getChunkOwners(worldName, c[0], c[1]);
             if (!nowOwners.equals(observedOwners.get(i))) {
                 continue; // (b) ownership moved in the gap
+            }
+            boolean zoneAdvanced = false;
+            for (Map.Entry<String, Long> ge : observedZoneGens.get(i).entrySet()) {
+                if (cacheManager.getZoneGeneration(ge.getKey()) != ge.getValue()) {
+                    zoneAdvanced = true;
+                    break;
+                }
+            }
+            if (zoneAdvanced) {
+                continue; // (c) observed zone re-promoted/re-registered in the gap
             }
             toApply.add(c);
         }
@@ -240,6 +271,9 @@ public class ChunkOwnershipAuditor {
             return;
         }
 
+        // Final fence: a stop()/reschedule() between the per-coord checks and this
+        // call must not let the stale pass apply.
+        if (!active.get() || passEpoch.get() != epoch) return;
         cacheManager.onChunksEvicted(worldName, toApply);
         LOG.info("[OptiPortal] Ownership audit: world '" + worldName + "': checked="
                 + checkedCount + " evictedApplied=" + toApply.size() + " (observed=" + evictedCount + ")");

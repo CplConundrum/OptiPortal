@@ -98,7 +98,11 @@ class ChunkOwnershipAuditorTest {
         snap.loaded.add(idx(1, 1));
         snap.loaded.add(idx(2, 2));
 
-        newAuditor(cm, cfg, exec, snap).runAudit();
+        // The apply phase checks the active fence - a pass that never ran start()
+        // would be a no-op, so exercise the fence (the 3 gap tests above do the same).
+        ChunkOwnershipAuditor auditor = newAuditor(cm, cfg, exec, snap);
+        auditor.start();
+        auditor.runAudit();
 
         assertEquals(java.util.Set.of("z1"), cm.getChunkOwners("w", 1, 1), "owned + loaded chunk untouched");
         assertEquals(java.util.Set.of("z1"), cm.getChunkOwners("w", 2, 2), "owned + loaded chunk untouched");
@@ -181,7 +185,11 @@ class ChunkOwnershipAuditorTest {
         cm.setZoneTier("z1", CacheTier.WARM);
         cm.registerOwnershipBatch("z1", "w", List.of(new int[]{1, 1}, new int[]{2, 2}));
 
-        newAuditor(cm, cfg, exec, snap).runAudit();
+        // The apply phase checks the active fence - a pass that never ran start()
+        // would be a no-op, so exercise the fence (the 3 gap tests above do the same).
+        ChunkOwnershipAuditor auditor = newAuditor(cm, cfg, exec, snap);
+        auditor.start();
+        auditor.runAudit();
 
         assertEquals(java.util.Set.of("z1"), cm.getChunkOwners("w", 1, 1),
                 "100% missing owned chunks read as a world unload - nothing is applied");

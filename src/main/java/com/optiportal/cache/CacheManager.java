@@ -632,6 +632,18 @@ public class CacheManager {
     }
 
     /**
+     * F3: re-request the keep-loaded pin for a chunk the engine evicted while zone
+     * ownership stayed intact. The pin request lapsed together with the eviction;
+     * re-issuing is idempotent and does NOT double-count per-zone pin ownership.
+     * Call AFTER the chunk has been re-loaded: the pre-store filter in
+     * addKeepLoadedBatchAsync skips absent chunks, so this is a no-op before the
+     * reload lands.
+     */
+    public void reacquireKeepLoadedPin(String worldName, int cx, int cz) {
+        addKeepLoadedBatchAsync(worldName, java.util.List.of(ChunkUtil.indexChunk(cx, cz)));
+    }
+
+    /**
      * Batch variant of registerOwnership — registers ownership for multiple chunks
      * in a single call, reducing world-thread task submissions. Used by ChunkPreloader
      * when claiming already-loaded chunks during warm/predictive loads.
@@ -878,6 +890,11 @@ public class CacheManager {
         long now = System.currentTimeMillis();
         tierSnapshotLock.readLock().lock();
         try {
+            // F5 pacing: collect (zone, generation) pairs and submit ONE task after
+            // the loop - a multi-zone audit must not burst world-thread pin-release
+            // work (one unpaced submit per zone).
+            java.util.List<String> coldZones = new java.util.ArrayList<>();
+            java.util.List<Long> coldGens = new java.util.ArrayList<>();
             for (Map.Entry<String, CacheTier> entry : downgrades.entrySet()) {
                 String zoneId = entry.getKey();
                 CacheTier current = entry.getValue();
@@ -900,19 +917,30 @@ public class CacheManager {
                     // ownership/pins would dangle forever. The tier+generation re-check skips
                     // the release if the zone was re-promoted before the task runs.
                     if (current == CacheTier.WARM && downgraded == CacheTier.COLD) {
-                        final String coldZone = zoneId;
-                        final long coldGen = zoneGenerations.getOrDefault(zoneId, 0L);
-                        executor.submit(() -> {
-                            if (zoneTiers.getOrDefault(coldZone, CacheTier.COLD) != CacheTier.COLD
-                                    || zoneGenerations.getOrDefault(coldZone, 0L) != coldGen) {
-                                LOG.info("[OptiPortal] onChunksEvicted: skipping WARM -> COLD cleanup for '"
-                                        + coldZone + "' (zone was re-promoted since the audit)");
-                                return;
-                            }
-                            deregisterAllChunks(coldZone);
-                        });
+                        coldZones.add(zoneId);
+                        coldGens.add(zoneGenerations.getOrDefault(zoneId, 0L));
                     }
                 }
+            }
+            // F5: one paced task per eviction batch (not per zone) - the per-zone
+            // tier+generation re-check is preserved, but the world-thread pin-release
+            // work is batched.
+            if (!coldZones.isEmpty()) {
+                final java.util.List<String> zones = coldZones;
+                final java.util.List<Long> gens = coldGens;
+                executor.submit(() -> {
+                    for (int zi = 0; zi < zones.size(); zi++) {
+                        final String coldZone = zones.get(zi);
+                        final long coldGen = gens.get(zi);
+                        if (zoneTiers.getOrDefault(coldZone, CacheTier.COLD) != CacheTier.COLD
+                                || zoneGenerations.getOrDefault(coldZone, 0L) != coldGen) {
+                            LOG.info("[OptiPortal] onChunksEvicted: skipping WARM -> COLD cleanup for '"
+                                    + coldZone + "' (zone was re-promoted since the audit)");
+                            continue;
+                        }
+                        deregisterAllChunks(coldZone);
+                    }
+                });
             }
         } finally {
             tierSnapshotLock.readLock().unlock();

@@ -503,7 +503,12 @@ public class OptiPortal extends JavaPlugin {
         // but does NOT swap implementations (a live swap would need to invalidate the old
         // manager's queued work - out of scope for the 2026-11-12 wiring).
         keepaliveManager.reschedule();
-        if (ownershipAuditor != null) ownershipAuditor.reschedule();
+        // D1: follow the reloaded flag - a reload that disabled the audit (or a reload
+        // while it was disabled at startup) must not silently re-arm it.
+        if (ownershipAuditor != null) {
+            if (config.isOwnershipAuditEnabled()) ownershipAuditor.reschedule();
+            else ownershipAuditor.stop();
+        }
         if (ttlEnforcer != null) ttlEnforcer.reschedule();
 
         // Restart warp watcher only if relevant settings changed (old vs new comparison)
