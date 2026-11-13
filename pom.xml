@@ -71,6 +71,13 @@
             <version>8.3.0</version>
         </dependency>
 
+        <!-- Database: PostgreSQL -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>42.7.4</version>
+        </dependency>
+
         <!-- Connection pooling -->
         <dependency>
             <groupId>com.zaxxer</groupId>

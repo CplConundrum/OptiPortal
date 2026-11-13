@@ -73,6 +73,7 @@ public class StorageFactory {
             case "SQLITE" -> new SqliteStorageBackend(config);
             case "H2"     -> new H2StorageBackend(config);
             case "MYSQL"  -> new MySqlStorageBackend(config);
+            case "POSTGRES" -> new PostgresStorageBackend(config);
             default       -> new JsonStorageBackend(config);
         };
         try {

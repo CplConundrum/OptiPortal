@@ -118,6 +118,12 @@ public class PluginConfig {
     private String mysqlUsername = "";
     private String mysqlPassword = "";
     private String mysqlTablePrefix = "pre_";
+    private String pgHost = "localhost";
+    private int pgPort = 5432;
+    private String pgDatabase = "preload";
+    private String pgUsername = "postgres";
+    private String pgPassword = "";
+    private String pgTablePrefix = "pre_";
 
     // UI
     private boolean uiEnabled = true;
@@ -324,6 +330,16 @@ public class PluginConfig {
             if (mysql.has("tablePrefix")) mysqlTablePrefix = mysql.get("tablePrefix").getAsString();
         }
 
+        if (json.has("postgres")) {
+            JsonObject postgres = json.getAsJsonObject("postgres");
+            if (postgres.has("host")) pgHost = postgres.get("host").getAsString();
+            if (postgres.has("port")) pgPort = postgres.get("port").getAsInt();
+            if (postgres.has("database")) pgDatabase = postgres.get("database").getAsString();
+            if (postgres.has("username")) pgUsername = postgres.get("username").getAsString();
+            if (postgres.has("password")) pgPassword = postgres.get("password").getAsString();
+            if (postgres.has("tablePrefix")) pgTablePrefix = postgres.get("tablePrefix").getAsString();
+        }
+
         if (json.has("ui")) {
             JsonObject ui = json.getAsJsonObject("ui");
             if (ui.has("enabled")) uiEnabled = ui.get("enabled").getAsBoolean();
@@ -523,6 +539,14 @@ public class PluginConfig {
         mysql.addProperty("password", "");
         mysql.addProperty("tablePrefix", "pre_");
 
+        JsonObject postgres = new JsonObject();
+        postgres.addProperty("host", "localhost");
+        postgres.addProperty("port", 5432);
+        postgres.addProperty("database", "preload");
+        postgres.addProperty("username", "postgres");
+        postgres.addProperty("password", "");
+        postgres.addProperty("tablePrefix", "pre_");
+
         JsonObject ui = new JsonObject();
         ui.addProperty("enabled", true);
         ui.addProperty("pagePath", "Common/UI/Custom/OptiPortalUI.ui");
@@ -578,6 +602,7 @@ public class PluginConfig {
         root.add("gravestones", gravestones);
         root.add("integrations", integrations);
         root.add("mysql", mysql);
+        root.add("postgres", postgres);
         root.add("ui", ui);
         root.add("metrics", metrics);
         root.add("updateChecker", updateChecker);
@@ -721,6 +746,12 @@ public class PluginConfig {
     public String getMysqlUsername() { return mysqlUsername; }
     public String getMysqlPassword() { return mysqlPassword; }
     public String getMysqlTablePrefix() { return mysqlTablePrefix; }
+    public String getPgHost() { return pgHost; }
+    public int getPgPort() { return pgPort; }
+    public String getPgDatabase() { return pgDatabase; }
+    public String getPgUsername() { return pgUsername; }
+    public String getPgPassword() { return pgPassword; }
+    public String getPgTablePrefix() { return pgTablePrefix; }
     public boolean isUiEnabled() { return uiEnabled; }
     public String getUiPagePath() { return uiPagePath; }
     public boolean isMetricsEnabled() { return metricsEnabled; }

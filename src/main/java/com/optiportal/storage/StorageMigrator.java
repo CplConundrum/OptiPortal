@@ -19,7 +19,7 @@ import java.util.logging.Logger;
  * entries from the old backend, writes them to the new one, and backs
  * up the old data file.
  *
- * Migration matrix: Any → Any (JSON ↔ SQLite ↔ H2 ↔ MySQL)
+ * Migration matrix: Any → Any (JSON ↔ SQLite ↔ H2 ↔ MySQL ↔ PostgreSQL)
  *
  * Safety guarantees:
  * - Old data is never deleted — backed up with a timestamp suffix
@@ -88,6 +88,10 @@ public class StorageMigrator {
                                       new File(dir, "portal-data-h2." + ts + ".migration-bak.mv.db"));
             case "MYSQL"  -> {
                 LOG.info("[OptiPortal] NOTE: MySQL remote database was NOT modified.");
+                LOG.info("[OptiPortal] Clean up the remote 'portal_entries' table manually if desired.");
+            }
+            case "POSTGRES" -> {
+                LOG.info("[OptiPortal] NOTE: Postgres remote database was NOT modified.");
                 LOG.info("[OptiPortal] Clean up the remote 'portal_entries' table manually if desired.");
             }
             default -> LOG.info("[OptiPortal] No backup action defined for backend type: " + backendType);
