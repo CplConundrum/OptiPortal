@@ -2,17 +2,35 @@
 
 ---
 
-## [1.3.0] - 2026-11-12
+## [1.3.0] - 2026-11-13
 
-- **0.7.7 engine port**: chunk loading moved to the `ChunkStore` reference API; removed `World`-overload calls and deprecated `readEnvironmentRuns` usage; builds against the 2026.03.26 server jar.
-- **Cache-tier hardening (Stage 1)**: generation-safe tier expiry, centralized WARM-floor policy, batched + paced WARM→COLD decay, cache registry persisted to `cache-registry.json` (warm cache survives restart).
-- **Async-core hardening (Stage 2)**: queue admission re-check at drain time, atomic batch enqueue/retire, single-owner circuit-breaker accounting, wider TPS clamp, authoritative TPS in load stats.
-- **Threading and data fixes**: JDBC moved off player-event threads, TTL `-1` (never-expire) sentinel preserved end-to-end, H2 upsert rewritten to `MERGE INTO` (H2 2.2 plain mode rejects `ON CONFLICT` — H2-mode saves were silently no-ops), save-lifecycle fences against post-shutdown callbacks.
-- **New config knob**: `async.executorThreadCount` (default 4 = legacy behavior) in `config.json`.
-- **Cleanup**: four dormant classes archived out of the published tree; full test suite now 55 tests.
+**Works with the latest game**
+
+- **Updated for Hytale 0.7.7**: the mod has been updated for the current game chapter. If your server runs 0.7.7, this is the version you need.
+
+**New choice of where your data lives**
+
+- **PostgreSQL is now an option for storing portal data**: alongside the built-in file storage, the built-in embedded database, and MariaDB/MySQL, you can now keep your portal data in a PostgreSQL database. All previous options keep working exactly as before; switching is a settings change, not a reinstall.
+- **Switching storage locations keeps your data**: the usual "move my data from where it was saved before" path now works with PostgreSQL too, so moving between storage options does not lose your portal records.
+
+**Lighter on your server**
+
+- **Teleport checks no longer interrupt the game**: the routine "is anyone near a portal?" check used to tap briefly into the part of the server that runs the game itself (a little, every second, per player). It now runs entirely in the background. What players see is exactly the same; busy servers simply lose less time to it.
+- **More housekeeping moved to the background**: several of the mod's internal bookkeeping jobs (keeping areas loaded, zone records, and area-ownership checks) now run without touching the game loop, so normal play no longer waits on them.
+- **The "keep your areas loaded" systems are now fully active**: two background systems that keep portal areas in the server's memory were sitting idle in earlier builds, which could let an area be forgotten between player visits (causing a slow reload the next time someone arrived). Both are now wired up and running.
+
+**Stability fixes**
+
+- **Shared areas can no longer lose their memory protection**: when two zones overlap and share an area, the "keep this area in memory" protection could get out of sync - an area could be released while one zone still needed it, or the protection could linger long after both zones were done. Protection is now tracked per zone: an area stays protected for as long as any zone needs it, and is released the moment the last zone lets go.
+- **Small bookkeeping fix for MySQL users**: a duplicate-record issue in the data bookkeeping was cleaned up; MySQL setups behave exactly as before.
+
+**Verified**
+
+- Everything above is covered by the mod's automated test suite (now 121 checks, all passing). The new PostgreSQL support was additionally verified by running its real save and update statements against a live PostgreSQL server - both a first save and a re-save of an existing area.
 
 ### Notes
-- Config keys unchanged from 1.2.3 except the new `async.executorThreadCount`; no data-migration required.
+
+- One new optional setting: how many background workers the mod uses (default is 4, which matches the old behavior). Nothing else in the settings changed, and no existing data needs to be moved.
 
 ## [1.2.3] - 2026-04-13
 
